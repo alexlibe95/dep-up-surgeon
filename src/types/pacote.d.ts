@@ -4,6 +4,8 @@ declare module 'pacote' {
     name?: string;
     dependencies?: Record<string, string>;
     peerDependencies?: Record<string, string>;
+    optionalDependencies?: Record<string, string>;
+    engines?: Record<string, string>;
   }
 
   export interface Packument {

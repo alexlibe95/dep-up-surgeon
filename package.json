@@ -1,6 +1,6 @@
 {
   "name": "dep-up-surgeon",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Upgrade npm dependencies one-by-one with validation, rollback, and conflict reporting.",
   "main": "dist/cli.js",
   "bin": {
@@ -27,7 +27,7 @@
     "cli",
     "semver"
   ],
-  "author": "",
+  "author": "Alexandros Lymperopoulos",
   "license": "ISC",
   "type": "module",
   "bugs": {

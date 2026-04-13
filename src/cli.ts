@@ -6,7 +6,7 @@ import fs from 'fs-extra';
 import { program } from 'commander';
 import prompts from 'prompts';
 import { appendIgnoreToRc, loadConfig, mergeIgnoreLists } from './config/loadConfig.js';
-import { toJsonReport } from './core/conflict.js';
+import { buildStructuredReport, printStructuredCliSummary } from './cli/report.js';
 import {
   BACKUP_FILENAME,
   restoreInitialFromBackup,
@@ -166,9 +166,29 @@ async function main(): Promise<void> {
     });
 
     if (jsonOutput) {
-      console.log(JSON.stringify(toJsonReport(report!), null, 2));
+      console.log(
+        JSON.stringify(
+          {
+            ...buildStructuredReport(report!, {
+              parsedConflicts: report!.parsedConflicts,
+              groups: report!.groupPlan,
+            }),
+            ignored: report!.ignored,
+          },
+          null,
+          2,
+        ),
+      );
     } else {
       printHumanReport(report!);
+      if (report!.parsedConflicts?.length) {
+        printStructuredCliSummary(
+          buildStructuredReport(report!, {
+            parsedConflicts: report!.parsedConflicts,
+            groups: report!.groupPlan,
+          }),
+        );
+      }
     }
 
     if (interactive && !jsonOutput && report!.failed.length > 0) {

@@ -3,7 +3,14 @@ import fs from 'fs-extra';
 import prompts from 'prompts';
 import semver from 'semver';
 import { appendIgnoreToRc } from '../config/loadConfig.js';
-import type { DepSection, FailureReason, FinalReport, ScannedPackage, UpgradeRecord } from '../types.js';
+import type {
+  Conflict,
+  DepSection,
+  FailureReason,
+  FinalReport,
+  ScannedPackage,
+  UpgradeRecord,
+} from '../types.js';
 import type { PackageJson } from '../types.js';
 import { addFailure, addUpgrade, createEmptyReport } from './conflict.js';
 import { isRegistryRange, scanProject } from './scanner.js';
@@ -11,11 +18,16 @@ import { validateProject } from './validator.js';
 import { log } from '../utils/logger.js';
 import {
   detectEsmCommonJsBlockage,
-  detectPeerConflictFromOutput,
   fetchAllPublishedVersions,
   fetchLatestVersion,
   runNpmInstall,
 } from '../utils/npm.js';
+import {
+  extractClassifiedConflicts,
+  shouldRollbackAfterSuccessfulInstall,
+  type ClassifiedConflict,
+} from './conflictAnalyzer.js';
+import { promptGroupConflictChoice } from '../cli/interactive.js';
 import { buildLineFallbackOrder } from '../utils/versionFallback.js';
 import { buildSingletonGroups } from './groups.js';
 import { buildDynamicLinkedGroups } from './dynamicGroups.js';
@@ -94,6 +106,39 @@ async function writeDepRange(
   await writePackageJson(cwd, next);
 }
 
+function pushParsedConflicts(report: FinalReport, classified: ClassifiedConflict[]): void {
+  if (classified.length === 0) {
+    return;
+  }
+  if (!report.parsedConflicts) {
+    report.parsedConflicts = [];
+  }
+  for (const c of classified) {
+    report.parsedConflicts.push({
+      depender: c.depender,
+      dependency: c.dependency,
+      requiredRange: c.requiredRange,
+      installedVersion: c.installedVersion,
+      attemptedVersion: c.attemptedVersion,
+      rawMessage: c.rawMessage,
+    });
+  }
+}
+
+function toConflicts(classified: ClassifiedConflict[] | undefined): Conflict[] | undefined {
+  if (!classified?.length) {
+    return undefined;
+  }
+  return classified.map((c) => ({
+    depender: c.depender,
+    dependency: c.dependency,
+    requiredRange: c.requiredRange,
+    installedVersion: c.installedVersion,
+    attemptedVersion: c.attemptedVersion,
+    rawMessage: c.rawMessage,
+  }));
+}
+
 type FailureKind = 'install' | 'peer' | 'validation';
 
 interface AttemptResult {
@@ -102,6 +147,8 @@ interface AttemptResult {
   message?: string;
   /** Stop trying further fallback versions (e.g. ESM vs CommonJS for all newer releases). */
   abortFallbacks?: boolean;
+  installOutput?: string;
+  classified?: ClassifiedConflict[];
 }
 
 /**
@@ -121,7 +168,8 @@ async function attemptSingleUpgrade(
   await writePackageJson(cwd, pkg);
 
   const install = await runNpmInstall(cwd);
-  const peerHit = detectPeerConflictFromOutput(install.output);
+  const classified = extractClassifiedConflicts(install.output);
+  const peerHit = shouldRollbackAfterSuccessfulInstall(classified, force);
 
   if (!install.ok) {
     const esm = detectEsmCommonJsBlockage(install.output);
@@ -134,6 +182,8 @@ async function attemptSingleUpgrade(
         ? `npm install failed (exit ${install.exitCode}): ESM/CommonJS mismatch (e.g. ERR_REQUIRE_ESM). Newer releases may be ESM-only while this project is CommonJS — pin the package, migrate to ESM, or ignore it.`
         : `npm install failed (exit ${install.exitCode})`,
       abortFallbacks: esm,
+      installOutput: install.output,
+      classified,
     };
   }
 
@@ -145,6 +195,8 @@ async function attemptSingleUpgrade(
       kind: 'peer',
       message:
         'npm reported peer dependency issues (see npm output). Suggestion: keep this package unchanged or resolve peers manually.',
+      installOutput: install.output,
+      classified,
     };
   }
 
@@ -198,7 +250,8 @@ async function attemptBatchUpgrade(
   await writePackageJson(cwd, pkg);
 
   const install = await runNpmInstall(cwd);
-  const peerHit = detectPeerConflictFromOutput(install.output);
+  const classified = extractClassifiedConflicts(install.output);
+  const peerHit = shouldRollbackAfterSuccessfulInstall(classified, force);
 
   const rollbackAll = async (): Promise<void> => {
     for (const { scanned } of bumps) {
@@ -221,6 +274,8 @@ async function attemptBatchUpgrade(
         ? `npm install failed (exit ${install.exitCode}): ESM/CommonJS mismatch (e.g. ERR_REQUIRE_ESM). Newer releases may be ESM-only while this project is CommonJS — pin the package, migrate to ESM, or ignore it.`
         : `npm install failed (exit ${install.exitCode})`,
       abortFallbacks: esm,
+      installOutput: install.output,
+      classified,
     };
   }
 
@@ -231,6 +286,8 @@ async function attemptBatchUpgrade(
       kind: 'peer',
       message:
         'npm reported peer dependency issues (see npm output). Suggestion: keep this package unchanged or resolve peers manually.',
+      installOutput: install.output,
+      classified,
     };
   }
 
@@ -522,12 +579,15 @@ async function runSinglePackageUpgrade(
     }
   } else {
     const kind = result.kind ?? 'install';
+    const classified = result.classified ?? extractClassifiedConflicts(result.installOutput ?? '');
+    pushParsedConflicts(report, classified);
     addFailure(report, {
       name: scanned.name,
       reason: failureReason(kind),
       previousVersion: scanned.currentRange,
       attemptedVersion: lastAttemptedVersion,
       message: result.message,
+      conflicts: toConflicts(classified),
     });
     if (!jsonOutput) {
       if (kind === 'peer') {
@@ -655,12 +715,38 @@ async function runLinkedGroupUpgrade(
     );
   }
 
-  let result = await attemptBatchUpgrade(cwd, bumps, opts);
-  const label = `[${gid}] ${group.names.join(', ')}`;
+  const maxAttempts = interactive ? 8 : 3;
+  let result: AttemptResult = { ok: false, kind: 'install', message: 'not started' };
+  let forceAttempt = opts.force;
+  let attempt = 0;
 
-  if (!result.ok && interactive) {
-    const action = await promptAfterFailure(label, true);
-    if (action === 'pin') {
+  while (attempt < maxAttempts) {
+    attempt++;
+    const batchOpts: UpgradeEngineOptions = { ...opts, force: forceAttempt };
+    result = await attemptBatchUpgrade(cwd, bumps, batchOpts);
+    if (result.ok) {
+      break;
+    }
+    const classified = result.classified ?? extractClassifiedConflicts(result.installOutput ?? '');
+    if (!interactive) {
+      break;
+    }
+    const choice = await promptGroupConflictChoice({
+      groupId: gid,
+      packageSummary: bumps.map((b) => b.scanned.name).join(', '),
+      classified,
+    });
+    if (choice === 'retry' && attempt < maxAttempts) {
+      if (!jsonOutput) {
+        log.warn(`Retrying linked group [${gid}] (attempt ${attempt + 1}/${maxAttempts}) …`);
+      }
+      continue;
+    }
+    if (choice === 'force') {
+      forceAttempt = true;
+      continue;
+    }
+    if (choice === 'freeze_all') {
       for (const n of group.names) {
         ignore.add(n);
       }
@@ -672,12 +758,15 @@ async function runLinkedGroupUpgrade(
       if (!jsonOutput) {
         log.warn(`Pinned linked group [${gid}] (added to .dep-up-surgeonrc ignore list)`);
       }
-    } else if (action === 'retry') {
-      if (!jsonOutput) {
-        log.warn(`Retrying linked group [${gid}] …`);
-      }
-      result = await attemptBatchUpgrade(cwd, bumps, opts);
+      pushParsedConflicts(report, classified);
+      return;
     }
+    break;
+  }
+
+  if (!result.ok) {
+    const classified = result.classified ?? extractClassifiedConflicts(result.installOutput ?? '');
+    pushParsedConflicts(report, classified);
   }
 
   if (result.ok) {
@@ -713,6 +802,7 @@ async function runLinkedGroupUpgrade(
       attemptedVersion: att,
       message: result.message,
       linkedGroupId: gid,
+      conflicts: toConflicts(result.classified ?? extractClassifiedConflicts(result.installOutput ?? '')),
     });
     if (!jsonOutput) {
       if (kind === 'peer') {
@@ -753,10 +843,19 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
     }
   }
 
+  const pkgJson = await readPackageJson(cwd);
   const groups =
     opts.linkGroups === 'auto'
-      ? await buildDynamicLinkedGroups(packages, ignore, opts.linkedGroupsConfig, jsonOutput)
+      ? await buildDynamicLinkedGroups(
+          pkgJson,
+          packages,
+          ignore,
+          opts.linkedGroupsConfig,
+          jsonOutput,
+        )
       : buildSingletonGroups(packages, ignore);
+
+  report.groupPlan = groups.map((g) => ({ id: g.id, packages: [...g.names] }));
 
   for (const group of groups) {
     const fresh = await scanProject(cwd);

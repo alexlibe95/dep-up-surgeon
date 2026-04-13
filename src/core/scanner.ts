@@ -18,7 +18,19 @@ export function isRegistryRange(range: string): boolean {
 }
 
 /**
- * Read package.json and list `dependencies` + `devDependencies` entries.
+ * First semver range found for a package across standard dependency sections.
+ */
+export function getPackageRange(pkg: PackageJson, name: string): string | undefined {
+  return (
+    pkg.dependencies?.[name] ??
+    pkg.devDependencies?.[name] ??
+    pkg.peerDependencies?.[name] ??
+    pkg.optionalDependencies?.[name]
+  );
+}
+
+/**
+ * Read package.json and list direct dependency entries (all standard sections).
  */
 export async function scanProject(cwd: string): Promise<ScannedPackage[]> {
   const file = path.join(cwd, 'package.json');
@@ -39,9 +51,13 @@ export async function scanProject(cwd: string): Promise<ScannedPackage[]> {
 
   pushSection('dependencies', pkg.dependencies);
   pushSection('devDependencies', pkg.devDependencies);
+  pushSection('peerDependencies', pkg.peerDependencies);
+  pushSection('optionalDependencies', pkg.optionalDependencies);
 
-  // Deterministic order: dependencies first (sorted), then devDependencies (sorted)
-  const deps = out.filter((p) => p.section === 'dependencies').sort((a, b) => a.name.localeCompare(b.name));
-  const devs = out.filter((p) => p.section === 'devDependencies').sort((a, b) => a.name.localeCompare(b.name));
-  return [...deps, ...devs];
+  const sortByName = (a: ScannedPackage, b: ScannedPackage) => a.name.localeCompare(b.name);
+  const deps = out.filter((p) => p.section === 'dependencies').sort(sortByName);
+  const devs = out.filter((p) => p.section === 'devDependencies').sort(sortByName);
+  const peers = out.filter((p) => p.section === 'peerDependencies').sort(sortByName);
+  const opts = out.filter((p) => p.section === 'optionalDependencies').sort(sortByName);
+  return [...deps, ...devs, ...peers, ...opts];
 }

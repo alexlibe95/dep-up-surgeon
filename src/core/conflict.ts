@@ -20,5 +20,7 @@ export function toJsonReport(report: FinalReport): Record<string, unknown> {
     upgraded: report.upgraded,
     failed: report.failed,
     ignored: report.ignored,
+    parsedConflicts: report.parsedConflicts ?? [],
+    groupPlan: report.groupPlan ?? [],
   };
 }

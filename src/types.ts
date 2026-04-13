@@ -2,7 +2,20 @@
  * Shared types for dep-up-surgeon.
  */
 
-export type DepSection = 'dependencies' | 'devDependencies';
+export interface Conflict {
+  depender: string;
+  dependency: string;
+  requiredRange: string;
+  installedVersion?: string;
+  attemptedVersion?: string;
+  rawMessage: string;
+}
+
+export type DepSection =
+  | 'dependencies'
+  | 'devDependencies'
+  | 'peerDependencies'
+  | 'optionalDependencies';
 
 export interface ScannedPackage {
   name: string;
@@ -38,6 +51,8 @@ export interface ConflictEntry {
   message?: string;
   /** Present when the failure was a linked multi-package upgrade */
   linkedGroupId?: string;
+  /** Structured conflicts parsed from npm output when available */
+  conflicts?: Conflict[];
 }
 
 export interface FinalReport {
@@ -45,6 +60,10 @@ export interface FinalReport {
   failed: ConflictEntry[];
   /** Packages never touched (ignored from config/CLI) */
   ignored: string[];
+  /** Aggregated parsed npm conflicts for this run */
+  parsedConflicts?: Conflict[];
+  /** Linked upgrade groups used for this run */
+  groupPlan?: Array<{ id: string; packages: string[] }>;
 }
 
 /** Minimal package.json shape used by the tool */
@@ -55,4 +74,6 @@ export interface PackageJson {
   scripts?: Record<string, string>;
   dependencies?: Record<string, string>;
   devDependencies?: Record<string, string>;
+  peerDependencies?: Record<string, string>;
+  optionalDependencies?: Record<string, string>;
 }

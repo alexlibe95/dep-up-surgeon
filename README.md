@@ -1,6 +1,8 @@
 # dep-up-surgeon
 
-Production-oriented CLI that upgrades **npm** `dependencies` and `devDependencies` with **`npm install` + validation** after each change, and **rolls back** on failure. With **`--link-groups auto`** (default) it **clusters** dependencies using the **registry graph** (see below) plus optional **`.dep-up-surgeonrc`** groups; use **`--link-groups none`** for strict one-package-at-a-time behavior.
+Production-oriented CLI that upgrades **npm** dependencies with **`npm install` + validation** after each change, and **rolls back** on failure. It is **framework-agnostic**: grouping and conflict handling come from **registry metadata** and **parsed npm output**, not hardcoded stacks (React, Angular, etc.).
+
+With **`--link-groups auto`** (default) it **clusters** upgrades using a **dependency graph** built from the npm registry (see below) plus optional **`.dep-up-surgeonrc`** `linkedGroups`. Use **`--link-groups none`** for strict one-package-at-a-time behavior.
 
 ## Install
 
@@ -29,36 +31,49 @@ dep-up-surgeon [options]
 | Option | Description |
 |--------|-------------|
 | `--dry-run` | Resolve latest versions and print the plan; does not change `package.json` or run installs. |
-| `--interactive` | On failure, prompt to continue, pin a package, or retry once; after the run, optionally bulk-add failed names to `.dep-up-surgeonrc`. |
-| `--force` | Keep a version bump even when validation fails; also skips **peer-conflict rollback** when npm output suggests peer issues (use with care). |
+| `--interactive` | On failure, prompts for next steps (see **Interactive mode**). After the run, optionally bulk-add failed names to `.dep-up-surgeonrc`. |
+| `--force` | Keep a version bump even when validation fails; also skips **rollback** when structured conflicts are detected in npm output after a successful exit code (use with care). |
 | `--ignore <pkgs>` | Comma-separated package names to skip (merged with `.dep-up-surgeonrc`). |
-| `--json` | Machine-readable report on stdout (suppresses colored logs). |
-| `--fallback-strategy <mode>` | `major-lines` (**default**), `minor-lines`, or `none`. After `@latest` fails, **`major-lines`** tries the best stable version per **major** (e.g. `9.x` → `8.x` → `7.x` …) — fewer installs when a whole major changes behavior (e.g. **execa** 6+ is ESM-only). **`minor-lines`** steps one **`major.minor` line** at a time (more granular). If npm output looks like **ESM vs CommonJS** (`ERR_REQUIRE_ESM`), further fallbacks for that package **stop** so you don’t burn through every line. `none` only attempts `@latest`. |
-| `--link-groups <mode>` | `auto` (**default**) or `none`. **`auto`** builds **linked batches** from the **npm registry** (see below) and optional **`linkedGroups`** in `.dep-up-surgeonrc`. **`none`** upgrades one dependency per step. |
+| `--json` | Machine-readable report on stdout (see **JSON report**). |
+| `--fallback-strategy <mode>` | `major-lines` (**default**), `minor-lines`, or `none`. After `@latest` fails, **`major-lines`** tries the best stable version per **major** (e.g. `9.x` → `8.x` → `7.x` …). **`minor-lines`** steps one **`major.minor` line** at a time. If npm output looks like **ESM vs CommonJS** (`ERR_REQUIRE_ESM`), further fallbacks for that package **stop**. `none` only attempts `@latest`. |
+| `--link-groups <mode>` | `auto` (**default**) or `none`. **`auto`** builds **linked batches** from the registry graph and optional **`linkedGroups`**. **`none`** upgrades one dependency per step. |
 
 Exit code `1` when any upgrade could not be kept (unless `--force`). Fatal errors also exit `1`.
 
+### What gets scanned
+
+Direct entries in **`dependencies`**, **`devDependencies`**, **`peerDependencies`**, and **`optionalDependencies`** are considered. Non-registry ranges (`workspace:`, `link:`, `file:`, `git:` …) are skipped for upgrades.
+
 ### How linked groups are chosen (`--link-groups auto`)
 
-There are **no hardcoded Expo/React lists**. Groups are derived **dynamically** from your **direct** `dependencies` / `devDependencies`:
+There are **no framework-specific lists**. Groups are derived from your **direct** dependency names and **published** package metadata:
 
 1. **Custom** groups from `.dep-up-surgeonrc` `linkedGroups` are applied **first** (exact package names).
-2. For every remaining **registry** dependency (semver / tag resolvable from npm), the tool fetches the published **`package.json`** via **`pacote`** and reads **`peerDependencies`** and **`dependencies`**.
-3. An **undirected edge** is added between two project dependencies **A** and **B** when **B** appears in **A**’s published peer or runtime deps (and both are in your project). That way **peer** and **direct** links in the npm graph become upgrade batches.
-4. **`@types/<pkg>`** is linked to **`<pkg>`** when **both** are direct dependencies (e.g. **`react`** ↔ **`@types/react`**), since TypeScript types often must move with the runtime.
-5. **Connected components** of that graph are **one batch each** (one `package.json` edit + one `npm install` + one validation). Packages that are **not** connected to anything else are upgraded **alone**.
+2. For each remaining **registry** dependency, the tool fetches the published manifest (**`pacote`**, cached in-memory for the run) and reads **`dependencies`**, **`peerDependencies`**, and **`optionalDependencies`** keys.
+3. An **undirected edge** is added between two project packages **A** and **B** when **B** appears in **A**’s published metadata for those fields (and both are registry deps in your project). **Connected components** become **one upgrade batch** each (single `package.json` write + one `npm install` + one validation).
+4. **`@types/<pkg>`** is linked to **`<pkg>`** when **both** are direct dependencies (types often move with the runtime package).
+5. Isolated packages are upgraded **alone** (singleton groups).
 
-**Caveats** (inherent to any graph heuristic):
+**Caveats**
 
-- **SDK-style** ecosystems (e.g. Expo) only cluster if the **published** manifests expose **`peerDependencies` / `dependencies`** edges between those packages. If two packages are **not** linked in the registry metadata, they will **not** be batched together — add **`linkedGroups`** in `.dep-up-surgeonrc` for that case.
-- For **guaranteed** Expo SDK alignment, prefer **`npx expo install`**; this tool still helps **automate** semver bumps when the graph is visible to npm.
-- **Prerelease / canary** lines: **`@latest`** may not match your channel — pin or ignore as needed.
+- Packages only batch if the **registry** exposes edges between them. If two packages must move together but are not linked in metadata, add a **`linkedGroups`** entry.
+- **SDK-style** tooling (e.g. Expo) may expect **`npx expo install`** for channel alignment; this tool automates semver bumps when the graph is visible to npm.
+- **Prerelease / canary**: **`@latest`** may not match your channel — pin or ignore as needed.
 
-**Performance**: one registry fetch per **registry** dependency when linking is enabled (batched in parallel).
+**Performance**: manifests are fetched with **bounded concurrency** (parallel batches); responses are **cached** for the duration of the run.
+
+### Interactive mode (`--interactive`)
+
+- **Single package** failures: prompt to continue, pin (ignore) that package, or retry once.
+- **Linked group** failures: prompt to **skip the group**, **retry** (same targets; several attempts allowed), **force** (same as `--force` for that batch), or **freeze** (add all packages in the group to `.dep-up-surgeonrc` ignore). Attempts are capped higher when interactive so you can recover without rerunning the whole CLI.
+
+### Conflict detection
+
+After each `npm install`, output is passed through a **generic conflict parser** (regex-based, no hardcoded package names). Structured conflicts are **classified** (e.g. peer mismatch, missing peer, version range, engine, unresolved tree). If **`npm install` exits successfully** but conflicts are still detected in the log, the tool **rolls back** the bump (unless **`--force`**). Failed runs also attach parsed conflicts to the report where possible.
 
 ### Why not only “latest”?
 
-Packages may publish a `latest` that your project cannot adopt yet (for example **execa** 6+ is **ESM-only** while a `"type": "commonjs"` app still `require()`s it, or a **TypeScript** major breaks your build). The default strategy **tries `latest` first**, then walks older **release lines** so you often land on a **newer compatible** version. Use **`--fallback-strategy minor-lines`** if you want finer steps than one per major.
+`latest` may not be adoptable yet (e.g. **ESM-only** majors, or a **TypeScript** major that breaks your build). The default strategy tries **`@latest` first**, then walks older **release lines** when fallbacks are enabled.
 
 ## Configuration
 
@@ -69,11 +84,10 @@ Create `.dep-up-surgeonrc` in the project root:
   "ignore": ["some-legacy-package"],
   "linkedGroups": [
     {
-      "id": "rn-addons",
+      "id": "my-batch",
       "packages": [
-        "react-native-reanimated",
-        "react-native-screens",
-        "react-native-safe-area-context"
+        "package-a",
+        "package-b"
       ]
     }
   ]
@@ -82,17 +96,20 @@ Create `.dep-up-surgeonrc` in the project root:
 
 Ignored packages are never upgraded. The CLI `--ignore` list is merged with this file.
 
-**`linkedGroups`** defines **forced** batches **before** the dynamic graph runs (e.g. packages you know must move together but are not linked in registry metadata). Use exact npm package names.
+**`linkedGroups`** defines **forced** batches **before** the dynamic graph runs (exact npm package names).
+
+## JSON report (`--json`)
+
+Stdout is a single JSON object including:
+
+- **`upgraded`**, **`skipped`**, **`failed`**, **`conflicts`** (parsed from npm output), **`unresolved`** (failed entries), **`groups`** (planned linked groups: ids and package names), and **`ignored`**.
+
+Use this for CI or tooling that needs structured results.
 
 ## Safety
 
 - Before the first real change, the tool copies `package.json` to `package.json.dep-up-surgeon.bak`.
 - On uncaught errors, it tries to restore `package.json` from that backup. If that happens, run `npm install` again to sync `node_modules`.
-- Non-registry ranges (`workspace:`, `link:`, `file:`, `git:` …) are skipped automatically.
-
-## Peer dependencies
-
-If `npm install` succeeds but combined output matches common **peer dependency** warning patterns, the tool treats that as a **peer conflict**, rolls back (unless `--force`), and suggests leaving the dependency unchanged or fixing peers manually.
 
 ## Output example
 
@@ -100,8 +117,21 @@ If `npm install` succeeds but combined output matches common **peer dependency**
 ✔ upgraded: lodash → 4.17.21
 ✔ upgraded: axios → 1.6.0
 ✖ skipped: legacy-lib (npm test failed)
-⚠ peer conflict: angular-plugin — …
+⚠ peer conflict: some-package — …
 ```
+
+## Architecture (overview)
+
+| Area | Role |
+|------|------|
+| `core/graph.ts` | Build dependency graph from `package.json` + registry manifests; connected components → batches. |
+| `core/dynamicGroups.ts` | Custom `linkedGroups` + graph-driven `LinkedGroup[]`. |
+| `core/conflictParser.ts` / `conflictAnalyzer.ts` | Parse and classify npm log lines; decide rollback after “successful” installs. |
+| `core/resolver.ts` | Semver helpers and compatible-version search (extensible for smarter resolution). |
+| `core/retryEngine.ts` | Generic retry helper. |
+| `cli/interactive.ts` | `prompts`-based choices for failed groups. |
+| `cli/report.ts` | Structured report builder and optional CLI summary. |
+| `utils/registryCache.ts` / `utils/concurrency.ts` | Manifest cache and parallel fetch limits. |
 
 ## Development
 
@@ -122,3 +152,4 @@ The compiled entry is `dist/cli.js` (see `"bin"` in `package.json`).
 - Monorepos / workspaces  
 - pnpm / Yarn  
 - Git integration (commit per success)  
+- Deeper automatic resolution using peer-range intersection across a batch  
