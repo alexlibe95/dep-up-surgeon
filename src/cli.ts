@@ -1,18 +1,21 @@
 #!/usr/bin/env node
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import chalk from 'chalk';
 import fs from 'fs-extra';
 import { program } from 'commander';
 import prompts from 'prompts';
-import { appendIgnoreToRc, loadConfig, mergeIgnoreLists } from './config/loadConfig';
-import { toJsonReport } from './core/conflict';
+import { appendIgnoreToRc, loadConfig, mergeIgnoreLists } from './config/loadConfig.js';
+import { toJsonReport } from './core/conflict.js';
 import {
   BACKUP_FILENAME,
   restoreInitialFromBackup,
   runUpgradeEngine,
-} from './core/upgrader';
-import type { FinalReport } from './types';
-import { log } from './utils/logger';
+} from './core/upgrader.js';
+import type { FinalReport } from './types.js';
+import { log } from './utils/logger.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 async function readSelfVersion(): Promise<string> {
   const pkgPath = path.join(__dirname, '..', 'package.json');
@@ -105,6 +108,11 @@ async function main(): Promise<void> {
       '--fallback-strategy <mode>',
       'When @latest fails: major-lines (default, one try per major), minor-lines (one per major.minor), or none',
       'major-lines',
+    )
+    .option(
+      '--link-groups <mode>',
+      'auto: upgrade Expo / React-core / custom rc groups in one step; none: one package at a time',
+      'auto',
     );
 
   program.parse(process.argv);
@@ -115,6 +123,7 @@ async function main(): Promise<void> {
     ignore?: string;
     json?: boolean;
     fallbackStrategy?: string;
+    linkGroups?: string;
   }>();
 
   const cwd = process.cwd();
@@ -137,6 +146,10 @@ async function main(): Promise<void> {
         ? 'minor-lines'
         : 'major-lines';
 
+  const linkRaw = String(opts.linkGroups ?? 'auto').toLowerCase();
+  const linkGroups: 'auto' | 'none' =
+    linkRaw === 'none' || linkRaw === 'off' || linkRaw === 'false' ? 'none' : 'auto';
+
   let report: FinalReport | null = null;
 
   try {
@@ -148,6 +161,8 @@ async function main(): Promise<void> {
       jsonOutput,
       ignore,
       fallbackStrategy,
+      linkGroups,
+      linkedGroupsConfig: config.linkedGroups ?? [],
     });
 
     if (jsonOutput) {

@@ -1,4 +1,4 @@
-import type { ConflictEntry, FinalReport, UpgradeRecord } from '../types';
+import type { ConflictEntry, FinalReport, UpgradeRecord } from '../types.js';
 
 export function createEmptyReport(): FinalReport {
   return { upgraded: [], failed: [], ignored: [] };

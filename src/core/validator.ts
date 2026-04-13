@@ -1,5 +1,5 @@
-import execa from 'execa';
-import type { PackageJson } from '../types';
+import { execa } from 'execa';
+import type { PackageJson } from '../types.js';
 
 export interface ValidationResult {
   ok: boolean;

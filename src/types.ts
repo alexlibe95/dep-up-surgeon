@@ -26,6 +26,8 @@ export interface UpgradeRecord {
   usedFallback?: boolean;
   /** Registry `latest` dist-tag at time of upgrade (for context when `usedFallback`) */
   requestedLatest?: string;
+  /** When set, this row was upgraded with other packages in the same batch */
+  linkedGroupId?: string;
 }
 
 export interface ConflictEntry {
@@ -34,6 +36,8 @@ export interface ConflictEntry {
   previousVersion: string;
   attemptedVersion?: string;
   message?: string;
+  /** Present when the failure was a linked multi-package upgrade */
+  linkedGroupId?: string;
 }
 
 export interface FinalReport {

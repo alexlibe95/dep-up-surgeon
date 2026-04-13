@@ -1,6 +1,6 @@
 # dep-up-surgeon
 
-Production-oriented CLI that upgrades **npm** `dependencies` and `devDependencies` **one package at a time**, runs `npm install` after each change, validates with `npm test` (or `npm run build` if there is no test script), and **rolls back** a change when install or validation fails.
+Production-oriented CLI that upgrades **npm** `dependencies` and `devDependencies` with **`npm install` + validation** after each change, and **rolls back** on failure. By default it **links** related packages (Expo, React Native core, and optional groups in `.dep-up-surgeonrc`) so they bump **together** in one edit + one install; use `--link-groups none` for strict one-package-at-a-time behavior.
 
 ## Install
 
@@ -34,8 +34,22 @@ dep-up-surgeon [options]
 | `--ignore <pkgs>` | Comma-separated package names to skip (merged with `.dep-up-surgeonrc`). |
 | `--json` | Machine-readable report on stdout (suppresses colored logs). |
 | `--fallback-strategy <mode>` | `major-lines` (**default**), `minor-lines`, or `none`. After `@latest` fails, **`major-lines`** tries the best stable version per **major** (e.g. `9.x` → `8.x` → `7.x` …) — fewer installs when a whole major changes behavior (e.g. **execa** 6+ is ESM-only). **`minor-lines`** steps one **`major.minor` line** at a time (more granular). If npm output looks like **ESM vs CommonJS** (`ERR_REQUIRE_ESM`), further fallbacks for that package **stop** so you don’t burn through every line. `none` only attempts `@latest`. |
+| `--link-groups <mode>` | `auto` (**default**) or `none`. **`auto`** upgrades **linked** sets in one step: built-in **`expo` + `expo-*` + `@expo/*`**, and **`react` + `react-dom` + `react-native` + `react-native-web`** when present, plus any **`linkedGroups`** from `.dep-up-surgeonrc`. **`none`** processes every dependency as its own step (legacy). |
 
 Exit code `1` when any upgrade could not be kept (unless `--force`). Fatal errors also exit `1`.
+
+### Linked upgrade groups (Expo / React / custom)
+
+Many mobile stacks break if you bump **`expo`** without the matching **`expo-*`** packages, or **`react-native`** without compatible **`react`**. With `--link-groups auto` (default), the tool:
+
+1. Applies **custom** groups from `.dep-up-surgeonrc` `linkedGroups` first (exact package names).
+2. Puts **`expo`**, every **`expo-*`**, and **`@expo/*`** into one batch.
+3. Puts **`react`**, **`react-dom`**, **`react-native`**, **`react-native-web`** into one batch.
+4. Leaves other packages (e.g. **`react-native-reanimated`**, **`firebase`**, **`@tanstack/react-query`**) as **individual** upgrades unless you list them in **`linkedGroups`**.
+
+A **linked** batch resolves **`@latest`** per package, writes **all** version bumps at once, runs **one** `npm install`, then **one** test/build validation. It does **not** replace `npx expo install`’s SDK pinning — for Expo, prefer **`expo install`** when you need guaranteed SDK alignment; this feature reduces “upgrade one expo package and break peers” during automated bumps.
+
+**Prerelease / canary** tags (e.g. `expo@…-canary-…`) are still read as semver ranges; **`@latest`** may point at a different channel than your canary line — pin or ignore if needed.
 
 ### Why not only “latest”?
 
@@ -47,11 +61,23 @@ Create `.dep-up-surgeonrc` in the project root:
 
 ```json
 {
-  "ignore": ["some-legacy-package"]
+  "ignore": ["some-legacy-package"],
+  "linkedGroups": [
+    {
+      "id": "rn-addons",
+      "packages": [
+        "react-native-reanimated",
+        "react-native-screens",
+        "react-native-safe-area-context"
+      ]
+    }
+  ]
 }
 ```
 
 Ignored packages are never upgraded. The CLI `--ignore` list is merged with this file.
+
+**`linkedGroups`** defines extra batches (in addition to built-in Expo / React-core). Use exact npm package names.
 
 ## Safety
 
@@ -73,6 +99,10 @@ If `npm install` succeeds but combined output matches common **peer dependency**
 ```
 
 ## Development
+
+This package is **ESM-only** (`"type": "module"`): source lives under `src/`, compiles to `dist/*.js` with **TypeScript `module: NodeNext`**, and relative imports use **`.js` extensions** in source so Node resolves them correctly.
+
+Requires **Node `^20.17.0` or `>=22.9.0`** (aligned with `pacote`).
 
 ```bash
 npm install

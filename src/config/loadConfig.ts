@@ -4,6 +4,11 @@ import fs from 'fs-extra';
 export interface DepUpSurgeonRc {
   /** Package names that must never be upgraded */
   ignore?: string[];
+  /**
+   * Explicit linked upgrade groups (applied before built-in expo / react-core rules).
+   * Packages listed together are bumped in one `package.json` edit + one `npm install`.
+   */
+  linkedGroups?: Array<{ id: string; packages: string[] }>;
 }
 
 const CONFIG_FILENAME = '.dep-up-surgeonrc';
@@ -26,8 +31,24 @@ export async function loadConfig(cwd: string): Promise<DepUpSurgeonRc> {
     if (parsed.ignore !== undefined && !Array.isArray(parsed.ignore)) {
       return { ...parsed, ignore: [] };
     }
+    let linkedGroups = parsed.linkedGroups;
+    if (linkedGroups !== undefined) {
+      if (!Array.isArray(linkedGroups)) {
+        linkedGroups = [];
+      } else {
+        linkedGroups = linkedGroups
+          .filter((g) => g && typeof g === 'object' && typeof (g as { id?: string }).id === 'string')
+          .map((g) => ({
+            id: String((g as { id: string }).id),
+            packages: Array.isArray((g as { packages?: unknown }).packages)
+              ? (g as { packages: string[] }).packages.map(String)
+              : [],
+          }));
+      }
+    }
     return {
       ignore: parsed.ignore?.map(String) ?? [],
+      linkedGroups: linkedGroups ?? [],
     };
   } catch {
     return {};

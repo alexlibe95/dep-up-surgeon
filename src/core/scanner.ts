@@ -1,8 +1,8 @@
 import path from 'node:path';
 import fs from 'fs-extra';
 import semver from 'semver';
-import type { DepSection, ScannedPackage } from '../types';
-import type { PackageJson } from '../types';
+import type { DepSection, ScannedPackage } from '../types.js';
+import type { PackageJson } from '../types.js';
 
 const NON_REGISTRY = /^(workspace:|link:|file:|git\+|git:|http:|https:)/i;
 
