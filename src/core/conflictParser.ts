@@ -138,10 +138,26 @@ export function parsePackageSpec(spec: string): { name: string; version?: string
   return { name: t };
 }
 
+export interface ParseConflictsOptions {
+  /**
+   * Skip conflicts whose dependency field matches (e.g. root `package.json` `name`).
+   * npm often prints `While resolving: <app>@0.0.0` which is not a registry package conflict.
+   */
+  skipDependencyNames?: Set<string>;
+}
+
+function shouldSkipDep(name: string, skip?: Set<string>): boolean {
+  if (!skip || !name || name === 'unknown') {
+    return false;
+  }
+  return skip.has(name);
+}
+
 /**
  * Split npm output into lines and apply regex extractors.
  */
-export function parseConflictsFromNpmOutput(output: string): Conflict[] {
+export function parseConflictsFromNpmOutput(output: string, options?: ParseConflictsOptions): Conflict[] {
+  const skip = options?.skipDependencyNames;
   const lines = (output || '').split(/\r?\n/);
   const out: Conflict[] = [];
 
@@ -163,6 +179,9 @@ export function parseConflictsFromNpmOutput(output: string): Conflict[] {
       if (dependency.includes('@')) {
         const p = parsePackageSpec(dependency);
         dependency = p.name;
+      }
+      if (shouldSkipDep(dependency, skip)) {
+        break;
       }
       pushUnique(out, {
         ...partial,

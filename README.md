@@ -49,8 +49,8 @@ Direct entries in **`dependencies`**, **`devDependencies`**, **`peerDependencies
 There are **no framework-specific lists**. Groups are derived from your **direct** dependency names and **published** package metadata:
 
 1. **Custom** groups from `.dep-up-surgeonrc` `linkedGroups` are applied **first** (exact package names).
-2. For each remaining **registry** dependency, the tool fetches the published manifest (**`pacote`**, cached in-memory for the run) and reads **`dependencies`**, **`peerDependencies`**, and **`optionalDependencies`** keys.
-3. An **undirected edge** is added between two project packages **A** and **B** when **B** appears in **A**’s published metadata for those fields (and both are registry deps in your project). **Connected components** become **one upgrade batch** each (single `package.json` write + one `npm install` + one validation).
+2. For each remaining **registry** dependency, the tool fetches the published manifest (**`pacote`**, cached in-memory for the run) and reads **`peerDependencies`** only. (Runtime **`dependencies`** / **`optionalDependencies`** are **not** used for clustering: they tend to connect unrelated packages through hubs like `typescript`, `eslint`, or `rxjs`, producing one giant batch.)
+3. An **undirected edge** is added between two project packages **A** and **B** when **B** appears in **A**’s published **peerDependencies** (and both are direct registry deps in your project). **Connected components** become **one upgrade batch** each (single `package.json` write + one `npm install` + one validation).
 4. **`@types/<pkg>`** is linked to **`<pkg>`** when **both** are direct dependencies (types often move with the runtime package).
 5. Isolated packages are upgraded **alone** (singleton groups).
 
@@ -69,7 +69,7 @@ There are **no framework-specific lists**. Groups are derived from your **direct
 
 ### Conflict detection
 
-After each `npm install`, output is passed through a **generic conflict parser** (regex-based, no hardcoded package names). Structured conflicts are **classified** (e.g. peer mismatch, missing peer, version range, engine, unresolved tree). If **`npm install` exits successfully** but conflicts are still detected in the log, the tool **rolls back** the bump (unless **`--force`**). Failed runs also attach parsed conflicts to the report where possible.
+After each `npm install`, output is passed through a **generic conflict parser** (regex-based, no hardcoded package names). Lines that only refer to the **root** `package.json` **`name`** (for example npm’s `While resolving: my-app@0.0.0`) are filtered out so they do not appear as fake registry-package conflicts. Structured conflicts are **classified** (e.g. peer mismatch, missing peer, version range, engine, unresolved tree). If **`npm install` exits successfully** but conflicts are still detected in the log, the tool **rolls back** the bump (unless **`--force`**). Failed runs also attach parsed conflicts to the report where possible.
 
 ### Why not only “latest”?
 
@@ -124,7 +124,7 @@ Use this for CI or tooling that needs structured results.
 
 | Area | Role |
 |------|------|
-| `core/graph.ts` | Build dependency graph from `package.json` + registry manifests; connected components → batches. |
+| `core/graph.ts` | Build graph from `package.json` + published **peerDependencies** only (+ `@types/*` pairing); connected components → batches. |
 | `core/dynamicGroups.ts` | Custom `linkedGroups` + graph-driven `LinkedGroup[]`. |
 | `core/conflictParser.ts` / `conflictAnalyzer.ts` | Parse and classify npm log lines; decide rollback after “successful” installs. |
 | `core/resolver.ts` | Semver helpers and compatible-version search (extensible for smarter resolution). |

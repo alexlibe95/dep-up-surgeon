@@ -10,8 +10,8 @@ import { createManifestCache } from '../utils/registryCache.js';
  * Build linked upgrade groups from **registry metadata only** (no framework lists):
  *
  * 1. Apply **custom** `.dep-up-surgeonrc` `linkedGroups` first.
- * 2. Build a **dependency graph** from root `package.json` + published manifests
- *    (`dependencies`, `peerDependencies`, `optionalDependencies` edges to other project deps).
+ * 2. Build a graph from root `package.json` + published **peerDependencies** only (runtime
+ *    `dependencies` are not used for clustering — they over-connect via hubs like `typescript`).
  * 3. Link `@types/<name>` ↔ `<name>` when both are direct dependencies.
  * 4. **Connected components** become one batch each; isolated packages stay singletons.
  * 5. Non-registry ranges (workspace/file/git) are always singletons.
@@ -104,7 +104,7 @@ export async function buildDynamicLinkedGroups(
 
   if (!jsonOutput) {
     log.dim(
-      `Linked groups: ${multiCount} multi-package cluster(s) from registry dependency graph (+ @types/* pairing).`,
+      `Linked groups: ${multiCount} multi-package cluster(s) from registry peerDependency graph (+ @types/* pairing).`,
     );
   }
 

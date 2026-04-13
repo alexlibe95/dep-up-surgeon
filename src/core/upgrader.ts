@@ -35,6 +35,10 @@ import type { LinkedGroup } from './groups.js';
 
 const BACKUP_FILENAME = 'package.json.dep-up-surgeon.bak';
 
+function classifyInstallOutput(output: string | undefined, opts: UpgradeEngineOptions): ClassifiedConflict[] {
+  return extractClassifiedConflicts(output ?? '', { rootPackageName: opts.rootPackageName });
+}
+
 export type FallbackStrategy = 'major-lines' | 'minor-lines' | 'none';
 
 export interface UpgradeEngineOptions {
@@ -52,12 +56,17 @@ export interface UpgradeEngineOptions {
    */
   fallbackStrategy: FallbackStrategy;
   /**
-   * `auto`: built-in linked groups (Expo, React core) + `.dep-up-surgeonrc` `linkedGroups`.
+   * `auto`: linked batches from registry **peer** graph + `.dep-up-surgeonrc` `linkedGroups`.
    * `none`: one package per upgrade step (legacy).
    */
   linkGroups: 'auto' | 'none';
   /** From `.dep-up-surgeonrc` — custom groups applied before built-in rules */
   linkedGroupsConfig?: Array<{ id: string; packages: string[] }>;
+  /**
+   * Root `package.json` `name` (set automatically in `runUpgradeEngine`). Used to ignore
+   * false-positive conflict lines such as `While resolving: <app>@0.0.0`.
+   */
+  rootPackageName?: string;
 }
 
 async function readPackageJson(cwd: string): Promise<PackageJson> {
@@ -168,7 +177,7 @@ async function attemptSingleUpgrade(
   await writePackageJson(cwd, pkg);
 
   const install = await runNpmInstall(cwd);
-  const classified = extractClassifiedConflicts(install.output);
+  const classified = classifyInstallOutput(install.output, opts);
   const peerHit = shouldRollbackAfterSuccessfulInstall(classified, force);
 
   if (!install.ok) {
@@ -250,7 +259,7 @@ async function attemptBatchUpgrade(
   await writePackageJson(cwd, pkg);
 
   const install = await runNpmInstall(cwd);
-  const classified = extractClassifiedConflicts(install.output);
+  const classified = classifyInstallOutput(install.output, opts);
   const peerHit = shouldRollbackAfterSuccessfulInstall(classified, force);
 
   const rollbackAll = async (): Promise<void> => {
@@ -579,7 +588,7 @@ async function runSinglePackageUpgrade(
     }
   } else {
     const kind = result.kind ?? 'install';
-    const classified = result.classified ?? extractClassifiedConflicts(result.installOutput ?? '');
+    const classified = result.classified ?? classifyInstallOutput(result.installOutput, opts);
     pushParsedConflicts(report, classified);
     addFailure(report, {
       name: scanned.name,
@@ -727,7 +736,7 @@ async function runLinkedGroupUpgrade(
     if (result.ok) {
       break;
     }
-    const classified = result.classified ?? extractClassifiedConflicts(result.installOutput ?? '');
+    const classified = result.classified ?? classifyInstallOutput(result.installOutput, opts);
     if (!interactive) {
       break;
     }
@@ -765,7 +774,7 @@ async function runLinkedGroupUpgrade(
   }
 
   if (!result.ok) {
-    const classified = result.classified ?? extractClassifiedConflicts(result.installOutput ?? '');
+    const classified = result.classified ?? classifyInstallOutput(result.installOutput, opts);
     pushParsedConflicts(report, classified);
   }
 
@@ -802,7 +811,7 @@ async function runLinkedGroupUpgrade(
       attemptedVersion: att,
       message: result.message,
       linkedGroupId: gid,
-      conflicts: toConflicts(result.classified ?? extractClassifiedConflicts(result.installOutput ?? '')),
+      conflicts: toConflicts(result.classified ?? classifyInstallOutput(result.installOutput, opts)),
     });
     if (!jsonOutput) {
       if (kind === 'peer') {
@@ -844,13 +853,18 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
   }
 
   const pkgJson = await readPackageJson(cwd);
+  const engineOpts: UpgradeEngineOptions = {
+    ...opts,
+    rootPackageName: typeof pkgJson.name === 'string' ? pkgJson.name : undefined,
+  };
+
   const groups =
-    opts.linkGroups === 'auto'
+    engineOpts.linkGroups === 'auto'
       ? await buildDynamicLinkedGroups(
           pkgJson,
           packages,
           ignore,
-          opts.linkedGroupsConfig,
+          engineOpts.linkedGroupsConfig,
           jsonOutput,
         )
       : buildSingletonGroups(packages, ignore);
@@ -867,9 +881,9 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
     }
 
     if (active.length === 1) {
-      await runSinglePackageUpgrade(cwd, active[0]!, opts, report, ignore);
+      await runSinglePackageUpgrade(cwd, active[0]!, engineOpts, report, ignore);
     } else {
-      await runLinkedGroupUpgrade(cwd, group, active, opts, report, ignore);
+      await runLinkedGroupUpgrade(cwd, group, active, engineOpts, report, ignore);
     }
   }
 

@@ -78,15 +78,26 @@ export function groupConflictsByCategory(
 /**
  * Merge line-based parses with ERESOLVE fallback (dedupe by raw line).
  */
-export function mergeParsedConflicts(output: string): Conflict[] {
-  const a = parseConflictsFromNpmOutput(output);
+export function mergeParsedConflicts(output: string, rootPackageName?: string): Conflict[] {
+  const skip =
+    rootPackageName && rootPackageName.trim() !== ''
+      ? new Set([rootPackageName.trim()])
+      : undefined;
+  const a = parseConflictsFromNpmOutput(output, { skipDependencyNames: skip });
   const b = parseEresolveFallback(output);
   const keys = new Set(a.map((x) => x.rawMessage));
   return [...a, ...b.filter((x) => !keys.has(x.rawMessage))];
 }
 
-export function extractClassifiedConflicts(output: string): ClassifiedConflict[] {
-  return analyzeConflicts(mergeParsedConflicts(output));
+export interface ExtractConflictsOptions {
+  rootPackageName?: string;
+}
+
+export function extractClassifiedConflicts(
+  output: string,
+  options?: ExtractConflictsOptions,
+): ClassifiedConflict[] {
+  return analyzeConflicts(mergeParsedConflicts(output, options?.rootPackageName));
 }
 
 /**

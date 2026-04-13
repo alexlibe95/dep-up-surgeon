@@ -121,8 +121,10 @@ export interface BuildDependencyGraphOptions {
 }
 
 /**
- * Build an undirected graph: project packages are nodes; edges come from published
- * dependency / peer / optional metadata intersecting other project packages, plus
+ * Build an undirected graph: project packages are nodes; edges come only from published
+ * **peerDependencies** (the signal that versions must align), not from runtime
+ * `dependencies` / `optionalDependencies` (those create hub edges through `typescript`,
+ * `eslint`, etc. and collapse unrelated tools into one giant batch). Also
  * `@types/<name>` ↔ `<name>` when both exist.
  */
 export async function buildDependencyGraph(
@@ -149,14 +151,8 @@ export async function buildDependencyGraph(
         addUndirectedEdge(edges, edgeKeys, name, to, kind);
       }
     };
-    for (const k of Object.keys(m.dependencies ?? {})) {
-      link(k, 'registry-dependency');
-    }
     for (const k of Object.keys(m.peerDependencies ?? {})) {
       link(k, 'registry-peer');
-    }
-    for (const k of Object.keys(m.optionalDependencies ?? {})) {
-      link(k, 'registry-optional');
     }
   }
 
