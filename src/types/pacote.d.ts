@@ -2,6 +2,8 @@ declare module 'pacote' {
   export interface Manifest {
     version: string;
     name?: string;
+    dependencies?: Record<string, string>;
+    peerDependencies?: Record<string, string>;
   }
 
   export interface Packument {

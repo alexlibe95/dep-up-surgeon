@@ -1,6 +1,6 @@
 {
   "name": "dep-up-surgeon",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "description": "Upgrade npm dependencies one-by-one with validation, rollback, and conflict reporting.",
   "main": "dist/cli.js",
   "bin": {

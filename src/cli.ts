@@ -111,7 +111,7 @@ async function main(): Promise<void> {
     )
     .option(
       '--link-groups <mode>',
-      'auto: upgrade Expo / React-core / custom rc groups in one step; none: one package at a time',
+      'auto: cluster deps from registry peer/dependency graph (+ @types/* pairing) + custom rc; none: one at a time',
       'auto',
     );
 

@@ -1,6 +1,6 @@
 # dep-up-surgeon
 
-Production-oriented CLI that upgrades **npm** `dependencies` and `devDependencies` with **`npm install` + validation** after each change, and **rolls back** on failure. By default it **links** related packages (Expo, React Native core, and optional groups in `.dep-up-surgeonrc`) so they bump **together** in one edit + one install; use `--link-groups none` for strict one-package-at-a-time behavior.
+Production-oriented CLI that upgrades **npm** `dependencies` and `devDependencies` with **`npm install` + validation** after each change, and **rolls back** on failure. With **`--link-groups auto`** (default) it **clusters** dependencies using the **registry graph** (see below) plus optional **`.dep-up-surgeonrc`** groups; use **`--link-groups none`** for strict one-package-at-a-time behavior.
 
 ## Install
 
@@ -34,22 +34,27 @@ dep-up-surgeon [options]
 | `--ignore <pkgs>` | Comma-separated package names to skip (merged with `.dep-up-surgeonrc`). |
 | `--json` | Machine-readable report on stdout (suppresses colored logs). |
 | `--fallback-strategy <mode>` | `major-lines` (**default**), `minor-lines`, or `none`. After `@latest` fails, **`major-lines`** tries the best stable version per **major** (e.g. `9.x` → `8.x` → `7.x` …) — fewer installs when a whole major changes behavior (e.g. **execa** 6+ is ESM-only). **`minor-lines`** steps one **`major.minor` line** at a time (more granular). If npm output looks like **ESM vs CommonJS** (`ERR_REQUIRE_ESM`), further fallbacks for that package **stop** so you don’t burn through every line. `none` only attempts `@latest`. |
-| `--link-groups <mode>` | `auto` (**default**) or `none`. **`auto`** upgrades **linked** sets in one step: built-in **`expo` + `expo-*` + `@expo/*`**, and **`react` + `react-dom` + `react-native` + `react-native-web`** when present, plus any **`linkedGroups`** from `.dep-up-surgeonrc`. **`none`** processes every dependency as its own step (legacy). |
+| `--link-groups <mode>` | `auto` (**default**) or `none`. **`auto`** builds **linked batches** from the **npm registry** (see below) and optional **`linkedGroups`** in `.dep-up-surgeonrc`. **`none`** upgrades one dependency per step. |
 
 Exit code `1` when any upgrade could not be kept (unless `--force`). Fatal errors also exit `1`.
 
-### Linked upgrade groups (Expo / React / custom)
+### How linked groups are chosen (`--link-groups auto`)
 
-Many mobile stacks break if you bump **`expo`** without the matching **`expo-*`** packages, or **`react-native`** without compatible **`react`**. With `--link-groups auto` (default), the tool:
+There are **no hardcoded Expo/React lists**. Groups are derived **dynamically** from your **direct** `dependencies` / `devDependencies`:
 
-1. Applies **custom** groups from `.dep-up-surgeonrc` `linkedGroups` first (exact package names).
-2. Puts **`expo`**, every **`expo-*`**, and **`@expo/*`** into one batch.
-3. Puts **`react`**, **`react-dom`**, **`react-native`**, **`react-native-web`** into one batch.
-4. Leaves other packages (e.g. **`react-native-reanimated`**, **`firebase`**, **`@tanstack/react-query`**) as **individual** upgrades unless you list them in **`linkedGroups`**.
+1. **Custom** groups from `.dep-up-surgeonrc` `linkedGroups` are applied **first** (exact package names).
+2. For every remaining **registry** dependency (semver / tag resolvable from npm), the tool fetches the published **`package.json`** via **`pacote`** and reads **`peerDependencies`** and **`dependencies`**.
+3. An **undirected edge** is added between two project dependencies **A** and **B** when **B** appears in **A**’s published peer or runtime deps (and both are in your project). That way **peer** and **direct** links in the npm graph become upgrade batches.
+4. **`@types/<pkg>`** is linked to **`<pkg>`** when **both** are direct dependencies (e.g. **`react`** ↔ **`@types/react`**), since TypeScript types often must move with the runtime.
+5. **Connected components** of that graph are **one batch each** (one `package.json` edit + one `npm install` + one validation). Packages that are **not** connected to anything else are upgraded **alone**.
 
-A **linked** batch resolves **`@latest`** per package, writes **all** version bumps at once, runs **one** `npm install`, then **one** test/build validation. It does **not** replace `npx expo install`’s SDK pinning — for Expo, prefer **`expo install`** when you need guaranteed SDK alignment; this feature reduces “upgrade one expo package and break peers” during automated bumps.
+**Caveats** (inherent to any graph heuristic):
 
-**Prerelease / canary** tags (e.g. `expo@…-canary-…`) are still read as semver ranges; **`@latest`** may point at a different channel than your canary line — pin or ignore if needed.
+- **SDK-style** ecosystems (e.g. Expo) only cluster if the **published** manifests expose **`peerDependencies` / `dependencies`** edges between those packages. If two packages are **not** linked in the registry metadata, they will **not** be batched together — add **`linkedGroups`** in `.dep-up-surgeonrc` for that case.
+- For **guaranteed** Expo SDK alignment, prefer **`npx expo install`**; this tool still helps **automate** semver bumps when the graph is visible to npm.
+- **Prerelease / canary** lines: **`@latest`** may not match your channel — pin or ignore as needed.
+
+**Performance**: one registry fetch per **registry** dependency when linking is enabled (batched in parallel).
 
 ### Why not only “latest”?
 
@@ -77,7 +82,7 @@ Create `.dep-up-surgeonrc` in the project root:
 
 Ignored packages are never upgraded. The CLI `--ignore` list is merged with this file.
 
-**`linkedGroups`** defines extra batches (in addition to built-in Expo / React-core). Use exact npm package names.
+**`linkedGroups`** defines **forced** batches **before** the dynamic graph runs (e.g. packages you know must move together but are not linked in registry metadata). Use exact npm package names.
 
 ## Safety
 

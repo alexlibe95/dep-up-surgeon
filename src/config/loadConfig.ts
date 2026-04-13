@@ -5,7 +5,7 @@ export interface DepUpSurgeonRc {
   /** Package names that must never be upgraded */
   ignore?: string[];
   /**
-   * Explicit linked upgrade groups (applied before built-in expo / react-core rules).
+   * Explicit linked upgrade groups (applied before the dynamic registry graph).
    * Packages listed together are bumped in one `package.json` edit + one `npm install`.
    */
   linkedGroups?: Array<{ id: string; packages: string[] }>;

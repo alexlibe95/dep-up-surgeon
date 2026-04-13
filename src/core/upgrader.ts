@@ -17,7 +17,8 @@ import {
   runNpmInstall,
 } from '../utils/npm.js';
 import { buildLineFallbackOrder } from '../utils/versionFallback.js';
-import { buildLinkedGroups } from './groups.js';
+import { buildSingletonGroups } from './groups.js';
+import { buildDynamicLinkedGroups } from './dynamicGroups.js';
 import type { LinkedGroup } from './groups.js';
 
 const BACKUP_FILENAME = 'package.json.dep-up-surgeon.bak';
@@ -725,7 +726,8 @@ async function runLinkedGroupUpgrade(
 
 /**
  * Sequential upgrade engine: validate, rollback on failure.
- * With `linkGroups: auto`, Expo / React-core (and custom rc groups) bump together.
+ * With `linkGroups: auto`, packages are clustered from registry peer/dependency graphs
+ * (and custom rc groups) so related deps bump together.
  *
  * TODO: parallel upgrades with dependency graph ordering
  * TODO: monorepo / workspaces
@@ -751,12 +753,10 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
     }
   }
 
-  const groups = buildLinkedGroups(
-    packages,
-    ignore,
-    opts.linkGroups === 'auto' ? 'auto' : 'none',
-    opts.linkedGroupsConfig,
-  );
+  const groups =
+    opts.linkGroups === 'auto'
+      ? await buildDynamicLinkedGroups(packages, ignore, opts.linkedGroupsConfig, jsonOutput)
+      : buildSingletonGroups(packages, ignore);
 
   for (const group of groups) {
     const fresh = await scanProject(cwd);
