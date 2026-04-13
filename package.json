@@ -1,6 +1,6 @@
 {
   "name": "dep-up-surgeon",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Upgrade npm dependencies one-by-one with validation, rollback, and conflict reporting.",
   "main": "dist/cli.js",
   "bin": {
@@ -35,22 +35,22 @@
   },
   "homepage": "https://github.com/alexlibe95/dep-up-surgeon#readme",
   "engines": {
-    "node": ">=18"
+    "node": "^18.17.0 || >=20.5.0"
   },
   "dependencies": {
-    "chalk": "^4.1.2",
-    "commander": "^12.1.0",
+    "chalk": "5.6.2",
+    "commander": "14.0.3",
     "execa": "^5.1.1",
-    "fs-extra": "^11.2.0",
-    "pacote": "^18.0.6",
+    "fs-extra": "11.3.4",
+    "pacote": "21.5.0",
     "prompts": "^2.4.2",
-    "semver": "^7.6.3"
+    "semver": "7.7.4"
   },
   "devDependencies": {
     "@types/fs-extra": "^11.0.4",
-    "@types/node": "^22.10.2",
+    "@types/node": "25.6.0",
     "@types/prompts": "^2.4.9",
-    "@types/semver": "^7.5.8",
+    "@types/semver": "7.7.1",
     "typescript": "^5.7.2"
   }
 }
