@@ -4,8 +4,15 @@ declare module 'pacote' {
     name?: string;
   }
 
+  export interface Packument {
+    name?: string;
+    versions?: Record<string, unknown>;
+  }
+
   export function manifest(
     spec: string,
     opts?: { fullMetadata?: boolean },
   ): Promise<Manifest>;
+
+  export function packument(spec: string, opts?: Record<string, unknown>): Promise<Packument>;
 }

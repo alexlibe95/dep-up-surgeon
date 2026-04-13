@@ -29,7 +29,11 @@ function printHumanReport(report: FinalReport): void {
     log.info(chalk.bold('Upgraded successfully'));
     for (const r of ok) {
       const forced = r.forced ? ' (forced)' : '';
-      log.success(`${r.name} ${r.from ?? '?'} → ${r.to ?? '?'}${forced}`);
+      const fb =
+        r.usedFallback && r.requestedLatest
+          ? ` — latest was ${r.requestedLatest}; fallback`
+          : '';
+      log.success(`${r.name} ${r.from ?? '?'} → ${r.to ?? '?'}${fb}${forced}`);
     }
   }
   if (skipped.length) {
@@ -96,7 +100,12 @@ async function main(): Promise<void> {
     .option('--interactive', 'Prompt when upgrades fail and after conflicts', false)
     .option('--force', 'Keep upgrades even when validation fails; relax peer rollback', false)
     .option('--ignore <pkgs>', 'Comma-separated package names to skip (merged with .dep-up-surgeonrc)')
-    .option('--json', 'Print machine-readable report to stdout', false);
+    .option('--json', 'Print machine-readable report to stdout', false)
+    .option(
+      '--fallback-strategy <mode>',
+      'When @latest fails: minor-lines (try older major.minor release lines) or none (only latest)',
+      'minor-lines',
+    );
 
   program.parse(process.argv);
   const opts = program.opts<{
@@ -105,6 +114,7 @@ async function main(): Promise<void> {
     force?: boolean;
     ignore?: string;
     json?: boolean;
+    fallbackStrategy?: string;
   }>();
 
   const cwd = process.cwd();
@@ -116,6 +126,10 @@ async function main(): Promise<void> {
   const config = await loadConfig(cwd);
   const ignore = mergeIgnoreLists(config.ignore, opts.ignore);
 
+  const fsRaw = String(opts.fallbackStrategy ?? 'minor-lines').toLowerCase();
+  const fallbackStrategy =
+    fsRaw === 'none' || fsRaw === 'off' || fsRaw === 'latest-only' ? 'none' : 'minor-lines';
+
   let report: FinalReport | null = null;
 
   try {
@@ -126,6 +140,7 @@ async function main(): Promise<void> {
       force,
       jsonOutput,
       ignore,
+      fallbackStrategy,
     });
 
     if (jsonOutput) {

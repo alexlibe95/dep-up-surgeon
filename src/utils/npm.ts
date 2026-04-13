@@ -34,6 +34,17 @@ export async function fetchLatestVersion(packageName: string): Promise<string> {
   return manifest.version;
 }
 
+/** All published version strings from the registry packument (includes prereleases). */
+export async function fetchAllPublishedVersions(packageName: string): Promise<string[]> {
+  // TODO: monorepo — scope fetches per workspace; cache packuments across packages
+  const pack = await pacote.packument(packageName);
+  const v = pack?.versions;
+  if (!v || typeof v !== 'object') {
+    return [];
+  }
+  return Object.keys(v);
+}
+
 /**
  * Run `npm install` in cwd; returns combined output for peer / error parsing.
  */

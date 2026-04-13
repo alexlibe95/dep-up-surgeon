@@ -9,9 +9,17 @@ import { addFailure, addUpgrade, createEmptyReport } from './conflict';
 import { isRegistryRange, scanProject } from './scanner';
 import { validateProject } from './validator';
 import { log } from '../utils/logger';
-import { detectPeerConflictFromOutput, fetchLatestVersion, runNpmInstall } from '../utils/npm';
+import {
+  detectPeerConflictFromOutput,
+  fetchAllPublishedVersions,
+  fetchLatestVersion,
+  runNpmInstall,
+} from '../utils/npm';
+import { buildMinorLineFallbackOrder } from '../utils/versionFallback';
 
 const BACKUP_FILENAME = 'package.json.dep-up-surgeon.bak';
+
+export type FallbackStrategy = 'minor-lines' | 'none';
 
 export interface UpgradeEngineOptions {
   cwd: string;
@@ -20,6 +28,12 @@ export interface UpgradeEngineOptions {
   force: boolean;
   jsonOutput: boolean;
   ignore: Set<string>;
+  /**
+   * `minor-lines`: if `@latest` fails (install/peer/validation), try the next
+   * best version per (major.minor) line until one passes or the list ends.
+   * `none`: only attempt the published `latest` (legacy behavior).
+   */
+  fallbackStrategy: FallbackStrategy;
 }
 
 async function readPackageJson(cwd: string): Promise<PackageJson> {
@@ -77,19 +91,19 @@ interface AttemptResult {
 }
 
 /**
- * Try upgrading one dependency to `latest`, install, validate, optionally rollback.
+ * Try upgrading one dependency to an exact `targetVersion`, install, validate, optionally rollback.
  */
 async function attemptSingleUpgrade(
   cwd: string,
   scanned: ScannedPackage,
-  latest: string,
+  targetVersion: string,
   opts: UpgradeEngineOptions,
 ): Promise<AttemptResult> {
   const { force } = opts;
   const previousRange = scanned.currentRange;
 
   let pkg = await readPackageJson(cwd);
-  pkg = setRange(pkg, scanned.section, scanned.name, latest);
+  pkg = setRange(pkg, scanned.section, scanned.name, targetVersion);
   await writePackageJson(cwd, pkg);
 
   const install = await runNpmInstall(cwd);
@@ -136,6 +150,75 @@ async function attemptSingleUpgrade(
   }
 
   return { ok: true };
+}
+
+/**
+ * Try `@latest` first, then (optional) walk down semver "release lines"
+ * (highest patch per major.minor) until one install+validation succeeds.
+ */
+async function upgradeWithReleaseLineFallbacks(
+  cwd: string,
+  scanned: ScannedPackage,
+  currentSemver: string,
+  registryLatest: string,
+  opts: UpgradeEngineOptions,
+): Promise<{
+  result: AttemptResult;
+  chosenVersion: string | null;
+  usedFallback: boolean;
+  /** Last concrete version we attempted (for reporting failed upgrades) */
+  lastAttemptedVersion: string;
+}> {
+  const { fallbackStrategy, jsonOutput } = opts;
+
+  let candidates: string[] = [registryLatest];
+  if (fallbackStrategy === 'minor-lines') {
+    try {
+      const all = await fetchAllPublishedVersions(scanned.name);
+      candidates = buildMinorLineFallbackOrder(currentSemver, registryLatest, all);
+    } catch {
+      candidates = [registryLatest];
+    }
+  }
+
+  if (candidates.length === 0) {
+    return {
+      result: { ok: false, kind: 'install', message: 'no suitable version candidates' },
+      chosenVersion: null,
+      usedFallback: false,
+      lastAttemptedVersion: registryLatest,
+    };
+  }
+
+  let last: AttemptResult = { ok: false, kind: 'install', message: 'not attempted' };
+  let lastAttemptedVersion = candidates[0]!;
+  for (let i = 0; i < candidates.length; i++) {
+    const target = candidates[i]!;
+    lastAttemptedVersion = target;
+    if (
+      i > 0 &&
+      !jsonOutput &&
+      fallbackStrategy === 'minor-lines' &&
+      candidates.length > 1
+    ) {
+      log.warn(
+        `Trying older release line: ${scanned.name}@${target} (after ${candidates[i - 1]} failed)`,
+      );
+    }
+
+    last = await attemptSingleUpgrade(cwd, scanned, target, opts);
+    if (last.ok) {
+      const usedFallback = target !== registryLatest;
+      return { result: last, chosenVersion: target, usedFallback, lastAttemptedVersion: target };
+    }
+  }
+
+  return {
+    result: last,
+    chosenVersion: null,
+    usedFallback: false,
+    lastAttemptedVersion,
+  };
 }
 
 async function promptAfterFailure(
@@ -274,10 +357,19 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
     }
 
     if (!jsonOutput) {
-      log.info(`Upgrading ${scanned.name}: ${cur.version} → ${latest} …`);
+      const fb =
+        opts.fallbackStrategy === 'minor-lines'
+          ? ' (may try older release lines if latest fails)'
+          : '';
+      log.info(`Upgrading ${scanned.name}: ${cur.version} → latest ${latest}${fb} …`);
     }
 
-    let result = await attemptSingleUpgrade(cwd, scanned, latest, opts);
+    let {
+      result,
+      chosenVersion,
+      usedFallback,
+      lastAttemptedVersion,
+    } = await upgradeWithReleaseLineFallbacks(cwd, scanned, cur.version, latest, opts);
 
     if (!result.ok && interactive) {
       const action = await promptAfterFailure(scanned.name, true);
@@ -295,24 +387,40 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
         if (!jsonOutput) {
           log.warn(`Retrying ${scanned.name} …`);
         }
-        result = await attemptSingleUpgrade(cwd, scanned, latest, opts);
+        ({
+          result,
+          chosenVersion,
+          usedFallback,
+          lastAttemptedVersion,
+        } = await upgradeWithReleaseLineFallbacks(cwd, scanned, cur.version, latest, opts));
       }
     }
 
     if (result.ok) {
+      const to = chosenVersion ?? latest;
       const row: UpgradeRecord = {
         name: scanned.name,
         success: true,
         from: cur.version,
-        to: latest,
+        to,
+        requestedLatest: latest,
+        usedFallback,
       };
       if (result.message?.includes('--force')) {
         row.forced = true;
         row.detail = result.message;
+      } else if (usedFallback) {
+        row.detail = `latest (${latest}) failed; kept highest working in older release lines`;
       }
       addUpgrade(report, row);
       if (!jsonOutput) {
-        log.success(`upgraded: ${scanned.name} → ${latest}`);
+        if (usedFallback) {
+          log.success(
+            `upgraded: ${scanned.name} → ${to} (latest ${latest} failed; fallback succeeded)`,
+          );
+        } else {
+          log.success(`upgraded: ${scanned.name} → ${to}`);
+        }
       }
     } else {
       const kind = result.kind ?? 'install';
@@ -320,7 +428,7 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
         name: scanned.name,
         reason: failureReason(kind),
         previousVersion: scanned.currentRange,
-        attemptedVersion: latest,
+        attemptedVersion: lastAttemptedVersion,
         message: result.message,
       });
       if (!jsonOutput) {

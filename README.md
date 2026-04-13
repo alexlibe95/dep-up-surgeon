@@ -33,8 +33,13 @@ dep-up-surgeon [options]
 | `--force` | Keep a version bump even when validation fails; also skips **peer-conflict rollback** when npm output suggests peer issues (use with care). |
 | `--ignore <pkgs>` | Comma-separated package names to skip (merged with `.dep-up-surgeonrc`). |
 | `--json` | Machine-readable report on stdout (suppresses colored logs). |
+| `--fallback-strategy <mode>` | `minor-lines` (**default**) or `none`. When `latest` fails install/validation/peer checks, `minor-lines` walks **down** semver by trying the **highest patch per `major.minor` release line** (e.g. if `9.6.1` fails, next try the best `9.5.x`, then `9.4.x`, … then earlier majors) until one works or the list ends. `none` only attempts the published `@latest` tag (legacy behavior). |
 
 Exit code `1` when any upgrade could not be kept (unless `--force`). Fatal errors also exit `1`.
+
+### Why not only “latest”?
+
+Packages may publish a `latest` that your project cannot adopt yet (for example **execa** 9’s **ESM-only** default, or a **TypeScript** major that breaks your build). The default strategy still **tries `latest` first**, then automatically tests older **release lines** so you often land on a **newer compatible** version without pinning forever.
 
 ## Configuration
 

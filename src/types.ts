@@ -22,6 +22,10 @@ export interface UpgradeRecord {
   reason?: FailureReason;
   detail?: string;
   forced?: boolean;
+  /** True when `to` is not the registry `@latest` because latest failed */
+  usedFallback?: boolean;
+  /** Registry `latest` dist-tag at time of upgrade (for context when `usedFallback`) */
+  requestedLatest?: string;
 }
 
 export interface ConflictEntry {
