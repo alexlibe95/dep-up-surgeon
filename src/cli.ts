@@ -103,8 +103,8 @@ async function main(): Promise<void> {
     .option('--json', 'Print machine-readable report to stdout', false)
     .option(
       '--fallback-strategy <mode>',
-      'When @latest fails: minor-lines (try older major.minor release lines) or none (only latest)',
-      'minor-lines',
+      'When @latest fails: major-lines (default, one try per major), minor-lines (one per major.minor), or none',
+      'major-lines',
     );
 
   program.parse(process.argv);
@@ -126,9 +126,16 @@ async function main(): Promise<void> {
   const config = await loadConfig(cwd);
   const ignore = mergeIgnoreLists(config.ignore, opts.ignore);
 
-  const fsRaw = String(opts.fallbackStrategy ?? 'minor-lines').toLowerCase();
-  const fallbackStrategy =
-    fsRaw === 'none' || fsRaw === 'off' || fsRaw === 'latest-only' ? 'none' : 'minor-lines';
+  const fsRaw = String(opts.fallbackStrategy ?? 'major-lines').toLowerCase();
+  const fallbackStrategy:
+    | 'major-lines'
+    | 'minor-lines'
+    | 'none' =
+    fsRaw === 'none' || fsRaw === 'off' || fsRaw === 'latest-only'
+      ? 'none'
+      : fsRaw === 'minor-lines' || fsRaw === 'minor'
+        ? 'minor-lines'
+        : 'major-lines';
 
   let report: FinalReport | null = null;
 

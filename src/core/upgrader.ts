@@ -10,16 +10,17 @@ import { isRegistryRange, scanProject } from './scanner';
 import { validateProject } from './validator';
 import { log } from '../utils/logger';
 import {
+  detectEsmCommonJsBlockage,
   detectPeerConflictFromOutput,
   fetchAllPublishedVersions,
   fetchLatestVersion,
   runNpmInstall,
 } from '../utils/npm';
-import { buildMinorLineFallbackOrder } from '../utils/versionFallback';
+import { buildLineFallbackOrder } from '../utils/versionFallback';
 
 const BACKUP_FILENAME = 'package.json.dep-up-surgeon.bak';
 
-export type FallbackStrategy = 'minor-lines' | 'none';
+export type FallbackStrategy = 'major-lines' | 'minor-lines' | 'none';
 
 export interface UpgradeEngineOptions {
   cwd: string;
@@ -29,9 +30,10 @@ export interface UpgradeEngineOptions {
   jsonOutput: boolean;
   ignore: Set<string>;
   /**
-   * `minor-lines`: if `@latest` fails (install/peer/validation), try the next
-   * best version per (major.minor) line until one passes or the list ends.
-   * `none`: only attempt the published `latest` (legacy behavior).
+   * `major-lines` (default): after `@latest` fails, try one best version per **major**
+   * (fewer installs; good when whole majors flip e.g. ESM-only).
+   * `minor-lines`: one best version per **(major.minor)** (finer steps).
+   * `none`: only attempt `@latest`.
    */
   fallbackStrategy: FallbackStrategy;
 }
@@ -88,6 +90,8 @@ interface AttemptResult {
   ok: boolean;
   kind?: FailureKind;
   message?: string;
+  /** Stop trying further fallback versions (e.g. ESM vs CommonJS for all newer releases). */
+  abortFallbacks?: boolean;
 }
 
 /**
@@ -110,12 +114,16 @@ async function attemptSingleUpgrade(
   const peerHit = detectPeerConflictFromOutput(install.output);
 
   if (!install.ok) {
+    const esm = detectEsmCommonJsBlockage(install.output);
     await writeDepRange(cwd, scanned.section, scanned.name, previousRange);
     await runNpmInstall(cwd);
     return {
       ok: false,
       kind: 'install',
-      message: `npm install failed (exit ${install.exitCode})`,
+      message: esm
+        ? `npm install failed (exit ${install.exitCode}): ESM/CommonJS mismatch (e.g. ERR_REQUIRE_ESM). Newer releases may be ESM-only while this project is CommonJS — pin the package, migrate to ESM, or ignore it.`
+        : `npm install failed (exit ${install.exitCode})`,
+      abortFallbacks: esm,
     };
   }
 
@@ -172,10 +180,11 @@ async function upgradeWithReleaseLineFallbacks(
   const { fallbackStrategy, jsonOutput } = opts;
 
   let candidates: string[] = [registryLatest];
-  if (fallbackStrategy === 'minor-lines') {
+  if (fallbackStrategy === 'major-lines' || fallbackStrategy === 'minor-lines') {
     try {
       const all = await fetchAllPublishedVersions(scanned.name);
-      candidates = buildMinorLineFallbackOrder(currentSemver, registryLatest, all);
+      const mode = fallbackStrategy === 'major-lines' ? 'major' : 'minor';
+      candidates = buildLineFallbackOrder(currentSemver, registryLatest, all, mode);
     } catch {
       candidates = [registryLatest];
     }
@@ -198,7 +207,7 @@ async function upgradeWithReleaseLineFallbacks(
     if (
       i > 0 &&
       !jsonOutput &&
-      fallbackStrategy === 'minor-lines' &&
+      (fallbackStrategy === 'major-lines' || fallbackStrategy === 'minor-lines') &&
       candidates.length > 1
     ) {
       log.warn(
@@ -210,6 +219,14 @@ async function upgradeWithReleaseLineFallbacks(
     if (last.ok) {
       const usedFallback = target !== registryLatest;
       return { result: last, chosenVersion: target, usedFallback, lastAttemptedVersion: target };
+    }
+    if (last.abortFallbacks) {
+      if (!jsonOutput) {
+        log.warn(
+          'Stopping further fallback attempts for this package (structural failure — likely same for other versions).',
+        );
+      }
+      break;
     }
   }
 
@@ -358,7 +375,7 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
 
     if (!jsonOutput) {
       const fb =
-        opts.fallbackStrategy === 'minor-lines'
+        opts.fallbackStrategy === 'major-lines' || opts.fallbackStrategy === 'minor-lines'
           ? ' (may try older release lines if latest fails)'
           : '';
       log.info(`Upgrading ${scanned.name}: ${cur.version} → latest ${latest}${fb} …`);

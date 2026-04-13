@@ -33,13 +33,13 @@ dep-up-surgeon [options]
 | `--force` | Keep a version bump even when validation fails; also skips **peer-conflict rollback** when npm output suggests peer issues (use with care). |
 | `--ignore <pkgs>` | Comma-separated package names to skip (merged with `.dep-up-surgeonrc`). |
 | `--json` | Machine-readable report on stdout (suppresses colored logs). |
-| `--fallback-strategy <mode>` | `minor-lines` (**default**) or `none`. When `latest` fails install/validation/peer checks, `minor-lines` walks **down** semver by trying the **highest patch per `major.minor` release line** (e.g. if `9.6.1` fails, next try the best `9.5.x`, then `9.4.x`, … then earlier majors) until one works or the list ends. `none` only attempts the published `@latest` tag (legacy behavior). |
+| `--fallback-strategy <mode>` | `major-lines` (**default**), `minor-lines`, or `none`. After `@latest` fails, **`major-lines`** tries the best stable version per **major** (e.g. `9.x` → `8.x` → `7.x` …) — fewer installs when a whole major changes behavior (e.g. **execa** 6+ is ESM-only). **`minor-lines`** steps one **`major.minor` line** at a time (more granular). If npm output looks like **ESM vs CommonJS** (`ERR_REQUIRE_ESM`), further fallbacks for that package **stop** so you don’t burn through every line. `none` only attempts `@latest`. |
 
 Exit code `1` when any upgrade could not be kept (unless `--force`). Fatal errors also exit `1`.
 
 ### Why not only “latest”?
 
-Packages may publish a `latest` that your project cannot adopt yet (for example **execa** 9’s **ESM-only** default, or a **TypeScript** major that breaks your build). The default strategy still **tries `latest` first**, then automatically tests older **release lines** so you often land on a **newer compatible** version without pinning forever.
+Packages may publish a `latest` that your project cannot adopt yet (for example **execa** 6+ is **ESM-only** while a `"type": "commonjs"` app still `require()`s it, or a **TypeScript** major breaks your build). The default strategy **tries `latest` first**, then walks older **release lines** so you often land on a **newer compatible** version. Use **`--fallback-strategy minor-lines`** if you want finer steps than one per major.
 
 ## Configuration
 

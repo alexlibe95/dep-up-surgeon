@@ -25,6 +25,20 @@ export function detectPeerConflictFromOutput(output: string): boolean {
 }
 
 /**
+ * Detect ESM/CJS mismatch in npm install / lifecycle output (e.g. prepare → tsc → node).
+ * When true, trying more versions in the same "family" is usually pointless — stop fallbacks.
+ */
+export function detectEsmCommonJsBlockage(output: string): boolean {
+  const t = output || '';
+  return (
+    /ERR_REQUIRE_ESM/i.test(t) ||
+    /require\(\) of ES Module/i.test(t) ||
+    /Must use import to load ES Module/i.test(t) ||
+    /Cannot use import statement outside a module/i.test(t)
+  );
+}
+
+/**
  * Latest published version for a package name (respects dist-tags; default latest).
  */
 export async function fetchLatestVersion(packageName: string): Promise<string> {

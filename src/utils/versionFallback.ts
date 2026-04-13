@@ -1,25 +1,24 @@
 import semver from 'semver';
 
-/** Max distinct (major.minor) release lines to try after `latest` fails. */
+/** Max candidates after `latest` (per strategy). */
 export const DEFAULT_MAX_FALLBACK_LINES = 40;
 
+export type FallbackLineMode = 'major' | 'minor';
+
 /**
- * When upgrading past the current version, npm's `latest` tag may point at a
- * release that breaks this project (ESM-only jump, TypeScript major, etc.).
- * Build an ordered list of concrete versions to try:
+ * Build an ordered list of concrete versions to try after `@latest` fails.
  *
- * 1. Always `registryLatest` first (the `@latest` dist-tag).
- * 2. Then, walking **down** semver order, one **best patch per (major.minor)
- *    line** — equivalent to trying "one minor line below" repeatedly across
- *    both patch and minor/major boundaries.
+ * - **major**: one best stable version per **major** (e.g. 9.6.1 → 8.0.1 → 7.2.0 …).
+ *   Fewer installs; best when whole majors change behavior (ESM-only, breaking API).
+ * - **minor**: one best stable version per **(major.minor)** line (finer steps).
  *
- * Example: current `5.1.1`, and `9.6.1` is `@latest` → try
- * `9.6.1`, then max `9.5.*`, max `9.4.*`, … then `8.x` lines, etc.
+ * Always tries `registryLatest` first, then walks the generated lines in semver-desc order.
  */
-export function buildMinorLineFallbackOrder(
+export function buildLineFallbackOrder(
   currentVersion: string,
   registryLatest: string,
   allPublishedVersions: string[],
+  mode: FallbackLineMode,
   maxLines = DEFAULT_MAX_FALLBACK_LINES,
 ): string[] {
   const cur = semver.coerce(currentVersion);
@@ -35,37 +34,46 @@ export function buildMinorLineFallbackOrder(
     .filter((v) => semver.gt(v, cur))
     .sort(semver.rcompare);
 
-  /** One representative per (major.minor): first in desc order = highest patch. */
-  const seenMinorLine = new Set<string>();
-  const onePerMinorLine: string[] = [];
+  const seen = new Set<string>();
+  const onePerLine: string[] = [];
   for (const v of newerThanCurrent) {
     const p = semver.parse(v);
     if (!p) {
       continue;
     }
-    const key = `${p.major}.${p.minor}`;
-    if (!seenMinorLine.has(key)) {
-      seenMinorLine.add(key);
-      onePerMinorLine.push(v);
-      if (onePerMinorLine.length >= maxLines) {
+    const key = mode === 'major' ? String(p.major) : `${p.major}.${p.minor}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      onePerLine.push(v);
+      if (onePerLine.length >= maxLines) {
         break;
       }
     }
   }
 
   const ordered: string[] = [];
-  const pushUnique = (v: string): void => {
-    if (semver.valid(v) && !ordered.includes(v)) {
-      ordered.push(v);
+  const pushUnique = (ver: string): void => {
+    if (semver.valid(ver) && !ordered.includes(ver)) {
+      ordered.push(ver);
     }
   };
 
   if (semver.gt(registryLatest, cur)) {
     pushUnique(registryLatest);
   }
-  for (const v of onePerMinorLine) {
+  for (const v of onePerLine) {
     pushUnique(v);
   }
 
   return ordered.slice(0, maxLines);
+}
+
+/** @deprecated use buildLineFallbackOrder(..., 'minor') */
+export function buildMinorLineFallbackOrder(
+  currentVersion: string,
+  registryLatest: string,
+  allPublishedVersions: string[],
+  maxLines = DEFAULT_MAX_FALLBACK_LINES,
+): string[] {
+  return buildLineFallbackOrder(currentVersion, registryLatest, allPublishedVersions, 'minor', maxLines);
 }
