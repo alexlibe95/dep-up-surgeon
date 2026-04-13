@@ -1,0 +1,24 @@
+{
+  "name": "dep-up-surgeon",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "bin": {
+    "dep-up-all": "./index.js"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alexlibe95/dep-up-surgeon.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/alexlibe95/dep-up-surgeon/issues"
+  },
+  "homepage": "https://github.com/alexlibe95/dep-up-surgeon#readme"
+}
