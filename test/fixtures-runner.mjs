@@ -159,3 +159,16 @@ test('fixture 12-express-style: Express-style runtime dep subset', () => {
   assert.ok(names.has('body-parser'));
   assert.ok(j.groups.length >= 1);
 });
+
+test('fixture 13-random: larger React + Vite + Tailwind style app', () => {
+  const { status, stdout, stderr } = runFixture('13-random');
+  assert.strictEqual(stderr, '');
+  assert.strictEqual(status, 0, stdout);
+  const j = parseReport(stdout);
+  const names = new Set(j.groups.flatMap((g) => g.packages ?? []));
+  assert.ok(names.has('react'));
+  assert.ok(names.has('vite'));
+  assert.ok(names.has('typescript'));
+  assert.ok(names.has('tailwindcss'));
+  assert.ok(j.groups.length >= 1);
+});

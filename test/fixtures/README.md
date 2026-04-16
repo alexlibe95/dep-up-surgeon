@@ -31,6 +31,7 @@ in each directory and check the JSON report.
 | `10-astro-minimal` | Single `astro` dep (from Astro `examples/minimal`). |
 | `11-nest-sample-cats` | Nest + RxJS (from Nest `sample/01-cats-app`, trimmed). |
 | `12-express-style` | Subset of Express’s runtime `dependencies` (many small packages). |
+| `13-random` | Synthetic “medium” React + Vite + Tailwind + ESLint stack (many deps). |
 
 ## Manual run
 
