@@ -53,13 +53,20 @@ const LINE_PATTERNS: Array<{
     }),
   },
   {
-    re: /incorrect peer dependency:\s+([^\s@]+(?:\/[^\s@]+)?)\s+@\s*([^\s]+)/i,
-    map: (m) => ({
-      depender: 'unknown',
-      dependency: m[1]!.trim(),
-      requiredRange: m[2] ?? '',
-      installedVersion: m[2],
-    }),
+    /** npm prints `incorrect peer dependency: react@18.2.0` (no space before `@`). */
+    re: /incorrect peer dependency:\s+(.+)$/i,
+    map: (m) => {
+      const p = parsePackageSpec(m[1]!.trim());
+      if (!p.version) {
+        return null;
+      }
+      return {
+        depender: 'unknown',
+        dependency: p.name,
+        requiredRange: p.version,
+        installedVersion: p.version,
+      };
+    },
   },
   {
     re: /peer dep(?:endency)?\s+not installed:\s+([^\s@]+(?:\/[^\s@]+)?@([^\s]+))/i,
@@ -70,21 +77,38 @@ const LINE_PATTERNS: Array<{
     }),
   },
   {
-    re: /Could not resolve dependency:\s+([^\s@]+(?:\/[^\s@]+)?)\s+@\s*([^\s]+)/i,
-    map: (m) => ({
-      depender: 'unknown',
-      dependency: m[1]!.trim(),
-      requiredRange: m[2] ?? '',
-    }),
+    /** npm often prints `Could not resolve dependency: foo@1.0.0` without space before `@`. */
+    re: /Could not resolve dependency:\s+(.+)$/i,
+    map: (m) => {
+      const tail = m[1]!.trim();
+      if (/^peer\s+/i.test(tail)) {
+        return null;
+      }
+      const p = parsePackageSpec(tail);
+      if (!p.version) {
+        return null;
+      }
+      return {
+        depender: 'unknown',
+        dependency: p.name,
+        requiredRange: p.version,
+      };
+    },
   },
   {
-    re: /conflicting peer dependency:\s+([^\s@]+(?:\/[^\s@]+)?)\s+@\s*([^\s]+)/i,
-    map: (m) => ({
-      depender: 'unknown',
-      dependency: m[1]!.trim(),
-      requiredRange: m[2] ?? '',
-      attemptedVersion: m[2],
-    }),
+    re: /conflicting peer dependency:\s+(.+)$/i,
+    map: (m) => {
+      const p = parsePackageSpec(m[1]!.trim());
+      if (!p.version) {
+        return null;
+      }
+      return {
+        depender: 'unknown',
+        dependency: p.name,
+        requiredRange: p.version,
+        attemptedVersion: p.version,
+      };
+    },
   },
   {
     re: /While resolving:\s+([^\s@]+(?:\/[^\s@]+)?)@([^\s]+)/i,

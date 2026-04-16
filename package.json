@@ -1,6 +1,6 @@
 {
   "name": "dep-up-surgeon",
-  "version": "1.6.1",
+  "version": "1.6.2",
   "description": "Upgrade npm dependencies one-by-one with validation, rollback, and conflict reporting.",
   "main": "dist/cli.js",
   "bin": {
@@ -14,7 +14,9 @@
     "build": "tsc",
     "prepare": "npm run build",
     "start": "node dist/cli.js",
-    "test": "echo \"No tests yet\" && exit 0"
+    "test": "npm run build && node --test test/unit/conflict-parser.test.mjs test/unit/npm-output-samples.test.mjs test/fixtures-runner.mjs",
+    "test:unit": "npm run build && node --test test/unit/conflict-parser.test.mjs test/unit/npm-output-samples.test.mjs",
+    "test:fixtures": "npm run build && node --test test/fixtures-runner.mjs"
   },
   "repository": {
     "type": "git",

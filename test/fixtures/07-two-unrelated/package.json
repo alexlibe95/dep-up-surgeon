@@ -1,0 +1,9 @@
+{
+  "name": "fixture-two-unrelated",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "lodash": "^4.17.21",
+    "once": "^1.4.0"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "ignore": [],
+  "linkedGroups": [
+    {
+      "id": "custom-bundle",
+      "packages": ["semver", "chalk"]
+    }
+  ]
+}

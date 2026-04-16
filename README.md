@@ -133,6 +133,14 @@ Use this for CI or tooling that needs structured results.
 | `cli/report.ts` | Structured report builder and optional CLI summary. |
 | `utils/registryCache.ts` / `utils/concurrency.ts` | Manifest cache and parallel fetch limits. |
 
+## Testing
+
+```bash
+npm test
+```
+
+Runs **unit tests** (conflict parsing, no network) and **fixture integration tests** (`test/fixtures/*/package.json` with `dep-up-surgeon --dry-run --json`). Fixtures require **network** access to the npm registry. See `test/fixtures/README.md`.
+
 ## Development
 
 This package is **ESM-only** (`"type": "module"`): source lives under `src/`, compiles to `dist/*.js` with **TypeScript `module: NodeNext`**, and relative imports use **`.js` extensions** in source so Node resolves them correctly.

@@ -1,0 +1,10 @@
+{
+  "name": "fixture-astro-minimal",
+  "type": "module",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Distilled from withastro/astro examples/minimal/package.json",
+  "dependencies": {
+    "astro": "^6.0.0"
+  }
+}
