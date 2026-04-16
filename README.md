@@ -15,9 +15,8 @@
 [![Commit activity](https://img.shields.io/github/commit-activity/m/alexlibe95/dep-up-surgeon.svg)](https://github.com/alexlibe95/dep-up-surgeon/graphs/commit-activity)
 [![Libraries.io release](https://img.shields.io/librariesio/release/npm/dep-up-surgeon.svg)](https://libraries.io/npm/dep-up-surgeon)
 [![Libraries.io dependents](https://img.shields.io/librariesio/dependents/npm/dep-up-surgeon.svg)](https://libraries.io/npm/dep-up-surgeon)
-[![Snyk vulnerabilities](https://snyk.io/test/npm/dep-up-surgeon/badge.svg)](https://snyk.io/test/npm/dep-up-surgeon)
 
-**Quick links:** [npm package](https://www.npmjs.com/package/dep-up-surgeon) · [GitHub repository](https://github.com/alexlibe95/dep-up-surgeon) · [Issues](https://github.com/alexlibe95/dep-up-surgeon/issues) · [Pull requests](https://github.com/alexlibe95/dep-up-surgeon/pulls) · [Socket (supply chain & maintenance)](https://socket.dev/npm/package/dep-up-surgeon) · [deps.dev (Open Source Insights)](https://deps.dev/npm/dep-up-surgeon) · [Snyk Advisor](https://snyk.io/advisor/npm-package/dep-up-surgeon) · [Libraries.io](https://libraries.io/npm/dep-up-surgeon) · [npms score](https://npms.io/search?q=dep-up-surgeon) · [Bundlephobia](https://bundlephobia.com/package/dep-up-surgeon) · [OpenSSF Scorecard (repo)](https://scorecard.dev/viewer/?uri=github.com/alexlibe95/dep-up-surgeon)
+**Quick links:** [npm package](https://www.npmjs.com/package/dep-up-surgeon) · [GitHub repository](https://github.com/alexlibe95/dep-up-surgeon) · [Issues](https://github.com/alexlibe95/dep-up-surgeon/issues) · [Pull requests](https://github.com/alexlibe95/dep-up-surgeon/pulls) · [Socket (supply chain & maintenance)](https://socket.dev/npm/package/dep-up-surgeon) · [deps.dev (Open Source Insights)](https://deps.dev/npm/dep-up-surgeon) · [Libraries.io](https://libraries.io/npm/dep-up-surgeon) · [npms score](https://npms.io/search?q=dep-up-surgeon) · [Bundlephobia](https://bundlephobia.com/package/dep-up-surgeon) · [OpenSSF Scorecard (repo)](https://scorecard.dev/viewer/?uri=github.com/alexlibe95/dep-up-surgeon)
 
 Production-oriented CLI that upgrades **npm** dependencies with **`npm install` + validation** after each change, and **rolls back** on failure. It is **framework-agnostic**: grouping and conflict handling come from **registry metadata** and **parsed npm output**, not hardcoded stacks (React, Angular, etc.).
 
@@ -29,12 +28,11 @@ Production-oriented CLI that upgrades **npm** dependencies with **`npm install` 
 | **[GitHub](https://github.com/alexlibe95/dep-up-surgeon)** | **Stars**, **forks**, **issues**, **pull requests**, **commits**, **contributors**, source tree, and (if enabled) **Dependabot** / **Security** advisories for the repo. |
 | **[Socket](https://socket.dev/npm/package/dep-up-surgeon)** | Supply-chain style view: **maintenance**, **license**, **dependencies**, and related signals npm users often open in dedicated security UIs. |
 | **[deps.dev](https://deps.dev/npm/dep-up-surgeon)** | Google **Open Source Insights**: dependency graph, versions, licenses, and cross-ecosystem metadata. |
-| **[Snyk](https://snyk.io/test/npm/dep-up-surgeon)** | Known **vulnerability** reports for the published package (always re-check with `npm audit` in *your* project). |
 | **[Libraries.io](https://libraries.io/npm/dep-up-surgeon)** | Release history, **reverse dependencies** (who depends on this package), and ecosystem metadata. |
 | **[npms](https://npms.io/search?q=dep-up-surgeon)** | Search **quality score** (maintenance, popularity, dependencies) used by many npm search front-ends. |
 | **[OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/alexlibe95/dep-up-surgeon)** | Automated **security health** checks for the GitHub repository (when the project is indexed). |
 
-**Note:** Badges above pull live data from **npm**, **GitHub**, **Libraries.io**, and **Snyk**; numbers change as the package and repo evolve. For **your** app’s risk after installing any tool, always run **`npm audit`** (and your own policy) in the project directory.
+**Note:** Badges above pull live data from **npm**, **GitHub**, and **Libraries.io**; numbers change as the package and repo evolve. For **your** app’s risk after installing any tool, always run **`npm audit`** (and your own policy) in the project directory.
 
 With **`--link-groups auto`** (default) it **clusters** upgrades using a **dependency graph** built from the npm registry (see below) plus optional **`.dep-up-surgeonrc`** `linkedGroups`. Use **`--link-groups none`** for strict one-package-at-a-time behavior.
 
@@ -149,7 +147,7 @@ Use this for CI or tooling that needs structured results.
 
 **Supply chain & registry trust**
 
-- Use the **[Package listings and security tools](#package-listings-and-security-tools)** table above for links to **Socket**, **deps.dev**, **Snyk**, **npm**, and **GitHub** signals (stars, issues, dependents).
+- Use the **[Package listings and security tools](#package-listings-and-security-tools)** table above for links to **Socket**, **deps.dev**, **npm**, and **GitHub** signals (stars, issues, dependents).
 - After installing or upgrading dependencies—including this tool—run **`npm audit`** in your project and follow your organization’s policy for **allowlists** and **lockfile** review.
 
 ## Output example
