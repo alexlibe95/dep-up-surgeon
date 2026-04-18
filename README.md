@@ -15,8 +15,11 @@
 [![Commit activity](https://img.shields.io/github/commit-activity/m/alexlibe95/dep-up-surgeon.svg)](https://github.com/alexlibe95/dep-up-surgeon/graphs/commit-activity)
 [![Libraries.io release](https://img.shields.io/librariesio/release/npm/dep-up-surgeon.svg)](https://libraries.io/npm/dep-up-surgeon)
 [![Libraries.io dependents](https://img.shields.io/librariesio/dependents/npm/dep-up-surgeon.svg)](https://libraries.io/npm/dep-up-surgeon)
+[![Website](https://img.shields.io/website?url=https%3A%2F%2Fdep-up-surgeon.netlify.app%2F&label=website)](https://dep-up-surgeon.netlify.app/)
 
-**Quick links:** [npm package](https://www.npmjs.com/package/dep-up-surgeon) · [GitHub repository](https://github.com/alexlibe95/dep-up-surgeon) · [Issues](https://github.com/alexlibe95/dep-up-surgeon/issues) · [Pull requests](https://github.com/alexlibe95/dep-up-surgeon/pulls) · [Socket (supply chain & maintenance)](https://socket.dev/npm/package/dep-up-surgeon) · [deps.dev (Open Source Insights)](https://deps.dev/npm/dep-up-surgeon) · [Libraries.io](https://libraries.io/npm/dep-up-surgeon) · [npms score](https://npms.io/search?q=dep-up-surgeon) · [Bundlephobia](https://bundlephobia.com/package/dep-up-surgeon) · [OpenSSF Scorecard (repo)](https://scorecard.dev/viewer/?uri=github.com/alexlibe95/dep-up-surgeon)
+**Website:** [https://dep-up-surgeon.netlify.app/](https://dep-up-surgeon.netlify.app/)
+
+**Quick links:** [Website](https://dep-up-surgeon.netlify.app/) · [npm package](https://www.npmjs.com/package/dep-up-surgeon) · [GitHub repository](https://github.com/alexlibe95/dep-up-surgeon) · [Issues](https://github.com/alexlibe95/dep-up-surgeon/issues) · [Pull requests](https://github.com/alexlibe95/dep-up-surgeon/pulls) · [Socket (supply chain & maintenance)](https://socket.dev/npm/package/dep-up-surgeon) · [deps.dev (Open Source Insights)](https://deps.dev/npm/dep-up-surgeon) · [Libraries.io](https://libraries.io/npm/dep-up-surgeon) · [npms score](https://npms.io/search?q=dep-up-surgeon) · [Bundlephobia](https://bundlephobia.com/package/dep-up-surgeon) · [OpenSSF Scorecard (repo)](https://scorecard.dev/viewer/?uri=github.com/alexlibe95/dep-up-surgeon)
 
 Production-oriented CLI that upgrades **npm** dependencies with **`npm install` + validation** after each change, and **rolls back** on failure. It is **framework-agnostic**: grouping and conflict handling come from **registry metadata** and **parsed npm output**, not hardcoded stacks (React, Angular, etc.).
 
@@ -24,6 +27,7 @@ Production-oriented CLI that upgrades **npm** dependencies with **`npm install` 
 
 | Where | What you get |
 |--------|----------------|
+| **[Website](https://dep-up-surgeon.netlify.app/)** | Project landing page: overview, live demo/session log, feature highlights, install commands, and flag reference. |
 | **[npm](https://www.npmjs.com/package/dep-up-surgeon)** | Current version, **readme**, **dependencies**, dist tags, publish time, tarball **integrity** (`sha512`), download counts, maintainers, and npm’s own **Security** / advisory context for the ecosystem. |
 | **[GitHub](https://github.com/alexlibe95/dep-up-surgeon)** | **Stars**, **forks**, **issues**, **pull requests**, **commits**, **contributors**, source tree, and (if enabled) **Dependabot** / **Security** advisories for the repo. |
 | **[Socket](https://socket.dev/npm/package/dep-up-surgeon)** | Supply-chain style view: **maintenance**, **license**, **dependencies**, and related signals npm users often open in dedicated security UIs. |

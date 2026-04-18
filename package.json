@@ -1,6 +1,6 @@
 {
   "name": "dep-up-surgeon",
-  "version": "1.6.5",
+  "version": "1.6.6",
   "description": "Upgrade npm dependencies one-by-one with validation, rollback, and conflict reporting.",
   "main": "dist/cli.js",
   "bin": {
@@ -35,7 +35,7 @@
   "bugs": {
     "url": "https://github.com/alexlibe95/dep-up-surgeon/issues"
   },
-  "homepage": "https://github.com/alexlibe95/dep-up-surgeon#readme",
+  "homepage": "https://dep-up-surgeon.netlify.app/",
   "engines": {
     "node": "^20.17.0 || >=22.9.0"
   },
