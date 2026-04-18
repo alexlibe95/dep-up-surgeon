@@ -1,0 +1,44 @@
+{
+  "upgraded": [],
+  "skipped": [
+    {
+      "name": "semver",
+      "success": true,
+      "skipped": true,
+      "from": "7.6.0",
+      "to": "7.7.4",
+      "reason": "skipped",
+      "detail": "dry-run"
+    }
+  ],
+  "failed": [],
+  "conflicts": [],
+  "unresolved": [],
+  "groups": [
+    {
+      "id": "single:semver",
+      "packages": [
+        "semver"
+      ]
+    }
+  ],
+  "project": {
+    "manager": "npm",
+    "managerSource": "default",
+    "hasWorkspaces": false,
+    "workspaceGlobs": [],
+    "workspaceMembers": []
+  },
+  "targets": [
+    {
+      "label": "root",
+      "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/05-root-name-app",
+      "packageJson": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/05-root-name-app/package.json"
+    }
+  ],
+  "installMode": "root",
+  "finishedAt": "2026-04-18T18:43:54.673Z",
+  "toolVersion": "1.6.6",
+  "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/05-root-name-app",
+  "dryRun": true
+}

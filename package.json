@@ -1,6 +1,6 @@
 {
   "name": "dep-up-surgeon",
-  "version": "1.6.6",
+  "version": "2.0.0",
   "description": "Upgrade npm dependencies one-by-one with validation, rollback, and conflict reporting.",
   "main": "dist/cli.js",
   "bin": {
@@ -14,8 +14,8 @@
     "build": "tsc",
     "prepare": "npm run build",
     "start": "node dist/cli.js",
-    "test": "npm run build && node --test test/unit/conflict-parser.test.mjs test/unit/npm-output-samples.test.mjs test/fixtures-runner.mjs",
-    "test:unit": "npm run build && node --test test/unit/conflict-parser.test.mjs test/unit/npm-output-samples.test.mjs",
+    "test": "npm run build && node --test test/unit/conflict-parser.test.mjs test/unit/npm-output-samples.test.mjs test/unit/workspaces.test.mjs test/unit/output-tail.test.mjs test/unit/upgrade-flow-targets.test.mjs test/unit/last-run-retry.test.mjs test/unit/summary.test.mjs test/unit/install-filter.test.mjs test/unit/concurrency.test.mjs test/unit/git.test.mjs test/fixtures-runner.mjs",
+    "test:unit": "npm run build && node --test test/unit/conflict-parser.test.mjs test/unit/npm-output-samples.test.mjs test/unit/workspaces.test.mjs test/unit/output-tail.test.mjs test/unit/upgrade-flow-targets.test.mjs test/unit/last-run-retry.test.mjs test/unit/summary.test.mjs test/unit/install-filter.test.mjs test/unit/concurrency.test.mjs test/unit/git.test.mjs",
     "test:fixtures": "npm run build && node --test test/fixtures-runner.mjs"
   },
   "repository": {

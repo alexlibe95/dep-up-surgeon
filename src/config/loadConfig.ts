@@ -9,6 +9,17 @@ export interface DepUpSurgeonRc {
    * Packages listed together are bumped in one `package.json` edit + one `npm install`.
    */
   linkedGroups?: Array<{ id: string; packages: string[] }>;
+  /**
+   * Override the validator command. Accepts either a shell string (run with `shell: true`)
+   * or `{ command?: string; skip?: boolean }`. When omitted, defaults are
+   * `npm test` → `npm run build` → no-op.
+   *
+   * Examples:
+   *   "validate": "tsc -p tsconfig.json --noEmit"
+   *   "validate": { "command": "pnpm -r build" }
+   *   "validate": { "skip": true }
+   */
+  validate?: string | { command?: string; skip?: boolean };
 }
 
 const CONFIG_FILENAME = '.dep-up-surgeonrc';
@@ -46,13 +57,63 @@ export async function loadConfig(cwd: string): Promise<DepUpSurgeonRc> {
           }));
       }
     }
+    let validate: DepUpSurgeonRc['validate'] = undefined;
+    if (typeof parsed.validate === 'string') {
+      const trimmed = parsed.validate.trim();
+      if (trimmed) {
+        validate = trimmed;
+      }
+    } else if (parsed.validate && typeof parsed.validate === 'object') {
+      const v = parsed.validate as { command?: unknown; skip?: unknown };
+      const out: { command?: string; skip?: boolean } = {};
+      if (typeof v.command === 'string' && v.command.trim()) {
+        out.command = v.command.trim();
+      }
+      if (typeof v.skip === 'boolean') {
+        out.skip = v.skip;
+      }
+      if (out.command || out.skip !== undefined) {
+        validate = out;
+      }
+    }
+
     return {
       ignore: parsed.ignore?.map(String) ?? [],
       linkedGroups: linkedGroups ?? [],
+      ...(validate !== undefined ? { validate } : {}),
     };
   } catch {
     return {};
   }
+}
+
+/**
+ * Resolve the effective validator settings combining CLI flags with `.dep-up-surgeonrc.validate`.
+ * CLI flags always win over the rc file.
+ */
+export function resolveValidateOptions(
+  configValidate: DepUpSurgeonRc['validate'],
+  cliValidateCmd: string | undefined,
+  cliNoValidate: boolean,
+): { command?: string; skip?: boolean; source?: 'cli' | 'config' } {
+  if (cliNoValidate) {
+    return { skip: true, source: 'cli' };
+  }
+  if (typeof cliValidateCmd === 'string' && cliValidateCmd.trim()) {
+    return { command: cliValidateCmd.trim(), source: 'cli' };
+  }
+  if (typeof configValidate === 'string') {
+    return { command: configValidate, source: 'config' };
+  }
+  if (configValidate && typeof configValidate === 'object') {
+    if (configValidate.skip) {
+      return { skip: true, source: 'config' };
+    }
+    if (configValidate.command) {
+      return { command: configValidate.command, source: 'config' };
+    }
+  }
+  return {};
 }
 
 /**

@@ -1,8 +1,11 @@
 import semver from 'semver';
 import { fetchAllPublishedVersions } from '../utils/npm.js';
+import type { RegistryCache } from '../utils/concurrency.js';
 
 export interface ResolverContext {
   getManifestAtVersion: (name: string, version: string) => Promise<unknown>;
+  /** Optional shared registry cache (deduplicates identical fetches across calls). */
+  registryCache?: RegistryCache;
 }
 
 /**
@@ -31,9 +34,8 @@ export function satisfiesAllPeerRanges(v: string, ranges: string[]): boolean {
 export async function findHighestCompatibleVersion(
   packageName: string,
   mustSatisfy: string[],
-  _ctx?: ResolverContext,
+  ctx?: ResolverContext,
 ): Promise<string | null> {
-  void _ctx;
   const ranges = mustSatisfy.map((r) => r.trim()).filter(Boolean);
   if (ranges.length === 0) {
     return null;
@@ -41,7 +43,7 @@ export async function findHighestCompatibleVersion(
 
   let versions: string[];
   try {
-    versions = await fetchAllPublishedVersions(packageName);
+    versions = await fetchAllPublishedVersions(packageName, ctx?.registryCache);
   } catch {
     return null;
   }

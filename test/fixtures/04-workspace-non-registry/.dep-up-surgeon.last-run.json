@@ -1,0 +1,57 @@
+{
+  "upgraded": [],
+  "skipped": [
+    {
+      "name": "left-pad",
+      "success": true,
+      "skipped": true,
+      "from": "1.3.0",
+      "to": "1.3.0",
+      "reason": "skipped",
+      "detail": "already latest"
+    },
+    {
+      "name": "local-lib",
+      "success": true,
+      "skipped": true,
+      "reason": "skipped",
+      "detail": "non-registry or non-semver range (workspace/link/git)"
+    }
+  ],
+  "failed": [],
+  "conflicts": [],
+  "unresolved": [],
+  "groups": [
+    {
+      "id": "single:left-pad",
+      "packages": [
+        "left-pad"
+      ]
+    },
+    {
+      "id": "single:local-lib",
+      "packages": [
+        "local-lib"
+      ]
+    }
+  ],
+  "project": {
+    "manager": "npm",
+    "managerSource": "default",
+    "hasWorkspaces": false,
+    "workspaceGlobs": [],
+    "workspaceMembers": []
+  },
+  "targets": [
+    {
+      "label": "root",
+      "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/04-workspace-non-registry",
+      "packageJson": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/04-workspace-non-registry/package.json"
+    }
+  ],
+  "installMode": "root",
+  "finishedAt": "2026-04-18T18:43:53.609Z",
+  "toolVersion": "1.6.6",
+  "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/04-workspace-non-registry",
+  "dryRun": true
+}

@@ -1,0 +1,44 @@
+{
+  "upgraded": [],
+  "skipped": [
+    {
+      "name": "lodash",
+      "success": true,
+      "skipped": true,
+      "from": "4.17.21",
+      "to": "4.18.1",
+      "reason": "skipped",
+      "detail": "dry-run"
+    }
+  ],
+  "failed": [],
+  "conflicts": [],
+  "unresolved": [],
+  "groups": [
+    {
+      "id": "single:lodash",
+      "packages": [
+        "lodash"
+      ]
+    }
+  ],
+  "project": {
+    "manager": "npm",
+    "managerSource": "default",
+    "hasWorkspaces": false,
+    "workspaceGlobs": [],
+    "workspaceMembers": []
+  },
+  "targets": [
+    {
+      "label": "root",
+      "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/01-minimal-single",
+      "packageJson": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/01-minimal-single/package.json"
+    }
+  ],
+  "installMode": "root",
+  "finishedAt": "2026-04-18T18:43:57.891Z",
+  "toolVersion": "1.6.6",
+  "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/01-minimal-single",
+  "dryRun": true
+}

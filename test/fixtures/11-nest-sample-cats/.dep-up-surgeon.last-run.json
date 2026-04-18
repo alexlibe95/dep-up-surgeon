@@ -1,0 +1,182 @@
+{
+  "upgraded": [],
+  "skipped": [
+    {
+      "name": "@nestjs/cli",
+      "success": true,
+      "skipped": true,
+      "from": "11.0.0",
+      "to": "11.0.21",
+      "reason": "skipped",
+      "detail": "dry-run"
+    },
+    {
+      "name": "class-transformer",
+      "success": true,
+      "skipped": true,
+      "from": "0.5.1",
+      "to": "0.5.1",
+      "reason": "skipped",
+      "detail": "already latest",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "reflect-metadata",
+      "success": true,
+      "skipped": true,
+      "from": "0.2.2",
+      "to": "0.2.2",
+      "reason": "skipped",
+      "detail": "already latest",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "@nestjs/common",
+      "success": true,
+      "skipped": true,
+      "from": "11.1.0",
+      "to": "11.1.19",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "@nestjs/core",
+      "success": true,
+      "skipped": true,
+      "from": "11.1.0",
+      "to": "11.1.19",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "@nestjs/platform-express",
+      "success": true,
+      "skipped": true,
+      "from": "11.1.0",
+      "to": "11.1.19",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "@nestjs/testing",
+      "success": true,
+      "skipped": true,
+      "from": "11.1.0",
+      "to": "11.1.19",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "class-validator",
+      "success": true,
+      "skipped": true,
+      "from": "0.15.0",
+      "to": "0.15.1",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "rxjs",
+      "success": true,
+      "skipped": true,
+      "from": "7.8.0",
+      "to": "7.8.2",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "@types/express",
+      "success": true,
+      "skipped": true,
+      "from": "5.0.0",
+      "to": "5.0.6",
+      "reason": "skipped",
+      "detail": "dry-run"
+    },
+    {
+      "name": "@types/node",
+      "success": true,
+      "skipped": true,
+      "from": "24.0.0",
+      "to": "25.6.0",
+      "reason": "skipped",
+      "detail": "dry-run"
+    },
+    {
+      "name": "typescript",
+      "success": true,
+      "skipped": true,
+      "from": "5.9.0",
+      "to": "6.0.3",
+      "reason": "skipped",
+      "detail": "dry-run"
+    }
+  ],
+  "failed": [],
+  "conflicts": [],
+  "unresolved": [],
+  "groups": [
+    {
+      "id": "single:@nestjs/cli",
+      "packages": [
+        "@nestjs/cli"
+      ]
+    },
+    {
+      "id": "graph-0",
+      "packages": [
+        "@nestjs/common",
+        "@nestjs/core",
+        "@nestjs/platform-express",
+        "@nestjs/testing",
+        "class-transformer",
+        "class-validator",
+        "reflect-metadata",
+        "rxjs"
+      ]
+    },
+    {
+      "id": "single:@types/express",
+      "packages": [
+        "@types/express"
+      ]
+    },
+    {
+      "id": "single:@types/node",
+      "packages": [
+        "@types/node"
+      ]
+    },
+    {
+      "id": "single:typescript",
+      "packages": [
+        "typescript"
+      ]
+    }
+  ],
+  "project": {
+    "manager": "npm",
+    "managerSource": "default",
+    "hasWorkspaces": false,
+    "workspaceGlobs": [],
+    "workspaceMembers": []
+  },
+  "targets": [
+    {
+      "label": "root",
+      "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/11-nest-sample-cats",
+      "packageJson": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/11-nest-sample-cats/package.json"
+    }
+  ],
+  "installMode": "root",
+  "finishedAt": "2026-04-18T18:44:13.026Z",
+  "toolVersion": "1.6.6",
+  "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/11-nest-sample-cats",
+  "dryRun": true
+}

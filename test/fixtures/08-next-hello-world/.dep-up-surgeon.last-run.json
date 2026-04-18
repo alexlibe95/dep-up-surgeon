@@ -1,0 +1,119 @@
+{
+  "upgraded": [],
+  "skipped": [
+    {
+      "name": "@types/node",
+      "success": true,
+      "skipped": true,
+      "from": "20.10.0",
+      "to": "25.6.0",
+      "reason": "skipped",
+      "detail": "dry-run"
+    },
+    {
+      "name": "@types/react",
+      "success": true,
+      "skipped": true,
+      "from": "18.2.0",
+      "to": "19.2.14",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "@types/react-dom",
+      "success": true,
+      "skipped": true,
+      "from": "18.2.0",
+      "to": "19.2.3",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "next",
+      "success": true,
+      "skipped": true,
+      "from": "15.1.0",
+      "to": "16.2.4",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "react",
+      "success": true,
+      "skipped": true,
+      "from": "18.2.0",
+      "to": "19.2.5",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "react-dom",
+      "success": true,
+      "skipped": true,
+      "from": "18.2.0",
+      "to": "19.2.5",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "typescript",
+      "success": true,
+      "skipped": true,
+      "from": "5.3.0",
+      "to": "6.0.3",
+      "reason": "skipped",
+      "detail": "dry-run"
+    }
+  ],
+  "failed": [],
+  "conflicts": [],
+  "unresolved": [],
+  "groups": [
+    {
+      "id": "single:@types/node",
+      "packages": [
+        "@types/node"
+      ]
+    },
+    {
+      "id": "graph-0",
+      "packages": [
+        "@types/react",
+        "@types/react-dom",
+        "next",
+        "react",
+        "react-dom"
+      ]
+    },
+    {
+      "id": "single:typescript",
+      "packages": [
+        "typescript"
+      ]
+    }
+  ],
+  "project": {
+    "manager": "npm",
+    "managerSource": "default",
+    "hasWorkspaces": false,
+    "workspaceGlobs": [],
+    "workspaceMembers": []
+  },
+  "targets": [
+    {
+      "label": "root",
+      "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/08-next-hello-world",
+      "packageJson": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/08-next-hello-world/package.json"
+    }
+  ],
+  "installMode": "root",
+  "finishedAt": "2026-04-18T18:44:02.361Z",
+  "toolVersion": "1.6.6",
+  "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/08-next-hello-world",
+  "dryRun": true
+}

@@ -1,0 +1,59 @@
+{
+  "upgraded": [],
+  "skipped": [
+    {
+      "name": "lodash",
+      "success": true,
+      "skipped": true,
+      "from": "4.17.21",
+      "to": "4.18.1",
+      "reason": "skipped",
+      "detail": "dry-run"
+    },
+    {
+      "name": "once",
+      "success": true,
+      "skipped": true,
+      "from": "1.4.0",
+      "to": "1.4.0",
+      "reason": "skipped",
+      "detail": "already latest"
+    }
+  ],
+  "failed": [],
+  "conflicts": [],
+  "unresolved": [],
+  "groups": [
+    {
+      "id": "single:lodash",
+      "packages": [
+        "lodash"
+      ]
+    },
+    {
+      "id": "single:once",
+      "packages": [
+        "once"
+      ]
+    }
+  ],
+  "project": {
+    "manager": "npm",
+    "managerSource": "default",
+    "hasWorkspaces": false,
+    "workspaceGlobs": [],
+    "workspaceMembers": []
+  },
+  "targets": [
+    {
+      "label": "root",
+      "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/07-two-unrelated",
+      "packageJson": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/07-two-unrelated/package.json"
+    }
+  ],
+  "installMode": "root",
+  "finishedAt": "2026-04-18T18:43:57.060Z",
+  "toolVersion": "1.6.6",
+  "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/07-two-unrelated",
+  "dryRun": true
+}

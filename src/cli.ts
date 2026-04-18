@@ -5,12 +5,27 @@ import chalk from 'chalk';
 import fs from 'fs-extra';
 import { program } from 'commander';
 import prompts from 'prompts';
-import { appendIgnoreToRc, loadConfig, mergeIgnoreLists } from './config/loadConfig.js';
+import {
+  appendIgnoreToRc,
+  loadConfig,
+  mergeIgnoreLists,
+  resolveValidateOptions,
+} from './config/loadConfig.js';
 import { buildStructuredReport, printStructuredCliSummary } from './cli/report.js';
+import {
+  computeRetryFailedIgnores,
+  LAST_RUN_FILENAME,
+  loadLastRunReport,
+  persistLastRunReport,
+} from './cli/lastRun.js';
+import { resolveSummaryDestination, writeSummary, type SummaryFormat } from './cli/summary.js';
+import { checkoutBranch, getCurrentBranch, type GitCommitMode } from './cli/git.js';
+import { createGitFlow, type GitFlowController } from './cli/gitFlow.js';
 import {
   BACKUP_FILENAME,
   restoreInitialFromBackup,
-  runUpgradeEngine,
+  runUpgradeFlow,
+  type WorkspaceMode,
 } from './core/upgrader.js';
 import type { FinalReport } from './types.js';
 import { log } from './utils/logger.js';
@@ -23,8 +38,22 @@ async function readSelfVersion(): Promise<string> {
   return pkg.version ?? '0.0.0';
 }
 
+function tagWs(workspace: string | undefined): string {
+  return workspace && workspace !== 'root' ? ` [${workspace}]` : '';
+}
+
 function printHumanReport(report: FinalReport): void {
   log.title('Summary');
+
+  if (report.project) {
+    const p = report.project;
+    const mgr = `${p.manager}${p.managerVersion ? '@' + p.managerVersion : ''}`;
+    const wsTail = p.hasWorkspaces ? `, workspaces: ${p.workspaceMembers.length}` : '';
+    log.dim(`Project: ${mgr} (via ${p.managerSource}${wsTail})`);
+  }
+  if (report.targets && report.targets.length > 1) {
+    log.dim(`Targets: ${report.targets.map((t) => t.label).join(', ')}`);
+  }
 
   const ok = report.upgraded.filter((r) => r.success && !r.skipped);
   const skipped = report.upgraded.filter((r) => r.skipped);
@@ -36,24 +65,48 @@ function printHumanReport(report: FinalReport): void {
         r.usedFallback && r.requestedLatest
           ? ` — latest was ${r.requestedLatest}; fallback`
           : '';
-      log.success(`${r.name} ${r.from ?? '?'} → ${r.to ?? '?'}${fb}${forced}`);
+      log.success(`${r.name}${tagWs(r.workspace)} ${r.from ?? '?'} → ${r.to ?? '?'}${fb}${forced}`);
     }
   }
   if (skipped.length) {
     log.info(chalk.bold('Skipped / no change'));
     for (const r of skipped) {
-      log.dim(`  ${r.name}: ${r.detail ?? r.reason ?? 'skipped'}`);
+      log.dim(`  ${r.name}${tagWs(r.workspace)}: ${r.detail ?? r.reason ?? 'skipped'}`);
     }
   }
   if (report.failed.length) {
     log.info(chalk.bold('Failed or rolled back'));
     for (const f of report.failed) {
+      const tag = tagWs(f.workspace);
       if (f.reason === 'peer') {
-        log.peer(`${f.name} — ${f.message ?? 'peer dependency conflict'}`);
+        log.peer(`${f.name}${tag} — ${f.message ?? 'peer dependency conflict'}`);
+      } else if (f.reason === 'validation-script') {
+        log.error(
+          `${f.name}${tag}: validator script failed — ${f.validation?.command ?? 'unknown'} (exit ${f.validation?.exitCode ?? '?'}).` +
+            ' This is NOT a dependency conflict; fix the script or pass --force / --no-validate.',
+        );
       } else {
-        log.error(`${f.name}: ${f.message ?? f.reason}`);
+        log.error(`${f.name}${tag}: ${f.message ?? f.reason}`);
+      }
+      if (f.install) {
+        const status = f.install.ok
+          ? `${f.install.command} exited 0 (rolled back due to post-install scan)`
+          : `${f.install.command} exited ${f.install.exitCode ?? '?'}`;
+        log.dim(`  install: ${status}`);
+        if (f.install.lastLines) {
+          const head = f.install.lastLines.split(/\r?\n/).slice(0, 8).join('\n    ');
+          log.dim(`    ${head}`);
+        }
       }
     }
+  }
+  if (report.preflightAborted && report.preflight) {
+    log.error(
+      `Aborted before upgrades: pre-flight validator \`${report.preflight.command}\` is already failing (exit ${report.preflight.exitCode ?? '?'}).`,
+    );
+    log.info(
+      'Re-run with --validate "<cmd>", --no-validate, or --force after fixing the project build.',
+    );
   }
   if (report.ignored.length) {
     log.dim(`Ignored packages: ${report.ignored.join(', ')}`);
@@ -113,6 +166,99 @@ async function main(): Promise<void> {
       '--link-groups <mode>',
       'auto: cluster deps from registry peer/dependency graph (+ @types/* pairing) + custom rc; none: one at a time',
       'auto',
+    )
+    .option(
+      '--validate <cmd>',
+      'Override the validator command run after every install (defaults to `npm test` then `npm run build`).',
+    )
+    .option(
+      '--no-validate',
+      'Skip the validator entirely (upgrades are kept regardless of test/build outcome). Different from --force, which keeps upgrades only when the validator fails.',
+    )
+    .option(
+      '--package-manager <mgr>',
+      'Override detected package manager: auto (default), npm, pnpm, or yarn. `auto` reads `packageManager` field, then lockfile, then falls back to npm.',
+      'auto',
+    )
+    .option(
+      '--include-workspace-deps',
+      'Treat workspace-internal dependencies (names matching a local workspace package) like any other dep. By default they are skipped because their version comes from the local workspace, not the registry.',
+      false,
+    )
+    .option(
+      '--workspaces',
+      'Traverse the root package.json AND every workspace member. Install + validation always run from the workspace root so the lockfile and validator see the whole monorepo.',
+      false,
+    )
+    .option(
+      '--workspaces-only',
+      'Traverse only workspace members; skip the root package.json. Implies --workspaces.',
+      false,
+    )
+    .option(
+      '--workspace <names>',
+      'Comma-separated workspace member names to traverse (use the package `name` from each child package.json). Pass `root` to also include the root. Example: --workspace "@org/core,@org/web,root".',
+    )
+    .option(
+      '--install-mode <mode>',
+      'Workspace install strategy: `root` (default; always install the whole tree from the workspace root — safest) or `filtered` (npm `-w <name>` / pnpm `--filter <name>` per child target). Yarn falls back to a full install with a warning. Only matters with --workspaces / --workspace.',
+      'root',
+    )
+    .option(
+      '--concurrency <n>',
+      'Maximum number of workspace targets to scan/plan in parallel (1-16; default 1). Higher values overlap registry fetches across targets while a shared mutex keeps installs and validation serialized (the lockfile is shared). Requires --json to keep per-target log lines from interleaving — non-JSON mode silently downgrades to 1 with a warning.',
+      '1',
+    )
+    .option(
+      '--no-persist-report',
+      `Do not write the structured report to ${LAST_RUN_FILENAME} after the run. By default the report is written next to the workspace root for inspection by CI / --retry-failed.`,
+    )
+    .option(
+      '--retry-failed',
+      `Read ${LAST_RUN_FILENAME} from the previous run and only reattempt entries that failed for non-terminal reasons (i.e. NOT 'peer' or 'validation-script'). Successful upgrades + terminal failures from the last run are added to the ignore list automatically.`,
+      false,
+    )
+    .option(
+      '--summary <format>',
+      'Write a human-friendly summary of the run as `md` (default) or `html`. Destination: $GITHUB_STEP_SUMMARY if set (appended), otherwise --summary-file <path>, otherwise ./dep-up-surgeon-summary.<ext>.',
+    )
+    .option(
+      '--summary-file <path>',
+      'Override the destination for --summary. Wins over $GITHUB_STEP_SUMMARY.',
+    )
+    .option(
+      '--ci',
+      'Convenience flag for CI / bot use: disables --interactive, auto-enables --summary md (great with $GITHUB_STEP_SUMMARY), and exits 0 even when individual upgrades fail (only pre-flight failures and fatal errors exit 1) so per-package conflicts surface in the PR description instead of failing the job.',
+      false,
+    )
+    .option(
+      '--git-commit',
+      'Commit successful upgrades to git as the run progresses. Refuses to start on a dirty tree (override with --git-allow-dirty); only stages package.json + the lockfile (never `git add -A`). Skipped silently in --dry-run.',
+      false,
+    )
+    .option(
+      '--git-commit-mode <mode>',
+      'How to group commits: `per-success` (default — one commit per upgrade; best for review), `per-target` (one commit per workspace), or `all` (one squashed commit at the end).',
+      'per-success',
+    )
+    .option(
+      '--git-commit-prefix <prefix>',
+      'String prepended to every commit message (default `"deps: "`). Use e.g. `"chore(deps): "` for Conventional Commits.',
+      'deps: ',
+    )
+    .option(
+      '--git-branch <name>',
+      'Create + checkout this branch before any commits. If the branch already exists, switches to it. Useful for `--ci` PR workflows.',
+    )
+    .option(
+      '--git-sign',
+      'Pass --gpg-sign to every commit. Requires a signing key configured for git.',
+      false,
+    )
+    .option(
+      '--git-allow-dirty',
+      'Allow --git-commit on a dirty working tree. We still only `git add` files we touched, but YOUR pre-existing dirty files will land in the same commit if you also stage them manually.',
+      false,
     );
 
   program.parse(process.argv);
@@ -124,16 +270,82 @@ async function main(): Promise<void> {
     json?: boolean;
     fallbackStrategy?: string;
     linkGroups?: string;
+    validate?: string | boolean;
+    packageManager?: string;
+    includeWorkspaceDeps?: boolean;
+    workspaces?: boolean;
+    workspacesOnly?: boolean;
+    workspace?: string;
+    installMode?: string;
+    concurrency?: string;
+    persistReport?: boolean; // commander turns `--no-persist-report` into `persistReport: false`
+    retryFailed?: boolean;
+    summary?: string;
+    summaryFile?: string;
+    ci?: boolean;
+    gitCommit?: boolean;
+    gitCommitMode?: string;
+    gitCommitPrefix?: string;
+    gitBranch?: string;
+    gitSign?: boolean;
+    gitAllowDirty?: boolean;
   }>();
 
   const cwd = process.cwd();
   const dryRun = Boolean(opts.dryRun);
-  const interactive = Boolean(opts.interactive);
+  const ciMode = Boolean(opts.ci);
+  // --ci is a no-prompt convenience for bots: force interactive off so we never block on stdin.
+  const interactive = Boolean(opts.interactive) && !ciMode;
   const force = Boolean(opts.force);
   const jsonOutput = Boolean(opts.json);
 
+  // Resolve --summary. Explicit flag wins; otherwise --ci auto-enables md.
+  let summaryFormat: SummaryFormat | undefined;
+  if (typeof opts.summary === 'string') {
+    const v = opts.summary.toLowerCase();
+    if (v !== 'md' && v !== 'html') {
+      log.error(`--summary: unknown format "${opts.summary}". Use "md" or "html".`);
+      process.exitCode = 1;
+      return;
+    }
+    summaryFormat = v;
+  } else if (ciMode) {
+    summaryFormat = 'md';
+  }
+
   const config = await loadConfig(cwd);
   const ignore = mergeIgnoreLists(config.ignore, opts.ignore);
+
+  if (opts.retryFailed) {
+    const last = await loadLastRunReport(cwd);
+    if (!last) {
+      log.error(
+        `--retry-failed: no previous run found at ${path.join(cwd, LAST_RUN_FILENAME)}. ` +
+          'Run dep-up-surgeon at least once first (and don’t pass --no-persist-report).',
+      );
+      process.exitCode = 1;
+      return;
+    }
+    const retry = computeRetryFailedIgnores(last);
+    for (const name of retry.added) {
+      ignore.add(name);
+    }
+    if (!jsonOutput) {
+      const ageMs = Date.now() - new Date(last.finishedAt).getTime();
+      const ageMin = Math.max(1, Math.round(ageMs / 60000));
+      log.info(
+        `--retry-failed: loaded last run from ${path.relative(cwd, path.join(cwd, LAST_RUN_FILENAME)) || LAST_RUN_FILENAME} (${ageMin}m ago, dep-up-surgeon ${last.toolVersion})`,
+      );
+      log.dim(
+        `  freezing ${retry.succeededLastRun} previously-upgraded + ${retry.terminalFailuresLastRun} terminal failure(s); retrying ${retry.retryableLastRun.length} non-terminal failure(s): ${retry.retryableLastRun.join(', ') || '(none)'}`,
+      );
+      if (retry.retryableLastRun.length === 0) {
+        log.warn(
+          'Nothing left to retry — every previous failure was peer/validation-script. The run will be effectively a no-op.',
+        );
+      }
+    }
+  }
 
   const fsRaw = String(opts.fallbackStrategy ?? 'major-lines').toLowerCase();
   const fallbackStrategy:
@@ -150,10 +362,120 @@ async function main(): Promise<void> {
   const linkGroups: 'auto' | 'none' =
     linkRaw === 'none' || linkRaw === 'off' || linkRaw === 'false' ? 'none' : 'auto';
 
+  // commander turns `--no-validate` into `validate: false`, and `--validate "<cmd>"` into
+  // `validate: "<cmd>"`. When neither is passed it stays `undefined`.
+  const cliValidateCmd = typeof opts.validate === 'string' ? opts.validate : undefined;
+  const cliNoValidate = opts.validate === false;
+  const validate = resolveValidateOptions(config.validate, cliValidateCmd, cliNoValidate);
+
+  const pmRaw = String(opts.packageManager ?? 'auto').toLowerCase();
+  const packageManager: 'auto' | 'npm' | 'pnpm' | 'yarn' =
+    pmRaw === 'npm' || pmRaw === 'pnpm' || pmRaw === 'yarn' ? pmRaw : 'auto';
+  const includeWorkspaceDeps = Boolean(opts.includeWorkspaceDeps);
+
+  const installModeRaw = String(opts.installMode ?? 'root').toLowerCase();
+  if (installModeRaw !== 'root' && installModeRaw !== 'filtered') {
+    log.error(`--install-mode: unknown value "${opts.installMode}". Use "root" or "filtered".`);
+    process.exitCode = 1;
+    return;
+  }
+  const installMode = installModeRaw as 'root' | 'filtered';
+
+  const concurrencyRaw = String(opts.concurrency ?? '1');
+  const concurrencyNum = Number.parseInt(concurrencyRaw, 10);
+  if (!Number.isFinite(concurrencyNum) || concurrencyNum < 1 || concurrencyNum > 16) {
+    log.error(
+      `--concurrency: expected an integer between 1 and 16, got "${opts.concurrency}".`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  const concurrency = concurrencyNum;
+
+  // ---- Git integration setup ----
+  const gitEnabled = Boolean(opts.gitCommit);
+  const gitModeRaw = String(opts.gitCommitMode ?? 'per-success').toLowerCase();
+  if (
+    gitEnabled &&
+    gitModeRaw !== 'per-success' &&
+    gitModeRaw !== 'per-target' &&
+    gitModeRaw !== 'all'
+  ) {
+    log.error(
+      `--git-commit-mode: unknown value "${opts.gitCommitMode}". Use "per-success", "per-target", or "all".`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  const gitCommitMode = gitModeRaw as GitCommitMode;
+  if (
+    !gitEnabled &&
+    (opts.gitCommitMode !== 'per-success' ||
+      opts.gitCommitPrefix !== 'deps: ' ||
+      opts.gitBranch ||
+      opts.gitSign ||
+      opts.gitAllowDirty)
+  ) {
+    log.warn('git options were passed without --git-commit; they will be ignored.');
+  }
+
+  let gitFlow: GitFlowController | undefined;
+  if (gitEnabled) {
+    if (typeof opts.gitBranch === 'string' && opts.gitBranch.trim()) {
+      try {
+        const previous = await checkoutBranch(cwd, opts.gitBranch.trim());
+        if (!jsonOutput) {
+          log.info(
+            `git: switched to branch "${opts.gitBranch}"${previous ? ` (was on "${previous}")` : ''}`,
+          );
+        }
+      } catch (e) {
+        log.error(e instanceof Error ? e.message : String(e));
+        process.exitCode = 1;
+        return;
+      }
+    }
+
+    const setup = await createGitFlow(
+      cwd,
+      {
+        enabled: true,
+        mode: gitCommitMode,
+        prefix: typeof opts.gitCommitPrefix === 'string' ? opts.gitCommitPrefix : 'deps: ',
+        sign: Boolean(opts.gitSign),
+        allowDirty: Boolean(opts.gitAllowDirty),
+      },
+      jsonOutput,
+      dryRun,
+    );
+    if (!setup.ok) {
+      log.error(setup.error);
+      process.exitCode = 1;
+      return;
+    }
+    gitFlow = setup.controller;
+    if (!jsonOutput && gitFlow.enabled) {
+      const branch = (await getCurrentBranch(cwd)) ?? '?';
+      log.info(`git: ${gitCommitMode} commits will land on "${branch}"`);
+    }
+  }
+
+  let workspaceMode: WorkspaceMode = 'root-only';
+  if (typeof opts.workspace === 'string' && opts.workspace.trim()) {
+    workspaceMode = opts.workspace
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  } else if (opts.workspacesOnly) {
+    workspaceMode = 'workspaces-only';
+  } else if (opts.workspaces) {
+    workspaceMode = 'all';
+  }
+
   let report: FinalReport | null = null;
 
   try {
-    report = await runUpgradeEngine({
+    report = await runUpgradeFlow({
       cwd,
       dryRun,
       interactive,
@@ -163,7 +485,30 @@ async function main(): Promise<void> {
       fallbackStrategy,
       linkGroups,
       linkedGroupsConfig: config.linkedGroups ?? [],
+      validate,
+      packageManager,
+      includeWorkspaceDeps,
+      workspaceMode,
+      installMode,
+      concurrency,
+      onUpgradeApplied: gitFlow?.onUpgradeApplied,
+      onTargetComplete: gitFlow
+        ? async (ev) => {
+            await gitFlow!.flushAfterTarget(ev.workspace, ev.manager, ev.installCwd);
+          }
+        : undefined,
     });
+
+    // Final flush for `--git-commit-mode all` (per-target / per-success have already committed).
+    if (gitFlow?.enabled && report) {
+      const installCwd = cwd;
+      const manager = report.project?.manager ?? 'npm';
+      await gitFlow.flushAtEnd(manager, installCwd);
+    }
+    if (gitFlow?.enabled && report) {
+      report.commits = gitFlow.commits;
+      report.gitCommitMode = gitFlow.mode;
+    }
 
     if (jsonOutput) {
       console.log(
@@ -195,14 +540,69 @@ async function main(): Promise<void> {
       await postRunInteractive(cwd, report!);
     }
 
-    if (!dryRun) {
-      const bak = path.join(cwd, BACKUP_FILENAME);
-      if (await fs.pathExists(bak)) {
-        await fs.remove(bak);
+    const structuredFinal = buildStructuredReport(report!, {
+      parsedConflicts: report!.parsedConflicts,
+      groups: report!.groupPlan,
+    });
+
+    if (opts.persistReport !== false) {
+      const written = await persistLastRunReport(structuredFinal, {
+        cwd,
+        toolVersion: version,
+        dryRun,
+      });
+      if (written && !jsonOutput) {
+        log.dim(`Wrote ${path.relative(cwd, written) || LAST_RUN_FILENAME} for --retry-failed / CI`);
       }
     }
 
-    const exitCode = force || !report!.failed.length ? 0 : 1;
+    if (summaryFormat) {
+      const dest = resolveSummaryDestination({
+        format: summaryFormat,
+        file: opts.summaryFile,
+        cwd,
+        toolVersion: version,
+      });
+      const written = await writeSummary(structuredFinal, {
+        format: summaryFormat,
+        file: opts.summaryFile,
+        cwd,
+        toolVersion: version,
+      });
+      if (written && !jsonOutput) {
+        const rel = path.relative(cwd, written) || written;
+        log.dim(
+          `Wrote ${summaryFormat.toUpperCase()} summary to ${rel}${dest.append ? ' (appended)' : ''}`,
+        );
+      }
+    }
+
+    if (!dryRun) {
+      const baks = new Set<string>([path.join(cwd, BACKUP_FILENAME)]);
+      for (const t of report?.targets ?? []) {
+        baks.add(path.join(t.cwd, BACKUP_FILENAME));
+      }
+      for (const bak of baks) {
+        if (await fs.pathExists(bak)) {
+          await fs.remove(bak);
+        }
+      }
+    }
+
+    const preflightFailed = Boolean(report!.preflightAborted);
+    // --ci treats per-package failures as informational so the bot job stays green; only the
+    // pre-flight failure (the project itself was broken before any upgrade) still exits 1.
+    let exitCode: number;
+    if (ciMode) {
+      exitCode = preflightFailed ? 1 : 0;
+      if (!jsonOutput && report!.failed.length > 0) {
+        log.dim(
+          `--ci: ${report!.failed.length} per-package failure(s) recorded in the report; exit 0 anyway.`,
+        );
+      }
+    } else {
+      exitCode = !force && (report!.failed.length > 0 || preflightFailed) ? 1 : 0;
+    }
     process.exitCode = exitCode;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -212,7 +612,13 @@ async function main(): Promise<void> {
       console.log(JSON.stringify({ error: msg }, null, 2));
     }
     try {
-      await restoreInitialFromBackup(cwd);
+      const dirs = new Set<string>([cwd]);
+      for (const t of report?.targets ?? []) {
+        dirs.add(t.cwd);
+      }
+      for (const dir of dirs) {
+        await restoreInitialFromBackup(dir);
+      }
     } catch {
       /* ignore restore errors */
     }

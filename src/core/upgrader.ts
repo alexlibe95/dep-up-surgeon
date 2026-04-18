@@ -8,20 +8,33 @@ import type {
   DepSection,
   FailureReason,
   FinalReport,
+  InstallDiagnostic,
   ScannedPackage,
   UpgradeRecord,
+  ValidationDiagnostic,
 } from '../types.js';
 import type { PackageJson } from '../types.js';
 import { addFailure, addUpgrade, createEmptyReport } from './conflict.js';
 import { isRegistryRange, scanProject } from './scanner.js';
-import { validateProject } from './validator.js';
+import { validateProject, type ValidationOptions, type ValidationResult } from './validator.js';
 import { log } from '../utils/logger.js';
 import {
   detectEsmCommonJsBlockage,
   fetchAllPublishedVersions,
   fetchLatestVersion,
-  runNpmInstall,
+  runInstall,
+  type InstallManager,
+  type InstallOptions,
+  type InstallResult,
 } from '../utils/npm.js';
+import { detectProjectInfo, type PackageManager, type ProjectInfo } from './workspaces.js';
+import { tailLines } from '../utils/output.js';
+import {
+  AsyncMutex,
+  createRegistryCache,
+  runWithConcurrency,
+  type RegistryCache,
+} from '../utils/concurrency.js';
 import {
   extractClassifiedConflicts,
   shouldRollbackAfterSuccessfulInstall,
@@ -67,6 +80,102 @@ export interface UpgradeEngineOptions {
    * false-positive conflict lines such as `While resolving: <app>@0.0.0`.
    */
   rootPackageName?: string;
+  /**
+   * Validator override: custom command, or `skip: true` to bypass validation entirely.
+   * When omitted, the built-in `npm test` → `npm run build` heuristic is used.
+   */
+  validate?: ValidationOptions & { source?: 'cli' | 'config' };
+  /**
+   * Override for the package manager used by `runInstall` and the default validator. When
+   * omitted, the manager is auto-detected via `detectProjectInfo` (looks at `packageManager`,
+   * lockfiles, and `pnpm-workspace.yaml`).
+   */
+  packageManager?: PackageManager | 'auto';
+  /**
+   * When `false` (default), workspace-internal dependencies (names matching a local workspace
+   * package) are skipped explicitly. When `true`, they are treated like any other dep — useful
+   * when local workspace packages also publish to the registry.
+   */
+  includeWorkspaceDeps?: boolean;
+  /**
+   * Pre-resolved project info. When omitted, `runUpgradeEngine` calls `detectProjectInfo`
+   * itself; tests/programmatic callers can pass their own.
+   */
+  projectInfo?: ProjectInfo;
+  /**
+   * Directory where the package manager (`<mgr> install`) and the validator are executed.
+   * Defaults to `cwd`. When mutating a workspace child `package.json`, set this to the workspace
+   * **root** so the install resolves the lockfile correctly and the validator sees the entire
+   * monorepo.
+   */
+  installCwd?: string;
+  /**
+   * Tag applied to every `UpgradeRecord` and `ConflictEntry` produced by this engine call.
+   * Used by the multi-target orchestrator (`runUpgradeFlow`) to label rows by workspace member.
+   */
+  targetLabel?: string;
+  /**
+   * Skip the pre-flight validator + initial backup (set by the orchestrator when running
+   * multiple targets in one flow — pre-flight only makes sense once per workspace root).
+   */
+  skipPreflight?: boolean;
+  /**
+   * Workspace install strategy. `'root'` (default) always runs `<mgr> install` from the
+   * workspace root — the safest choice and what every package manager supports unconditionally.
+   * `'filtered'` rewrites each per-child install to its workspace-scoped form (npm `-w`,
+   * pnpm `--filter`) so only the affected member is resolved; on big monorepos this is several
+   * times faster. Only effective when the orchestrator also sets `installFilter`.
+   */
+  installMode?: 'root' | 'filtered';
+  /**
+   * Workspace member name to scope the install to (e.g. `@org/web`). Set by `runUpgradeFlow`
+   * per target when `installMode === 'filtered'` and the target is a workspace child. Yarn
+   * silently falls back to a full install (`InstallResult.filtered` will be `false`).
+   */
+  installFilter?: string;
+  /**
+   * Shared registry fetch cache. When provided, `pacote.manifest` / `pacote.packument` calls
+   * for the same package name are deduplicated across the engine call. The orchestrator
+   * creates one cache per `runUpgradeFlow` invocation so all targets benefit, even at
+   * `--concurrency 1` (in monorepos the same dep typically appears in many members).
+   */
+  registryCache?: RegistryCache;
+  /**
+   * Shared async mutex. When set, the engine acquires it around every install + post-install
+   * validation step so concurrent target traversals don't race the lockfile. The orchestrator
+   * creates one lock per `runUpgradeFlow` invocation when `--concurrency > 1`. At
+   * concurrency 1 the lock is omitted (zero overhead, same behavior as before).
+   */
+  installLock?: AsyncMutex;
+  /**
+   * Hook fired AFTER each successful single OR batch upgrade (after the row has been added to
+   * `report.upgraded` but before the next attempt begins). Used by the CLI's git integration
+   * to commit per-success or accumulate per-target diffs. The callback runs INSIDE the
+   * `installLock` critical section when one is active, so multiple concurrent targets won't
+   * race their git operations either.
+   *
+   * Failures from the callback MUST be swallowed by the callback itself — the engine treats
+   * the callback as fire-and-forget. The package.json mutation has already happened and is
+   * recorded in the report; downstream side effects (git commits) must never roll back the
+   * upgrade.
+   */
+  onUpgradeApplied?: (event: UpgradeAppliedEvent) => Promise<void>;
+}
+
+/**
+ * Payload passed to `onUpgradeApplied`. For single upgrades `records` has length 1; for batched
+ * linked-group upgrades it has length N (one per group member). `targetCwd` is the directory
+ * whose `package.json` was mutated; `installCwd` is where the lockfile + node_modules live.
+ */
+export interface UpgradeAppliedEvent {
+  records: UpgradeRecord[];
+  targetCwd: string;
+  installCwd: string;
+  manager: PackageManager;
+  /** Workspace label tag (`'root'` or member package name). `undefined` for non-workspace runs. */
+  workspace?: string;
+  /** Linked-group id when this success was a batch; absent for single upgrades. */
+  groupId?: string;
 }
 
 async function readPackageJson(cwd: string): Promise<PackageJson> {
@@ -148,7 +257,12 @@ function toConflicts(classified: ClassifiedConflict[] | undefined): Conflict[] |
   }));
 }
 
-type FailureKind = 'install' | 'peer' | 'validation';
+type FailureKind =
+  | 'install'
+  | 'peer'
+  | 'validation' // generic, kept for backwards compat
+  | 'validation-script' // build/test script crashed independently of npm install
+  | 'validation-conflicts'; // npm install logged structured peer/version conflicts post-success
 
 interface AttemptResult {
   ok: boolean;
@@ -158,6 +272,156 @@ interface AttemptResult {
   abortFallbacks?: boolean;
   installOutput?: string;
   classified?: ClassifiedConflict[];
+  /** Validator command/exit/last-lines, when this attempt invoked the validator. */
+  validation?: ValidationDiagnostic;
+  /** Install command/exit/last-lines for the install that triggered (or preceded) this result. */
+  install?: InstallDiagnostic;
+}
+
+function toValidationDiagnostic(v: ValidationResult): ValidationDiagnostic {
+  return {
+    command: v.command,
+    exitCode: v.exitCode,
+    lastLines: v.output,
+    source: v.source,
+  };
+}
+
+function toInstallDiagnostic(install: InstallResult): InstallDiagnostic {
+  return {
+    command: install.command,
+    exitCode: install.exitCode,
+    lastLines: tailLines(install.output),
+    ok: install.ok,
+  };
+}
+
+function indentBlock(text: string, prefix = '    '): string {
+  return text
+    .split(/\r?\n/)
+    .map((line) => `${prefix}${line}`)
+    .join('\n');
+}
+
+function isWorkspaceInternal(name: string, opts: UpgradeEngineOptions): boolean {
+  if (opts.includeWorkspaceDeps) {
+    return false;
+  }
+  return opts.projectInfo?.workspacePackageNames.has(name) ?? false;
+}
+
+/**
+ * Build the `InstallOptions` for the current engine call. Returns `{ filter }` only when
+ * `installMode === 'filtered'` AND a child target is being mutated (`installFilter` is set).
+ * Root-target runs always do a full install regardless of mode.
+ *
+ * Also forwards the per-manager capability bit (`yarnSupportsFocus`) so `installCommand` can
+ * pick `yarn workspaces focus <name>` over the classic full-install fallback when the project
+ * is on yarn berry with `@yarnpkg/plugin-workspace-tools` available.
+ */
+function installFilterOptions(opts: UpgradeEngineOptions): InstallOptions {
+  if (opts.installMode === 'filtered' && opts.installFilter) {
+    return {
+      filter: opts.installFilter,
+      ...(opts.projectInfo?.yarnSupportsFocus
+        ? { yarnSupportsFocus: true }
+        : {}),
+    };
+  }
+  return {};
+}
+
+/**
+ * Run `fn` under the shared install/validate mutex if one was provided. At concurrency 1 the
+ * orchestrator omits the lock entirely → we run inline with zero overhead. The lock guarantees
+ * that no two targets simultaneously touch the workspace lockfile / `node_modules` tree.
+ */
+async function withInstallLock<T>(
+  opts: UpgradeEngineOptions,
+  fn: () => Promise<T>,
+): Promise<T> {
+  if (opts.installLock) {
+    return opts.installLock.runExclusive(fn);
+  }
+  return fn();
+}
+
+/**
+ * Fire `onUpgradeApplied` if the orchestrator wired one up, swallowing every error so a buggy
+ * (or unauthorized) git commit can never roll back an upgrade that was already validated.
+ */
+async function fireUpgradeApplied(
+  opts: UpgradeEngineOptions,
+  records: UpgradeRecord[],
+  targetCwd: string,
+  groupId: string | undefined,
+): Promise<void> {
+  if (!opts.onUpgradeApplied || records.length === 0) {
+    return;
+  }
+  // Run the hook UNDER the install lock too: it inspects + commits the lockfile, which is
+  // the same shared resource the install just touched. Without the lock, a concurrent target
+  // could start its own install while we're still git-add'ing the previous target's commit.
+  await withInstallLock(opts, async () => {
+    try {
+      await opts.onUpgradeApplied!({
+        records,
+        targetCwd,
+        installCwd: opts.installCwd ?? targetCwd,
+        manager: (opts.projectInfo?.manager ?? 'npm') as PackageManager,
+        workspace: opts.targetLabel,
+        groupId,
+      });
+    } catch (e) {
+      if (!opts.jsonOutput) {
+        const msg = e instanceof Error ? e.message : String(e);
+        log.warn(`onUpgradeApplied hook threw: ${msg}`);
+      }
+    }
+  });
+}
+
+function tagWorkspaceLabels(report: FinalReport, label: string): void {
+  for (const row of report.upgraded) {
+    if (!row.workspace) {
+      row.workspace = label;
+    }
+  }
+  for (const row of report.failed) {
+    if (!row.workspace) {
+      row.workspace = label;
+    }
+  }
+}
+
+/**
+ * Run the validator against the *unchanged* tree. If it already exits non-zero, every per-group
+ * rollback during the run will look identical and waste minutes. Surfacing this up-front turns a
+ * silent failure mode into an explicit, actionable error.
+ */
+export interface PreflightCheckResult {
+  ok: boolean;
+  skipped: boolean;
+  command: string;
+  exitCode?: number;
+  source?: ValidationResult['source'];
+  lastLines?: string;
+}
+
+export async function preflightValidate(
+  cwd: string,
+  pkgJson: PackageJson,
+  validate: ValidationOptions | undefined,
+): Promise<PreflightCheckResult> {
+  const v = await validateProject(cwd, pkgJson, validate ?? {});
+  return {
+    ok: v.ok,
+    skipped: Boolean(v.skipped),
+    command: v.command,
+    exitCode: v.exitCode,
+    source: v.source,
+    lastLines: v.output,
+  };
 }
 
 /**
@@ -169,55 +433,82 @@ async function attemptSingleUpgrade(
   targetVersion: string,
   opts: UpgradeEngineOptions,
 ): Promise<AttemptResult> {
+  // Whole attempt is the critical section: every transition (mutate → install → maybe
+  // rollback → validate → maybe rollback) reads/writes the same lockfile + node_modules,
+  // so we acquire the lock once and release on completion. Cheap (no contention) at
+  // concurrency 1 — `withInstallLock` no-ops without a lock.
+  return withInstallLock(opts, () => attemptSingleUpgradeUnlocked(cwd, scanned, targetVersion, opts));
+}
+
+async function attemptSingleUpgradeUnlocked(
+  cwd: string,
+  scanned: ScannedPackage,
+  targetVersion: string,
+  opts: UpgradeEngineOptions,
+): Promise<AttemptResult> {
   const { force } = opts;
+  const manager = (opts.projectInfo?.manager ?? 'npm') as InstallManager;
+  const installCwd = opts.installCwd ?? cwd;
+  const installOpts = installFilterOptions(opts);
   const previousRange = scanned.currentRange;
 
   let pkg = await readPackageJson(cwd);
   pkg = setRange(pkg, scanned.section, scanned.name, targetVersion);
   await writePackageJson(cwd, pkg);
 
-  const install = await runNpmInstall(cwd);
+  const install = await runInstall(installCwd, manager, installOpts);
+  const installDiag = toInstallDiagnostic(install);
   const classified = classifyInstallOutput(install.output, opts);
   const peerHit = shouldRollbackAfterSuccessfulInstall(classified, force);
 
   if (!install.ok) {
     const esm = detectEsmCommonJsBlockage(install.output);
     await writeDepRange(cwd, scanned.section, scanned.name, previousRange);
-    await runNpmInstall(cwd);
+    await runInstall(installCwd, manager, installOpts);
     return {
       ok: false,
       kind: 'install',
       message: esm
-        ? `npm install failed (exit ${install.exitCode}): ESM/CommonJS mismatch (e.g. ERR_REQUIRE_ESM). Newer releases may be ESM-only while this project is CommonJS — pin the package, migrate to ESM, or ignore it.`
-        : `npm install failed (exit ${install.exitCode})`,
+        ? `${install.command} failed (exit ${install.exitCode}): ESM/CommonJS mismatch (e.g. ERR_REQUIRE_ESM). Newer releases may be ESM-only while this project is CommonJS — pin the package, migrate to ESM, or ignore it.`
+        : `${install.command} failed (exit ${install.exitCode})`,
       abortFallbacks: esm,
       installOutput: install.output,
       classified,
+      install: installDiag,
     };
   }
 
   if (peerHit && !force) {
     await writeDepRange(cwd, scanned.section, scanned.name, previousRange);
-    await runNpmInstall(cwd);
+    await runInstall(installCwd, manager, installOpts);
     return {
       ok: false,
       kind: 'peer',
-      message:
-        'npm reported peer dependency issues (see npm output). Suggestion: keep this package unchanged or resolve peers manually.',
+      message: `${manager === 'npm' ? 'npm' : manager} reported peer dependency issues (see install output). Suggestion: keep this package unchanged or resolve peers manually.`,
       installOutput: install.output,
       classified,
+      install: installDiag,
     };
   }
 
-  pkg = await readPackageJson(cwd);
-  const validation = await validateProject(cwd, pkg);
+  // Validator runs against the install root (where the actual node_modules live), but it reads
+  // its `scripts` from the **install root's** package.json, not the per-child one — workspaces
+  // typically declare test/build scripts at the root anyway.
+  const validatorPkg = await readPackageJson(installCwd);
+  const validation = await validateProject(installCwd, validatorPkg, {
+    ...(opts.validate ?? {}),
+    manager,
+  });
+  const diag = validation.skipped ? undefined : toValidationDiagnostic(validation);
   if (!validation.ok && !force) {
     await writeDepRange(cwd, scanned.section, scanned.name, previousRange);
-    await runNpmInstall(cwd);
+    await runInstall(installCwd, manager, installOpts);
     return {
       ok: false,
-      kind: 'validation',
+      kind: 'validation-script',
       message: `${validation.command} failed (exit ${validation.exitCode ?? '?'})`,
+      validation: diag,
+      install: installDiag,
     };
   }
 
@@ -225,10 +516,12 @@ async function attemptSingleUpgrade(
     return {
       ok: true,
       message: `Kept upgrade despite ${validation.command} failure (--force)`,
+      validation: diag,
+      install: installDiag,
     };
   }
 
-  return { ok: true };
+  return { ok: true, validation: diag, install: installDiag };
 }
 
 type Bump = { scanned: ScannedPackage; targetVersion: string };
@@ -242,7 +535,18 @@ async function attemptBatchUpgrade(
   bumps: Bump[],
   opts: UpgradeEngineOptions,
 ): Promise<AttemptResult> {
+  return withInstallLock(opts, () => attemptBatchUpgradeUnlocked(cwd, bumps, opts));
+}
+
+async function attemptBatchUpgradeUnlocked(
+  cwd: string,
+  bumps: Bump[],
+  opts: UpgradeEngineOptions,
+): Promise<AttemptResult> {
   const { force } = opts;
+  const manager = (opts.projectInfo?.manager ?? 'npm') as InstallManager;
+  const installCwd = opts.installCwd ?? cwd;
+  const installOpts = installFilterOptions(opts);
   if (bumps.length === 0) {
     return { ok: true };
   }
@@ -258,7 +562,8 @@ async function attemptBatchUpgrade(
   }
   await writePackageJson(cwd, pkg);
 
-  const install = await runNpmInstall(cwd);
+  const install = await runInstall(installCwd, manager, installOpts);
+  const installDiag = toInstallDiagnostic(install);
   const classified = classifyInstallOutput(install.output, opts);
   const peerHit = shouldRollbackAfterSuccessfulInstall(classified, force);
 
@@ -270,7 +575,7 @@ async function attemptBatchUpgrade(
       }
       await writeDepRange(cwd, snap.section, scanned.name, snap.range);
     }
-    await runNpmInstall(cwd);
+    await runInstall(installCwd, manager, installOpts);
   };
 
   if (!install.ok) {
@@ -280,11 +585,12 @@ async function attemptBatchUpgrade(
       ok: false,
       kind: 'install',
       message: esm
-        ? `npm install failed (exit ${install.exitCode}): ESM/CommonJS mismatch (e.g. ERR_REQUIRE_ESM). Newer releases may be ESM-only while this project is CommonJS — pin the package, migrate to ESM, or ignore it.`
-        : `npm install failed (exit ${install.exitCode})`,
+        ? `${install.command} failed (exit ${install.exitCode}): ESM/CommonJS mismatch (e.g. ERR_REQUIRE_ESM). Newer releases may be ESM-only while this project is CommonJS — pin the package, migrate to ESM, or ignore it.`
+        : `${install.command} failed (exit ${install.exitCode})`,
       abortFallbacks: esm,
       installOutput: install.output,
       classified,
+      install: installDiag,
     };
   }
 
@@ -293,21 +599,27 @@ async function attemptBatchUpgrade(
     return {
       ok: false,
       kind: 'peer',
-      message:
-        'npm reported peer dependency issues (see npm output). Suggestion: keep this package unchanged or resolve peers manually.',
+      message: `${manager === 'npm' ? 'npm' : manager} reported peer dependency issues (see install output). Suggestion: keep this package unchanged or resolve peers manually.`,
       installOutput: install.output,
       classified,
+      install: installDiag,
     };
   }
 
-  pkg = await readPackageJson(cwd);
-  const validation = await validateProject(cwd, pkg);
+  const validatorPkg = await readPackageJson(installCwd);
+  const validation = await validateProject(installCwd, validatorPkg, {
+    ...(opts.validate ?? {}),
+    manager,
+  });
+  const diag = validation.skipped ? undefined : toValidationDiagnostic(validation);
   if (!validation.ok && !force) {
     await rollbackAll();
     return {
       ok: false,
-      kind: 'validation',
+      kind: 'validation-script',
       message: `${validation.command} failed (exit ${validation.exitCode ?? '?'})`,
+      validation: diag,
+      install: installDiag,
     };
   }
 
@@ -315,10 +627,12 @@ async function attemptBatchUpgrade(
     return {
       ok: true,
       message: `Kept upgrade despite ${validation.command} failure (--force)`,
+      validation: diag,
+      install: installDiag,
     };
   }
 
-  return { ok: true };
+  return { ok: true, validation: diag, install: installDiag };
 }
 
 /**
@@ -343,7 +657,7 @@ async function upgradeWithReleaseLineFallbacks(
   let candidates: string[] = [registryLatest];
   if (fallbackStrategy === 'major-lines' || fallbackStrategy === 'minor-lines') {
     try {
-      const all = await fetchAllPublishedVersions(scanned.name);
+      const all = await fetchAllPublishedVersions(scanned.name, opts.registryCache);
       const mode = fallbackStrategy === 'major-lines' ? 'major' : 'minor';
       candidates = buildLineFallbackOrder(currentSemver, registryLatest, all, mode);
     } catch {
@@ -424,13 +738,18 @@ async function promptAfterFailure(
 }
 
 function failureReason(kind: FailureKind): FailureReason {
-  if (kind === 'peer') {
-    return 'peer';
+  switch (kind) {
+    case 'peer':
+      return 'peer';
+    case 'validation':
+      return 'validation';
+    case 'validation-script':
+      return 'validation-script';
+    case 'validation-conflicts':
+      return 'validation-conflicts';
+    default:
+      return 'install';
   }
-  if (kind === 'validation') {
-    return 'validation';
-  }
-  return 'install';
 }
 
 /**
@@ -444,6 +763,20 @@ async function runSinglePackageUpgrade(
   ignore: Set<string>,
 ): Promise<void> {
   const { dryRun, interactive, jsonOutput } = opts;
+
+  if (isWorkspaceInternal(scanned.name, opts)) {
+    addUpgrade(report, {
+      name: scanned.name,
+      success: true,
+      skipped: true,
+      reason: 'skipped',
+      detail: 'workspace-internal dep (resolved from local workspace package)',
+    });
+    if (!jsonOutput) {
+      log.dim(`Skipped ${scanned.name} (workspace-internal dep)`);
+    }
+    return;
+  }
 
   if (!isRegistryRange(scanned.currentRange)) {
     addUpgrade(report, {
@@ -461,7 +794,7 @@ async function runSinglePackageUpgrade(
 
   let latest: string;
   try {
-    latest = await fetchLatestVersion(scanned.name);
+    latest = await fetchLatestVersion(scanned.name, opts.registryCache);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     addFailure(report, {
@@ -586,6 +919,7 @@ async function runSinglePackageUpgrade(
         log.success(`upgraded: ${scanned.name} → ${to}`);
       }
     }
+    await fireUpgradeApplied(opts, [row], cwd, undefined);
   } else {
     const kind = result.kind ?? 'install';
     const classified = result.classified ?? classifyInstallOutput(result.installOutput, opts);
@@ -597,12 +931,27 @@ async function runSinglePackageUpgrade(
       attemptedVersion: lastAttemptedVersion,
       message: result.message,
       conflicts: toConflicts(classified),
+      validation: result.validation,
+      install: result.install,
     });
     if (!jsonOutput) {
       if (kind === 'peer') {
         log.peer(`${scanned.name} — ${result.message ?? 'peer conflict'}`);
+        if (result.install?.lastLines) {
+          log.dim(indentBlock(result.install.lastLines, '    '));
+        }
+      } else if (kind === 'validation-script') {
+        log.error(
+          `skipped: ${scanned.name} — validator (${result.validation?.command ?? 'unknown'}) failed; this is not a dependency conflict`,
+        );
+        if (result.validation?.lastLines) {
+          log.dim(indentBlock(result.validation.lastLines, '    '));
+        }
       } else {
         log.error(`skipped: ${scanned.name} (${result.message ?? kind})`);
+        if (result.install?.lastLines) {
+          log.dim(indentBlock(result.install.lastLines, '    '));
+        }
       }
     }
   }
@@ -627,6 +976,20 @@ async function runLinkedGroupUpgrade(
   const skippedNonRegistry: ScannedPackage[] = [];
 
   for (const scanned of members) {
+    if (isWorkspaceInternal(scanned.name, opts)) {
+      addUpgrade(report, {
+        name: scanned.name,
+        success: true,
+        skipped: true,
+        reason: 'skipped',
+        detail: 'workspace-internal dep (resolved from local workspace package)',
+        linkedGroupId: gid,
+      });
+      if (!jsonOutput) {
+        log.dim(`Skipped ${scanned.name} in group [${gid}] (workspace-internal dep)`);
+      }
+      continue;
+    }
     if (!isRegistryRange(scanned.currentRange)) {
       skippedNonRegistry.push(scanned);
       addUpgrade(report, {
@@ -645,7 +1008,7 @@ async function runLinkedGroupUpgrade(
 
     let latest: string;
     try {
-      latest = await fetchLatestVersion(scanned.name);
+      latest = await fetchLatestVersion(scanned.name, opts.registryCache);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       addFailure(report, {
@@ -779,6 +1142,7 @@ async function runLinkedGroupUpgrade(
   }
 
   if (result.ok) {
+    const groupRows: UpgradeRecord[] = [];
     for (const b of bumps) {
       const cur = semver.coerce(b.scanned.currentRange);
       const row: UpgradeRecord = {
@@ -796,10 +1160,12 @@ async function runLinkedGroupUpgrade(
         row.detail = `upgraded with linked group [${gid}] (single install + validate)`;
       }
       addUpgrade(report, row);
+      groupRows.push(row);
       if (!jsonOutput) {
         log.success(`upgraded: ${b.scanned.name} → ${b.targetVersion} (group ${gid})`);
       }
     }
+    await fireUpgradeApplied(opts, groupRows, cwd, gid);
   } else {
     const kind = result.kind ?? 'install';
     const prev = bumps.map((b) => `${b.scanned.name}@${b.scanned.currentRange}`).join(', ');
@@ -812,12 +1178,27 @@ async function runLinkedGroupUpgrade(
       message: result.message,
       linkedGroupId: gid,
       conflicts: toConflicts(result.classified ?? classifyInstallOutput(result.installOutput, opts)),
+      validation: result.validation,
+      install: result.install,
     });
     if (!jsonOutput) {
       if (kind === 'peer') {
         log.peer(`group [${gid}] — ${result.message ?? 'peer conflict'}`);
+        if (result.install?.lastLines) {
+          log.dim(indentBlock(result.install.lastLines, '    '));
+        }
+      } else if (kind === 'validation-script') {
+        log.error(
+          `skipped linked group [${gid}] — validator (${result.validation?.command ?? 'unknown'}) failed; this is not a dependency conflict`,
+        );
+        if (result.validation?.lastLines) {
+          log.dim(indentBlock(result.validation.lastLines, '    '));
+        }
       } else {
         log.error(`skipped linked group [${gid}] (${result.message ?? kind})`);
+        if (result.install?.lastLines) {
+          log.dim(indentBlock(result.install.lastLines, '    '));
+        }
       }
     }
   }
@@ -828,20 +1209,47 @@ async function runLinkedGroupUpgrade(
  * With `linkGroups: auto`, packages are clustered from registry peer/dependency graphs
  * (and custom rc groups) so related deps bump together.
  *
+ * Operates on a **single** `package.json` at `cwd`. Install + validation happen at
+ * `installCwd ?? cwd` so the same engine can be reused for workspace child packages by setting
+ * `cwd` to the child dir and `installCwd` to the workspace root. The orchestrator
+ * (`runUpgradeFlow`) handles target selection, pre-flight, and aggregation.
+ *
  * TODO: parallel upgrades with dependency graph ordering
- * TODO: monorepo / workspaces
- * TODO: pnpm / yarn
  * TODO: git commit after each successful upgrade
  * TODO: expo install–style version alignment for Expo SDK
  */
 export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<FinalReport> {
-  const { cwd, dryRun, interactive, jsonOutput, ignore } = opts;
+  const { cwd, dryRun, jsonOutput, ignore, force } = opts;
+  const installCwd = opts.installCwd ?? cwd;
   const report = createEmptyReport();
 
-  const packages = await scanProject(cwd);
-  if (!dryRun) {
-    await backupPackageJson(cwd);
+  const projectInfo =
+    opts.projectInfo ?? (await detectProjectInfo(installCwd, opts.packageManager ?? 'auto'));
+  report.project = {
+    manager: projectInfo.manager,
+    managerVersion: projectInfo.managerVersion,
+    managerSource: projectInfo.managerSource,
+    lockfile: projectInfo.lockfile,
+    hasWorkspaces: projectInfo.hasWorkspaces,
+    workspaceGlobs: projectInfo.workspaceGlobs,
+    workspaceMembers: projectInfo.workspaceMembers.map((m) => ({ name: m.name, dir: m.dir })),
+    ...(projectInfo.yarnMajorVersion !== undefined
+      ? { yarnMajorVersion: projectInfo.yarnMajorVersion }
+      : {}),
+    ...(projectInfo.yarnSupportsFocus !== undefined
+      ? { yarnSupportsFocus: projectInfo.yarnSupportsFocus }
+      : {}),
+  };
+
+  if (!jsonOutput && !opts.skipPreflight) {
+    const mgrLabel = `${projectInfo.manager}${projectInfo.managerVersion ? '@' + projectInfo.managerVersion : ''}`;
+    const wsLabel = projectInfo.hasWorkspaces
+      ? ` (workspaces: ${projectInfo.workspaceMembers.length} member${projectInfo.workspaceMembers.length === 1 ? '' : 's'})`
+      : '';
+    log.dim(`Detected package manager: ${mgrLabel} via ${projectInfo.managerSource}${wsLabel}`);
   }
+
+  const packages = await scanProject(cwd);
 
   for (const scanned of packages) {
     if (ignore.has(scanned.name)) {
@@ -856,7 +1264,53 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
   const engineOpts: UpgradeEngineOptions = {
     ...opts,
     rootPackageName: typeof pkgJson.name === 'string' ? pkgJson.name : undefined,
+    projectInfo,
+    installCwd,
   };
+
+  if (!dryRun && !opts.skipPreflight) {
+    // Pre-flight runs against the install root (where node_modules + the validator live), not
+    // necessarily the per-target package.json that's about to be mutated.
+    const installRootPkg = await readPackageJson(installCwd);
+    const pre = await preflightValidate(installCwd, installRootPkg, {
+      ...(engineOpts.validate ?? {}),
+      manager: projectInfo.manager,
+    });
+    if (!pre.skipped) {
+      report.preflight = {
+        ok: pre.ok,
+        skipped: pre.skipped,
+        command: pre.command,
+        exitCode: pre.exitCode,
+        lastLines: pre.lastLines,
+        source: pre.source,
+      };
+      if (!pre.ok) {
+        if (!jsonOutput) {
+          log.error(
+            `Pre-flight validator failed: \`${pre.command}\` exited ${pre.exitCode ?? '?'} on the unchanged tree.`,
+          );
+          log.warn(
+            'Every per-group rollback would look identical because the validator is already broken before any upgrade.',
+          );
+          if (pre.lastLines) {
+            log.dim(indentBlock(pre.lastLines, '    '));
+          }
+          log.info(
+            'Fix the validator command or pass --no-validate / --validate "<cmd>" / --force to proceed anyway.',
+          );
+        }
+        if (!force) {
+          report.preflightAborted = true;
+          return report;
+        }
+      }
+    }
+  }
+
+  if (!dryRun) {
+    await backupPackageJson(cwd);
+  }
 
   const groups =
     engineOpts.linkGroups === 'auto'
@@ -887,6 +1341,10 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
     }
   }
 
+  if (opts.targetLabel) {
+    tagWorkspaceLabels(report, opts.targetLabel);
+  }
+
   return report;
 }
 
@@ -895,3 +1353,360 @@ export async function restoreInitialFromBackup(cwd: string): Promise<void> {
 }
 
 export { backupPackageJson, BACKUP_FILENAME };
+
+/**
+ * Workspace traversal mode for `runUpgradeFlow`.
+ *
+ *   - `'root-only'` (default): mutate only the root `package.json`.
+ *   - `'all'`: mutate the root and **every** workspace member's `package.json`.
+ *   - `'workspaces-only'`: mutate every workspace member but **not** the root.
+ *   - `string[]`: mutate only the workspace members whose `package.json` `name` is in the list
+ *     (root is included if `'root'` appears in the list).
+ */
+export type WorkspaceMode = 'root-only' | 'all' | 'workspaces-only' | string[];
+
+export interface UpgradeFlowOptions
+  extends Omit<
+    UpgradeEngineOptions,
+    | 'cwd'
+    | 'installCwd'
+    | 'targetLabel'
+    | 'skipPreflight'
+    | 'installFilter'
+    | 'installLock'
+    | 'registryCache'
+    | 'onUpgradeApplied'
+  > {
+  /** Workspace root (where the lockfile and the `workspaces` field live). */
+  cwd: string;
+  /** Which `package.json` files to traverse. Defaults to `'root-only'`. */
+  workspaceMode?: WorkspaceMode;
+  /**
+   * Engine `onUpgradeApplied` hook. The CLI installs one for git integration so each
+   * successful upgrade can be committed in real time (per-success mode) or accumulated for
+   * a per-target / per-run squashed commit. The orchestrator forwards it verbatim to every
+   * spawned engine call; ordering is naturally serialized by the install lock.
+   */
+  onUpgradeApplied?: UpgradeEngineOptions['onUpgradeApplied'];
+  /**
+   * Hook fired after each per-target `runUpgradeEngine` returns (success OR failure). Used by
+   * the git integration's `per-target` mode to flush its buffered commits BEFORE the next
+   * target's install starts. The orchestrator awaits the hook serially so even with
+   * `--concurrency > 1` multiple `onTargetComplete` calls do not interleave.
+   */
+  onTargetComplete?: (event: TargetCompleteEvent) => Promise<void>;
+  /**
+   * Maximum number of workspace targets to traverse in parallel. Default `1` (serial — exact
+   * pre-existing behavior). Higher values run target **scan + plan** phases concurrently while
+   * a shared mutex serializes lockfile-touching operations (install + validate). Net effect:
+   * registry / network IO is overlapped across targets, but lockfile mutations stay strictly
+   * serial. Capped at `MAX_CONCURRENCY` (16) to avoid registry rate-limiting and runaway open
+   * sockets.
+   *
+   * In **non-JSON** human mode this is silently downgraded to `1` (parallel logging would
+   * interleave per-target output unreadably). Pass `--json` or `--ci` to use values > 1.
+   */
+  concurrency?: number;
+}
+
+export interface TargetCompleteEvent {
+  /** Workspace label (`'root'` or member package name). */
+  workspace: string;
+  /** Absolute path to the target's package.json directory. */
+  targetCwd: string;
+  /** Workspace root (where the lockfile lives). */
+  installCwd: string;
+  manager: PackageManager;
+  /** Engine's per-target report (already merged into the aggregate by the orchestrator). */
+  report: FinalReport;
+}
+
+const MAX_CONCURRENCY = 16;
+
+interface ResolvedTarget {
+  label: string;
+  cwd: string;
+  packageJson: string;
+}
+
+function resolveTargets(rootCwd: string, projectInfo: ProjectInfo, mode: WorkspaceMode): ResolvedTarget[] {
+  const root: ResolvedTarget = {
+    label: 'root',
+    cwd: rootCwd,
+    packageJson: path.join(rootCwd, 'package.json'),
+  };
+  const members: ResolvedTarget[] = projectInfo.workspaceMembers.map((m) => ({
+    label: m.name,
+    cwd: m.dir,
+    packageJson: path.join(m.dir, 'package.json'),
+  }));
+
+  if (mode === 'root-only') {
+    return [root];
+  }
+  if (mode === 'all') {
+    return [root, ...members];
+  }
+  if (mode === 'workspaces-only') {
+    return members;
+  }
+
+  // explicit list of names
+  const want = new Set(mode);
+  const out: ResolvedTarget[] = [];
+  if (want.has('root')) {
+    out.push(root);
+    want.delete('root');
+  }
+  for (const m of members) {
+    if (want.has(m.label)) {
+      out.push(m);
+      want.delete(m.label);
+    }
+  }
+  if (want.size > 0) {
+    const missing = [...want].join(', ');
+    throw new Error(
+      `--workspace: unknown workspace member(s): ${missing}. Known members: ${members.map((m) => m.label).join(', ') || '(none)'}`,
+    );
+  }
+  return out;
+}
+
+/**
+ * Multi-target orchestrator. Detects project info once, runs pre-flight once at the install
+ * root, then invokes `runUpgradeEngine` per target with `installCwd` pinned to the workspace
+ * root so installs and validation always exercise the **whole** monorepo. Aggregates results
+ * into a single `FinalReport`.
+ */
+export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalReport> {
+  const { cwd: rootCwd, dryRun, jsonOutput, force } = opts;
+  const mode: WorkspaceMode = opts.workspaceMode ?? 'root-only';
+
+  const projectInfo =
+    opts.projectInfo ?? (await detectProjectInfo(rootCwd, opts.packageManager ?? 'auto'));
+
+  const targets = resolveTargets(rootCwd, projectInfo, mode);
+
+  if (!jsonOutput) {
+    const mgrLabel = `${projectInfo.manager}${projectInfo.managerVersion ? '@' + projectInfo.managerVersion : ''}`;
+    const wsLabel = projectInfo.hasWorkspaces
+      ? ` (workspaces: ${projectInfo.workspaceMembers.length} member${projectInfo.workspaceMembers.length === 1 ? '' : 's'})`
+      : '';
+    log.dim(`Detected package manager: ${mgrLabel} via ${projectInfo.managerSource}${wsLabel}`);
+    if (mode !== 'root-only') {
+      log.info(
+        `Workspace traversal: ${targets.length} target(s) → ${targets.map((t) => t.label).join(', ')}`,
+      );
+    }
+  }
+
+  // Pre-flight runs ONCE at the workspace root. Per-target runs then skip it.
+  let aggregate: FinalReport = createEmptyReport();
+  aggregate.targets = targets.map((t) => ({ label: t.label, cwd: t.cwd, packageJson: t.packageJson }));
+  aggregate.installMode = opts.installMode ?? 'root';
+  aggregate.project = {
+    manager: projectInfo.manager,
+    managerVersion: projectInfo.managerVersion,
+    managerSource: projectInfo.managerSource,
+    lockfile: projectInfo.lockfile,
+    hasWorkspaces: projectInfo.hasWorkspaces,
+    workspaceGlobs: projectInfo.workspaceGlobs,
+    workspaceMembers: projectInfo.workspaceMembers.map((m) => ({ name: m.name, dir: m.dir })),
+    ...(projectInfo.yarnMajorVersion !== undefined
+      ? { yarnMajorVersion: projectInfo.yarnMajorVersion }
+      : {}),
+    ...(projectInfo.yarnSupportsFocus !== undefined
+      ? { yarnSupportsFocus: projectInfo.yarnSupportsFocus }
+      : {}),
+  };
+
+  if (!dryRun) {
+    const installRootPkg = await readPackageJson(rootCwd);
+    const pre = await preflightValidate(rootCwd, installRootPkg, {
+      ...(opts.validate ?? {}),
+      manager: projectInfo.manager,
+    });
+    if (!pre.skipped) {
+      aggregate.preflight = {
+        ok: pre.ok,
+        skipped: pre.skipped,
+        command: pre.command,
+        exitCode: pre.exitCode,
+        lastLines: pre.lastLines,
+        source: pre.source,
+      };
+      if (!pre.ok && !force) {
+        if (!jsonOutput) {
+          log.error(
+            `Pre-flight validator failed: \`${pre.command}\` exited ${pre.exitCode ?? '?'} on the unchanged tree.`,
+          );
+          if (pre.lastLines) {
+            log.dim(indentBlock(pre.lastLines, '    '));
+          }
+          log.info(
+            'Fix the validator command or pass --no-validate / --validate "<cmd>" / --force to proceed anyway.',
+          );
+        }
+        aggregate.preflightAborted = true;
+        return aggregate;
+      }
+    }
+  }
+
+  // Only prefix group ids with the target label when traversing more than one target. In the
+  // common single-target ("root-only") case we keep ids identical to the legacy single-engine
+  // shape so existing JSON consumers / fixture assertions stay stable.
+  const namespaceGroups = targets.length > 1;
+
+  // Yarn-specific user feedback for `--install-mode filtered`:
+  //   - berry + plugin → use `yarn workspaces focus <name>` (great), inform once.
+  //   - berry without plugin → fall back to root install, point at the plugin install hint.
+  //   - classic (v1) → no `workspaces focus` exists, fall back to root install with version hint.
+  // We deliberately log only once per run (not per target) so monorepos with many members don't
+  // produce a wall of identical warnings.
+  if (
+    opts.installMode === 'filtered' &&
+    projectInfo.manager === 'yarn' &&
+    !jsonOutput &&
+    targets.some((t) => t.cwd !== rootCwd)
+  ) {
+    const major = projectInfo.yarnMajorVersion;
+    if (projectInfo.yarnSupportsFocus) {
+      log.info(
+        `--install-mode filtered: using \`yarn workspaces focus <name>\` (yarn ${major ?? 'berry'} + @yarnpkg/plugin-workspace-tools).`,
+      );
+    } else if (major !== undefined && major < 2) {
+      log.warn(
+        `--install-mode filtered: yarn ${major}.x (classic) has no \`workspaces focus\` command. Falling back to a full root install for child targets — upgrade to yarn berry (v2+) for filtered installs.`,
+      );
+    } else {
+      log.warn(
+        '--install-mode filtered: `yarn workspaces focus` is unavailable (install `@yarnpkg/plugin-workspace-tools` with `yarn plugin import workspace-tools`). Falling back to a full root install for child targets.',
+      );
+    }
+  }
+
+  // Resolve effective concurrency. Cap at the target count (no point spawning more workers than
+  // work) and at MAX_CONCURRENCY (registry rate-limit safety). Downgrade to 1 in non-JSON mode
+  // so per-target log lines don't interleave into illegibility — humans still get serial output;
+  // CI / scripts can opt into parallelism by adding --json or --ci.
+  const requested = Math.max(1, Math.floor(opts.concurrency ?? 1));
+  let effectiveConcurrency = Math.min(requested, targets.length, MAX_CONCURRENCY);
+  if (effectiveConcurrency > 1 && !jsonOutput) {
+    log.warn(
+      `--concurrency ${requested}: parallel target traversal interleaves human-mode log output; downgrading to 1. Add --json (or --ci) to enable parallelism.`,
+    );
+    effectiveConcurrency = 1;
+  }
+  aggregate.concurrency = effectiveConcurrency;
+
+  // Shared resources for the parallel run. The cache is created unconditionally — even at
+  // concurrency 1 it deduplicates fetches across targets (typical monorepo: same dep in many
+  // workspaces). The lock is created when we actually run > 1 in flight OR when a per-upgrade
+  // hook is wired (the hook may itself touch shared state — git index, lockfile, etc. — and
+  // benefits from the same serialization guarantees the install path gets). When neither
+  // applies, `withInstallLock` no-ops at zero overhead.
+  const registryCache = createRegistryCache();
+  const installLock =
+    effectiveConcurrency > 1 || opts.onUpgradeApplied ? new AsyncMutex() : undefined;
+
+  if (effectiveConcurrency > 1 && !jsonOutput) {
+    log.dim(
+      `Parallel traversal: scan/plan up to ${effectiveConcurrency} targets concurrently; install + validate stay serialized via a shared lock.`,
+    );
+  }
+
+  const buildEngineOpts = (target: { label: string; cwd: string; packageJson: string }) => ({
+    ...opts,
+    cwd: target.cwd,
+    installCwd: rootCwd,
+    projectInfo,
+    targetLabel: namespaceGroups ? target.label : undefined,
+    skipPreflight: true,
+    // Filter only applies when (a) user opted into filtered mode and (b) we're mutating a
+    // workspace child (root targets always need a full install — nothing to filter).
+    installFilter:
+      opts.installMode === 'filtered' && target.cwd !== rootCwd ? target.label : undefined,
+    registryCache,
+    installLock,
+    onUpgradeApplied: opts.onUpgradeApplied,
+  });
+
+  // Helper that runs a single target's engine, fires `onTargetComplete` (used by the git
+  // integration's per-target flush), and returns the sub-report. Centralized so both the
+  // serial and parallel branches use identical semantics.
+  const runOneTarget = async (target: ResolvedTarget): Promise<FinalReport> => {
+    const subReport = await runUpgradeEngine(buildEngineOpts(target));
+    if (opts.onTargetComplete) {
+      try {
+        await opts.onTargetComplete({
+          workspace: target.label,
+          targetCwd: target.cwd,
+          installCwd: rootCwd,
+          manager: projectInfo.manager,
+          report: subReport,
+        });
+      } catch (e) {
+        if (!jsonOutput) {
+          const msg = e instanceof Error ? e.message : String(e);
+          log.warn(`onTargetComplete hook threw for ${target.label}: ${msg}`);
+        }
+      }
+    }
+    return subReport;
+  };
+
+  if (effectiveConcurrency === 1) {
+    // Serial path — exact pre-existing behavior. Header logs print before each target.
+    for (const target of targets) {
+      if (!jsonOutput && namespaceGroups) {
+        log.title(`Target: ${target.label}`);
+      }
+      const subReport = await runOneTarget(target);
+      aggregate = mergeSubReport(aggregate, subReport, target.label, namespaceGroups);
+    }
+    return aggregate;
+  }
+
+  // Parallel path — spawn up to `effectiveConcurrency` engines at once. We deliberately merge
+  // results in **input order** (not completion order) so the aggregated report is deterministic
+  // for snapshot-style assertions and CI diffs. JSON-mode is the gate for this path so we don't
+  // worry about interleaved human logs.
+  const subReports = await runWithConcurrency(targets, effectiveConcurrency, async (target) => {
+    return runOneTarget(target);
+  });
+  for (let i = 0; i < targets.length; i++) {
+    aggregate = mergeSubReport(aggregate, subReports[i], targets[i].label, namespaceGroups);
+  }
+  return aggregate;
+}
+
+function mergeSubReport(
+  into: FinalReport,
+  sub: FinalReport,
+  label: string,
+  namespaceGroups: boolean,
+): FinalReport {
+  into.upgraded.push(...sub.upgraded);
+  into.failed.push(...sub.failed);
+  for (const name of sub.ignored) {
+    if (!into.ignored.includes(name)) {
+      into.ignored.push(name);
+    }
+  }
+  if (sub.parsedConflicts?.length) {
+    into.parsedConflicts = into.parsedConflicts ?? [];
+    into.parsedConflicts.push(...sub.parsedConflicts);
+  }
+  if (sub.groupPlan?.length) {
+    into.groupPlan = into.groupPlan ?? [];
+    for (const g of sub.groupPlan) {
+      into.groupPlan.push({
+        id: namespaceGroups ? `${label}::${g.id}` : g.id,
+        packages: [...g.packages],
+      });
+    }
+  }
+  return into;
+}

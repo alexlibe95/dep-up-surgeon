@@ -1,5 +1,5 @@
 import chalk from 'chalk';
-import type { Conflict } from '../types.js';
+import type { Conflict, GitCommitRecord, ProjectInfoReport, ValidationDiagnostic } from '../types.js';
 import type { ConflictEntry, FinalReport, UpgradeRecord } from '../types.js';
 import { log } from '../utils/logger.js';
 
@@ -13,6 +13,28 @@ export interface StructuredReport {
   conflicts: Conflict[];
   unresolved: ConflictEntry[];
   groups: Array<{ id: string; packages: string[] }>;
+  /** Result of the unchanged-tree validator run (when not skipped). */
+  preflight?: ValidationDiagnostic & { ok: boolean; skipped: boolean };
+  /** True when the run aborted before any upgrade because pre-flight failed. */
+  preflightAborted?: boolean;
+  /** Detected package manager + workspace topology. */
+  project?: ProjectInfoReport;
+  /** Targets that were processed in this run (root and/or workspace members). */
+  targets?: Array<{ label: string; cwd: string; packageJson: string }>;
+  /** Packages that were skipped via the ignore list (CLI flag or `.dep-up-surgeonrc`). */
+  ignored?: string[];
+  /** Workspace install strategy used for this run (`'root'` or `'filtered'`). */
+  installMode?: 'root' | 'filtered';
+  /** Effective number of targets traversed in parallel (`1` = serial). */
+  concurrency?: number;
+  /**
+   * Git commits created during the run (only present when `--git-commit` was set). Failed
+   * commit attempts are also recorded here with `ok: false` so CI can surface the reason
+   * without us having to fail the whole run.
+   */
+  commits?: GitCommitRecord[];
+  /** Resolved git commit grouping mode (only present when `--git-commit` was set). */
+  gitCommitMode?: 'per-success' | 'per-target' | 'all';
 }
 
 export function buildStructuredReport(
@@ -36,11 +58,33 @@ export function buildStructuredReport(
     conflicts,
     unresolved,
     groups,
+    ...(report.preflight ? { preflight: report.preflight } : {}),
+    ...(report.preflightAborted ? { preflightAborted: true } : {}),
+    ...(report.project ? { project: report.project } : {}),
+    ...(report.targets ? { targets: report.targets } : {}),
+    ...(report.ignored?.length ? { ignored: report.ignored } : {}),
+    ...(report.installMode ? { installMode: report.installMode } : {}),
+    ...(report.concurrency && report.concurrency > 1 ? { concurrency: report.concurrency } : {}),
+    ...(report.commits && report.commits.length > 0 ? { commits: report.commits } : {}),
+    ...(report.gitCommitMode ? { gitCommitMode: report.gitCommitMode } : {}),
   };
 }
 
 export function printStructuredCliSummary(structured: StructuredReport): void {
   log.title('Structured summary');
+
+  if (structured.project) {
+    const p = structured.project;
+    const mgr = `${p.manager}${p.managerVersion ? '@' + p.managerVersion : ''}`;
+    log.dim(
+      `  project: ${mgr} via ${p.managerSource}` +
+        (p.lockfile ? `, lockfile=${p.lockfile}` : '') +
+        (p.hasWorkspaces ? `, workspaces=${p.workspaceMembers.length}` : ''),
+    );
+  }
+  if (structured.targets && structured.targets.length > 1) {
+    log.dim(`  targets: ${structured.targets.map((t) => t.label).join(', ')}`);
+  }
 
   if (structured.groups.length) {
     log.info(chalk.bold('Groups'));
@@ -62,7 +106,31 @@ export function printStructuredCliSummary(structured: StructuredReport): void {
   if (structured.unresolved.length) {
     log.info(chalk.bold('Unresolved'));
     for (const u of structured.unresolved) {
-      log.error(`${u.name}: ${u.message ?? u.reason}`);
+      const tag = u.reason === 'validation-script' ? ' (validator script error)' : '';
+      const ws = u.workspace && u.workspace !== 'root' ? ` [${u.workspace}]` : '';
+      log.error(`${u.name}${ws}${tag}: ${u.message ?? u.reason}`);
+      if (u.install) {
+        const status = u.install.ok
+          ? `${u.install.command} exited 0 (rolled back due to post-install scan)`
+          : `${u.install.command} exited ${u.install.exitCode ?? '?'}`;
+        log.dim(`    install: ${status}`);
+        if (u.install.lastLines) {
+          const head = u.install.lastLines.split(/\r?\n/).slice(0, 6).join('\n    ');
+          log.dim(`    ${head}`);
+        }
+      }
+      if (u.validation?.lastLines) {
+        const head = u.validation.lastLines.split(/\r?\n/).slice(0, 6).join('\n    ');
+        log.dim(`    validator: ${u.validation.command}`);
+        log.dim(`    ${head}`);
+      }
     }
+  }
+
+  if (structured.preflight && !structured.preflight.ok) {
+    log.info(chalk.bold('Pre-flight'));
+    log.error(
+      `Validator already failing on the unchanged tree: \`${structured.preflight.command}\` (exit ${structured.preflight.exitCode ?? '?'})`,
+    );
   }
 }

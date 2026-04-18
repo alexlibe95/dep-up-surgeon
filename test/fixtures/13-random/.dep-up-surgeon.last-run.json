@@ -1,0 +1,352 @@
+{
+  "upgraded": [],
+  "skipped": [
+    {
+      "name": "@types/react",
+      "success": true,
+      "skipped": true,
+      "from": "18.2.0",
+      "to": "19.2.14",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "@types/react-dom",
+      "success": true,
+      "skipped": true,
+      "from": "18.2.0",
+      "to": "19.2.3",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "framer-motion",
+      "success": true,
+      "skipped": true,
+      "from": "10.16.0",
+      "to": "12.38.0",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "immer",
+      "success": true,
+      "skipped": true,
+      "from": "10.0.0",
+      "to": "11.1.4",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "lucide-react",
+      "success": true,
+      "skipped": true,
+      "from": "0.292.0",
+      "to": "1.8.0",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "react",
+      "success": true,
+      "skipped": true,
+      "from": "18.2.0",
+      "to": "19.2.5",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "react-dom",
+      "success": true,
+      "skipped": true,
+      "from": "18.2.0",
+      "to": "19.2.5",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "react-hook-form",
+      "success": true,
+      "skipped": true,
+      "from": "7.50.0",
+      "to": "7.72.1",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "react-router-dom",
+      "success": true,
+      "skipped": true,
+      "from": "6.21.0",
+      "to": "7.14.1",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "swr",
+      "success": true,
+      "skipped": true,
+      "from": "2.2.0",
+      "to": "2.4.1",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "zustand",
+      "success": true,
+      "skipped": true,
+      "from": "4.4.0",
+      "to": "5.0.12",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "@vitejs/plugin-react",
+      "success": true,
+      "skipped": true,
+      "from": "4.2.0",
+      "to": "6.0.1",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-1"
+    },
+    {
+      "name": "vite",
+      "success": true,
+      "skipped": true,
+      "from": "5.0.0",
+      "to": "8.0.8",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-1"
+    },
+    {
+      "name": "autoprefixer",
+      "success": true,
+      "skipped": true,
+      "from": "10.4.18",
+      "to": "10.5.0",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-2"
+    },
+    {
+      "name": "postcss",
+      "success": true,
+      "skipped": true,
+      "from": "8.4.32",
+      "to": "8.5.10",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-2"
+    },
+    {
+      "name": "axios",
+      "success": true,
+      "skipped": true,
+      "from": "1.6.0",
+      "to": "1.15.0",
+      "reason": "skipped",
+      "detail": "dry-run"
+    },
+    {
+      "name": "clsx",
+      "success": true,
+      "skipped": true,
+      "from": "2.1.0",
+      "to": "2.1.1",
+      "reason": "skipped",
+      "detail": "dry-run"
+    },
+    {
+      "name": "date-fns",
+      "success": true,
+      "skipped": true,
+      "from": "3.0.0",
+      "to": "4.1.0",
+      "reason": "skipped",
+      "detail": "dry-run"
+    },
+    {
+      "name": "eslint",
+      "success": true,
+      "skipped": true,
+      "from": "8.55.0",
+      "to": "10.2.1",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-3"
+    },
+    {
+      "name": "eslint-plugin-import",
+      "success": true,
+      "skipped": true,
+      "from": "2.30.0",
+      "to": "2.32.0",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-3"
+    },
+    {
+      "name": "eslint-plugin-react",
+      "success": true,
+      "skipped": true,
+      "from": "7.33.0",
+      "to": "7.37.5",
+      "reason": "skipped",
+      "detail": "dry-run (linked group)",
+      "linkedGroupId": "graph-3"
+    },
+    {
+      "name": "prettier",
+      "success": true,
+      "skipped": true,
+      "from": "3.1.0",
+      "to": "3.8.3",
+      "reason": "skipped",
+      "detail": "dry-run"
+    },
+    {
+      "name": "tailwindcss",
+      "success": true,
+      "skipped": true,
+      "from": "3.4.0",
+      "to": "4.2.2",
+      "reason": "skipped",
+      "detail": "dry-run"
+    },
+    {
+      "name": "typescript",
+      "success": true,
+      "skipped": true,
+      "from": "5.3.3",
+      "to": "6.0.3",
+      "reason": "skipped",
+      "detail": "dry-run"
+    },
+    {
+      "name": "zod",
+      "success": true,
+      "skipped": true,
+      "from": "3.22.0",
+      "to": "4.3.6",
+      "reason": "skipped",
+      "detail": "dry-run"
+    }
+  ],
+  "failed": [],
+  "conflicts": [],
+  "unresolved": [],
+  "groups": [
+    {
+      "id": "graph-0",
+      "packages": [
+        "@types/react",
+        "@types/react-dom",
+        "framer-motion",
+        "immer",
+        "lucide-react",
+        "react",
+        "react-dom",
+        "react-hook-form",
+        "react-router-dom",
+        "swr",
+        "zustand"
+      ]
+    },
+    {
+      "id": "graph-1",
+      "packages": [
+        "@vitejs/plugin-react",
+        "vite"
+      ]
+    },
+    {
+      "id": "graph-2",
+      "packages": [
+        "autoprefixer",
+        "postcss"
+      ]
+    },
+    {
+      "id": "single:axios",
+      "packages": [
+        "axios"
+      ]
+    },
+    {
+      "id": "single:clsx",
+      "packages": [
+        "clsx"
+      ]
+    },
+    {
+      "id": "single:date-fns",
+      "packages": [
+        "date-fns"
+      ]
+    },
+    {
+      "id": "graph-3",
+      "packages": [
+        "eslint",
+        "eslint-plugin-import",
+        "eslint-plugin-react"
+      ]
+    },
+    {
+      "id": "single:prettier",
+      "packages": [
+        "prettier"
+      ]
+    },
+    {
+      "id": "single:tailwindcss",
+      "packages": [
+        "tailwindcss"
+      ]
+    },
+    {
+      "id": "single:typescript",
+      "packages": [
+        "typescript"
+      ]
+    },
+    {
+      "id": "single:zod",
+      "packages": [
+        "zod"
+      ]
+    }
+  ],
+  "project": {
+    "manager": "npm",
+    "managerSource": "default",
+    "hasWorkspaces": false,
+    "workspaceGlobs": [],
+    "workspaceMembers": []
+  },
+  "targets": [
+    {
+      "label": "root",
+      "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/13-random",
+      "packageJson": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/13-random/package.json"
+    }
+  ],
+  "installMode": "root",
+  "finishedAt": "2026-04-18T18:44:26.669Z",
+  "toolVersion": "1.6.6",
+  "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/13-random",
+  "dryRun": true
+}
