@@ -98,6 +98,17 @@ export interface UpgradeRecord {
     source: 'github-release' | 'changelog.md';
     url?: string;
     body: string;
+    /**
+     * Non-empty when `scanForBreakingChanges` matched BREAKING markers inside `body`. Used by
+     * the summary + PR body to render a prominent warning and by downstream CI bots that want
+     * to auto-require reviews on breaking bumps. Never affects the engine — the upgrade still
+     * goes through; this is pure reviewer signal.
+     */
+    breaking?: {
+      hasBreaking: boolean;
+      matchedLines: string[];
+      reasons: string[];
+    };
   };
   /**
    * Optional security metadata attached by `--security-only` mode. When set, this upgrade was
@@ -253,6 +264,58 @@ export interface FinalReport {
    * actually matched. Empty arrays are OK and mean the file was valid but didn't apply.
    */
   policy?: PolicyReport;
+  /**
+   * Result of the post-run `--open-pr` attempt. Present only when `--git-commit --git-branch
+   * --open-pr` was passed and the branch had at least one commit to push. The provider-specific
+   * CLI (`gh` for GitHub today; `glab` for GitLab is a future extension) runs after all
+   * commits have landed and its outcome is recorded here — never fatal, so a missing `gh`
+   * binary or a `gh auth` failure degrades to `{ ok: false, error: '...' }` instead of
+   * aborting the upgrade run the user has already paid for.
+   */
+  /**
+   * Result of the `--apply-overrides` post-run step. Every advisory we considered is recorded
+   * here — including skips (already-safe pins) and rollbacks — so JSON consumers can render
+   * the full decision trail. Empty / undefined means the step was disabled.
+   */
+  overrides?: {
+    /** Which field we wrote to: `overrides`, `pnpm.overrides`, or `resolutions`. */
+    field: 'overrides' | 'pnpm.overrides' | 'resolutions';
+    /** Ordered list of per-advisory attempts. */
+    attempts: Array<{
+      name: string;
+      severity: 'low' | 'moderate' | 'high' | 'critical';
+      ids: string[];
+      url?: string;
+      title?: string;
+      applied?: string;
+      previous?: string;
+      ok: boolean;
+      skipped: boolean;
+      reason?: string;
+      installLog?: string;
+      rolledBack?: boolean;
+    }>;
+  };
+  pullRequest?: {
+    ok: boolean;
+    provider: 'github' | 'gitlab';
+    /** Repo-relative slug as reported by the provider CLI (e.g. `owner/repo`). */
+    repo?: string;
+    /** Resolved PR number when creation succeeded. */
+    number?: number;
+    /** PR URL when creation succeeded. */
+    url?: string;
+    /** Source branch we pushed + opened the PR from. */
+    branch?: string;
+    /** Target base branch (usually `main` / `master`; resolved via `gh repo view`). */
+    base?: string;
+    /** True when `--open-pr-draft` was set or the provider defaulted to draft. */
+    draft?: boolean;
+    /** When the PR already existed for this branch, we reuse it and flip this to true. */
+    reused?: boolean;
+    /** Human-readable error when `ok === false`. */
+    error?: string;
+  };
 }
 
 export interface PolicyReport {

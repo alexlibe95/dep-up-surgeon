@@ -15,6 +15,7 @@ import type { UpgradeRecord } from '../types.js';
 import { runWithConcurrency } from '../utils/concurrency.js';
 import {
   fetchChangelog,
+  scanForBreakingChanges,
   type ChangelogCache,
   type ChangelogFetchers,
 } from '../utils/changelog.js';
@@ -68,10 +69,12 @@ export async function enrichWithChangelogs(
           githubToken: opts.githubToken,
         });
         if (excerpt) {
+          const breaking = scanForBreakingChanges(excerpt.body);
           r.changelog = {
             source: excerpt.source,
             url: excerpt.url,
             body: excerpt.body,
+            ...(breaking.hasBreaking ? { breaking } : {}),
           };
         }
       } catch {

@@ -67,6 +67,16 @@ function workspaceTag(workspace: string | undefined): string {
   return workspace && workspace !== 'root' ? ` _(${workspace})_` : '';
 }
 
+/**
+ * Light escape for Markdown special characters that would otherwise mangle a breaking-change
+ * line lifted verbatim from a changelog (e.g. `|` in a table cell, backticks breaking code
+ * spans). Conservative — we leave `*`/`_` alone because changelogs intentionally use them
+ * for emphasis and stripping would read worse than preserving.
+ */
+function escapeMd(s: string): string {
+  return s.replace(/\|/g, '\\|').replace(/</g, '&lt;');
+}
+
 function workspaceTagPlain(workspace: string | undefined): string {
   return workspace && workspace !== 'root' ? ` (${workspace})` : '';
 }
@@ -125,6 +135,29 @@ export function renderSummaryMarkdown(structured: StructuredReport, toolVersion:
       lines.push(
         `| \`${r.name}\`${workspaceTag(r.workspace)} | **${s.severity}** | ${idCell} | \`${r.from ?? '?'}\` → \`${r.to ?? '?'}\` | ${s.title ?? ''} |`,
       );
+    }
+    lines.push('');
+  }
+
+  // Breaking-changes roll-up sits above the Upgraded table so reviewers never miss it. Only
+  // renders when at least one excerpt was scanned and matched; a package with no changelog
+  // excerpt fetched is never flagged (we can't know either way).
+  const breakingRows = upgraded.filter(
+    (r) => r.changelog?.breaking?.hasBreaking === true,
+  );
+  if (breakingRows.length > 0) {
+    lines.push(`### :warning: Breaking changes detected`);
+    lines.push('');
+    lines.push(
+      `_${breakingRows.length} upgrade${breakingRows.length === 1 ? '' : 's'} include breaking-change markers. Review these carefully before merging._`,
+    );
+    lines.push('');
+    for (const r of breakingRows) {
+      const b = r.changelog!.breaking!;
+      lines.push(`- **\`${r.name}\`** \`${r.from ?? '?'}\` → \`${r.to ?? '?'}\`${workspaceTag(r.workspace)}`);
+      for (const line of b.matchedLines.slice(0, 5)) {
+        lines.push(`  - ${escapeMd(line)}`);
+      }
     }
     lines.push('');
   }
@@ -205,6 +238,48 @@ export function renderSummaryMarkdown(structured: StructuredReport, toolVersion:
     lines.push(`### Ignored`);
     lines.push('');
     lines.push(structured.ignored.map((n) => `\`${n}\``).join(', '));
+    lines.push('');
+  }
+
+  if (structured.overrides && structured.overrides.attempts.length > 0) {
+    const ok = structured.overrides.attempts.filter((a) => a.ok && !a.skipped);
+    const noOp = structured.overrides.attempts.filter((a) => a.ok && a.skipped);
+    const failed = structured.overrides.attempts.filter((a) => !a.ok);
+    lines.push(`### Overrides applied`);
+    lines.push('');
+    lines.push(
+      `_wrote to \`${structured.overrides.field}\` — ${ok.length} pinned, ${noOp.length} already safe, ${failed.length} failed._`,
+    );
+    lines.push('');
+    if (ok.length > 0) {
+      lines.push(`| Package | Pinned to | Severity | Advisory |`);
+      lines.push(`| --- | --- | --- | --- |`);
+      for (const a of ok) {
+        const advCell = a.url && a.ids[0] ? `[${a.ids[0]}](${a.url})` : a.ids[0] ?? '';
+        lines.push(`| \`${a.name}\` | \`${a.applied ?? '?'}\` | ${a.severity} | ${advCell} |`);
+      }
+      lines.push('');
+    }
+    if (failed.length > 0) {
+      lines.push(`**Failed overrides** (rolled back):`);
+      for (const a of failed) {
+        lines.push(`- \`${a.name}\` — ${a.reason ?? 'unknown'}`);
+      }
+      lines.push('');
+    }
+  }
+
+  if (structured.pullRequest) {
+    const pr = structured.pullRequest;
+    lines.push(`### Pull request`);
+    lines.push('');
+    if (pr.ok && pr.url) {
+      lines.push(`- [${pr.url}](${pr.url}) on \`${pr.branch}\`${pr.reused ? ' (reused existing)' : ''}${pr.draft ? ' _(draft)_' : ''}`);
+    } else if (pr.ok) {
+      lines.push(`- opened on \`${pr.branch}\`${pr.reused ? ' (reused existing)' : ''}`);
+    } else {
+      lines.push(`- **failed** on \`${pr.branch ?? '?'}\`: ${pr.error ?? 'unknown error'}`);
+    }
     lines.push('');
   }
 
@@ -290,6 +365,28 @@ export function renderSummaryHtml(structured: StructuredReport, toolVersion: str
     out.push(`</tbody></table>`);
   }
 
+  const breakingRowsHtml = upgraded.filter(
+    (r) => r.changelog?.breaking?.hasBreaking === true,
+  );
+  if (breakingRowsHtml.length > 0) {
+    out.push(`<h3>⚠️ Breaking changes detected</h3>`);
+    out.push(
+      `<p><em>${breakingRowsHtml.length} upgrade${breakingRowsHtml.length === 1 ? '' : 's'} include breaking-change markers. Review carefully before merging.</em></p>`,
+    );
+    out.push(`<ul>`);
+    for (const r of breakingRowsHtml) {
+      const b = r.changelog!.breaking!;
+      out.push(
+        `<li><strong><code>${esc(r.name)}</code></strong> <code>${esc(r.from ?? '?')}</code> → <code>${esc(r.to ?? '?')}</code>${esc(workspaceTagPlain(r.workspace))}<ul>`,
+      );
+      for (const line of b.matchedLines.slice(0, 5)) {
+        out.push(`<li>${esc(line)}</li>`);
+      }
+      out.push(`</ul></li>`);
+    }
+    out.push(`</ul>`);
+  }
+
   if (upgraded.length) {
     out.push(`<h3>Upgraded</h3>`);
     out.push(`<table><thead><tr><th>Package</th><th>Workspace</th><th>From</th><th>To</th><th>Notes</th></tr></thead><tbody>`);
@@ -358,6 +455,9 @@ export function renderSummaryHtml(structured: StructuredReport, toolVersion: str
 
 function formatUpgradeNote(r: UpgradeRecord): string {
   const bits: string[] = [];
+  if (r.changelog?.breaking?.hasBreaking) {
+    bits.push(':warning: **breaking**');
+  }
   if (r.security) {
     const id = r.security.ids[0];
     bits.push(id ? `security: **${r.security.severity}** (${id})` : `security: **${r.security.severity}**`);

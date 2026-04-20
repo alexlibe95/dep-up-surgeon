@@ -236,6 +236,11 @@ export interface UpgradeChange {
     source: 'github-release' | 'changelog.md';
     url?: string;
     body: string;
+    breaking?: {
+      hasBreaking: boolean;
+      matchedLines: string[];
+      reasons: string[];
+    };
   };
   /**
    * Security metadata from `--security-only` audit. Surfaced in commit subjects and bodies so
@@ -300,6 +305,38 @@ function securitySubjectTag(changes: UpgradeChange[]): string {
   return highest ? `[security:${highest}] ` : '';
 }
 
+/**
+ * True when ANY change in the batch has a breaking-change marker detected in its changelog.
+ * Consumed by the subject tag (`[breaking] `) and the dedicated "Breaking changes:" footer so
+ * reviewers spot them at a glance in `git log` + `gh pr view`.
+ */
+function hasBreakingChange(changes: UpgradeChange[]): boolean {
+  return changes.some((c) => c.changelog?.breaking?.hasBreaking === true);
+}
+
+/** Render the `[breaking] ` tag prefix; emitted BEFORE the security tag so order is stable. */
+function breakingSubjectTag(changes: UpgradeChange[]): string {
+  return hasBreakingChange(changes) ? '[breaking] ' : '';
+}
+
+/**
+ * Render a per-change breaking-changes footer. One section per upgrade so reviewers can see
+ * which package the breaking lines came from. Capped to 5 lines per package — the scanner
+ * already dedupes, this is just a belt-and-braces against especially noisy changelogs.
+ */
+function breakingFooter(changes: UpgradeChange[]): string {
+  const rows: string[] = [];
+  for (const c of changes) {
+    const b = c.changelog?.breaking;
+    if (!b?.hasBreaking || b.matchedLines.length === 0) continue;
+    rows.push(`- ${c.name}:`);
+    for (const line of b.matchedLines.slice(0, 5)) {
+      rows.push(`    · ${line}`);
+    }
+  }
+  return rows.length > 0 ? `\n\nBreaking changes detected:\n${rows.join('\n')}` : '';
+}
+
 /** Render a per-change security footer (inside the commit body). */
 function securityFooter(changes: UpgradeChange[]): string {
   const rows = changes
@@ -315,22 +352,22 @@ function securityFooter(changes: UpgradeChange[]): string {
 }
 
 export function formatPerSuccessMessage(prefix: string, changes: UpgradeChange[]): string {
+  const brkTag = breakingSubjectTag(changes);
   const secTag = securitySubjectTag(changes);
   if (changes.length === 1) {
     const c = changes[0];
     const ws = c.workspace && c.workspace !== 'root' ? ` (${c.workspace})` : '';
-    const subject = `${prefix}${secTag}bump ${c.name} from ${tidyVersion(c.from)} to ${tidyVersion(c.to)}${ws}`;
-    return subject + securityFooter(changes) + changelogSection(changes);
+    const subject = `${prefix}${brkTag}${secTag}bump ${c.name} from ${tidyVersion(c.from)} to ${tidyVersion(c.to)}${ws}`;
+    return subject + breakingFooter(changes) + securityFooter(changes) + changelogSection(changes);
   }
-  // Linked group → multi-line message with each member listed.
   const head = changes[0];
   const ws = head.workspace && head.workspace !== 'root' ? ` (${head.workspace})` : '';
   const lines = [
-    `${prefix}${secTag}bump ${changes.length} linked packages${ws}`,
+    `${prefix}${brkTag}${secTag}bump ${changes.length} linked packages${ws}`,
     '',
     ...changes.map((c) => `- ${c.name}: ${tidyVersion(c.from)} → ${tidyVersion(c.to)}`),
   ];
-  return lines.join('\n') + securityFooter(changes) + changelogSection(changes);
+  return lines.join('\n') + breakingFooter(changes) + securityFooter(changes) + changelogSection(changes);
 }
 
 /**
@@ -359,22 +396,24 @@ export function formatPerTargetMessage(
   if (changes.length === 0) {
     return `${prefix}no changes for ${workspace}`;
   }
+  const brkTag = breakingSubjectTag(changes);
   const secTag = securitySubjectTag(changes);
   const wsLabel = workspace === 'root' ? '' : ` in ${workspace}`;
   const lines = [
-    `${prefix}${secTag}${changes.length} upgrade${changes.length === 1 ? '' : 's'}${wsLabel}`,
+    `${prefix}${brkTag}${secTag}${changes.length} upgrade${changes.length === 1 ? '' : 's'}${wsLabel}`,
     '',
     ...changes.map(
       (c) => `- ${c.name}: ${tidyVersion(c.from)} → ${tidyVersion(c.to)}${compactChangelogMark(c)}`,
     ),
   ];
-  return lines.join('\n') + securityFooter(changes);
+  return lines.join('\n') + breakingFooter(changes) + securityFooter(changes);
 }
 
 export function formatAllInOneMessage(prefix: string, changes: UpgradeChange[]): string {
   if (changes.length === 0) {
     return `${prefix}no upgrades`;
   }
+  const brkTag = breakingSubjectTag(changes);
   const secTag = securitySubjectTag(changes);
   const targets = new Map<string, UpgradeChange[]>();
   for (const c of changes) {
@@ -386,8 +425,8 @@ export function formatAllInOneMessage(prefix: string, changes: UpgradeChange[]):
   const targetCount = targets.size;
   const head =
     targetCount === 1
-      ? `${prefix}${secTag}${changes.length} upgrade${changes.length === 1 ? '' : 's'}`
-      : `${prefix}${secTag}${changes.length} upgrades across ${targetCount} targets`;
+      ? `${prefix}${brkTag}${secTag}${changes.length} upgrade${changes.length === 1 ? '' : 's'}`
+      : `${prefix}${brkTag}${secTag}${changes.length} upgrades across ${targetCount} targets`;
   const lines: string[] = [head, ''];
   for (const [ws, list] of targets) {
     if (targetCount > 1) {
@@ -404,5 +443,5 @@ export function formatAllInOneMessage(prefix: string, changes: UpgradeChange[]):
   while (lines.length > 0 && lines[lines.length - 1] === '') {
     lines.pop();
   }
-  return lines.join('\n') + securityFooter(changes);
+  return lines.join('\n') + breakingFooter(changes) + securityFooter(changes);
 }

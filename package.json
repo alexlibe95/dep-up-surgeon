@@ -1,6 +1,6 @@
 {
   "name": "dep-up-surgeon",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Upgrade npm dependencies one-by-one with validation, rollback, and conflict reporting.",
   "main": "dist/cli.js",
   "bin": {
@@ -14,8 +14,8 @@
     "build": "tsc",
     "prepare": "npm run build",
     "start": "node dist/cli.js",
-    "test": "npm run build && node --test test/unit/conflict-parser.test.mjs test/unit/npm-output-samples.test.mjs test/unit/workspaces.test.mjs test/unit/output-tail.test.mjs test/unit/upgrade-flow-targets.test.mjs test/unit/last-run-retry.test.mjs test/unit/summary.test.mjs test/unit/install-filter.test.mjs test/unit/concurrency.test.mjs test/unit/git.test.mjs test/unit/changelog.test.mjs test/unit/audit.test.mjs test/unit/policy.test.mjs test/unit/blast-radius.test.mjs test/fixtures-runner.mjs",
-    "test:unit": "npm run build && node --test test/unit/conflict-parser.test.mjs test/unit/npm-output-samples.test.mjs test/unit/workspaces.test.mjs test/unit/output-tail.test.mjs test/unit/upgrade-flow-targets.test.mjs test/unit/last-run-retry.test.mjs test/unit/summary.test.mjs test/unit/install-filter.test.mjs test/unit/concurrency.test.mjs test/unit/git.test.mjs test/unit/changelog.test.mjs test/unit/audit.test.mjs test/unit/policy.test.mjs test/unit/blast-radius.test.mjs",
+    "test": "npm run build && node --test test/unit/conflict-parser.test.mjs test/unit/npm-output-samples.test.mjs test/unit/workspaces.test.mjs test/unit/output-tail.test.mjs test/unit/upgrade-flow-targets.test.mjs test/unit/last-run-retry.test.mjs test/unit/summary.test.mjs test/unit/install-filter.test.mjs test/unit/concurrency.test.mjs test/unit/git.test.mjs test/unit/changelog.test.mjs test/unit/audit.test.mjs test/unit/policy.test.mjs test/unit/blast-radius.test.mjs test/unit/breaking-changes.test.mjs test/unit/open-pr.test.mjs test/unit/overrides.test.mjs test/fixtures-runner.mjs",
+    "test:unit": "npm run build && node --test test/unit/conflict-parser.test.mjs test/unit/npm-output-samples.test.mjs test/unit/workspaces.test.mjs test/unit/output-tail.test.mjs test/unit/upgrade-flow-targets.test.mjs test/unit/last-run-retry.test.mjs test/unit/summary.test.mjs test/unit/install-filter.test.mjs test/unit/concurrency.test.mjs test/unit/git.test.mjs test/unit/changelog.test.mjs test/unit/audit.test.mjs test/unit/policy.test.mjs test/unit/blast-radius.test.mjs test/unit/breaking-changes.test.mjs test/unit/open-pr.test.mjs test/unit/overrides.test.mjs",
     "test:fixtures": "npm run build && node --test test/fixtures-runner.mjs"
   },
   "repository": {

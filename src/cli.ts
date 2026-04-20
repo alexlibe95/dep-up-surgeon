@@ -287,6 +287,42 @@ async function main(): Promise<void> {
     .option(
       '--no-blast-radius',
       'Disable blast-radius source scanning. Useful in very large monorepos where the scan is slower than the install itself.',
+    )
+    .option(
+      '--apply-overrides',
+      'After the main upgrade loop, attempt to fix transitive CVEs that no direct bump could reach by writing a package-manager override (`overrides` for npm, `pnpm.overrides` for pnpm, `resolutions` for yarn) pinning each vulnerable package to its audit-recommended safe version. Runs install + validator after each pin and rolls back the pin on failure. Requires --security-only.',
+      false,
+    )
+    .option(
+      '--override-force',
+      'Used with --apply-overrides. Overwrite an existing override whose value conflicts with the audit-recommended version. By default we refuse and record a `conflict` reason so the user can reconcile manually.',
+      false,
+    )
+    .option(
+      '--open-pr',
+      'Push the branch created by --git-branch and open a GitHub PR using the `gh` CLI (must be installed + authenticated). The PR body is the --summary markdown (falls back to a minimal default). Never fatal: a missing `gh`, an auth failure, or a push reject is recorded in the structured report as `pullRequest.error` without aborting the upgrade run.',
+      false,
+    )
+    .option(
+      '--open-pr-title <title>',
+      'Override the PR title. Default: a deterministic title derived from the upgrade counts (e.g. "deps: [security] bump 3 packages").',
+    )
+    .option(
+      '--open-pr-draft',
+      'Open the PR as a draft. Useful on Fridays or when --force was used so the PR cannot be auto-merged by a queue bot.',
+      false,
+    )
+    .option(
+      '--open-pr-base <branch>',
+      'Target base branch for the PR. Default: the repo default branch as reported by `gh repo view`.',
+    )
+    .option(
+      '--open-pr-reviewers <users>',
+      'Comma-separated usernames to request reviews from. Passed through to `gh pr create --reviewer`.',
+    )
+    .option(
+      '--open-pr-assignees <users>',
+      'Comma-separated usernames to assign. Passed through to `gh pr create --assignee`.',
     );
 
   program.parse(process.argv);
@@ -321,6 +357,14 @@ async function main(): Promise<void> {
     securityOnly?: boolean;
     minSeverity?: string;
     blastRadius?: boolean;
+    applyOverrides?: boolean;
+    overrideForce?: boolean;
+    openPr?: boolean;
+    openPrTitle?: string;
+    openPrDraft?: boolean;
+    openPrBase?: string;
+    openPrReviewers?: string;
+    openPrAssignees?: string;
   }>();
 
   const cwd = process.cwd();
@@ -764,15 +808,153 @@ async function main(): Promise<void> {
       }
     }
 
+    // --apply-overrides: fix transitive CVEs that the direct-dep loop couldn't reach. Runs
+    // AFTER enrichments so we have the final `upgraded` list, and BEFORE the summary so the
+    // summary writer + JSON consumers see `report.overrides`.
+    if (opts.applyOverrides && !dryRun) {
+      if (!opts.securityOnly || !auditResult || auditResult.advisories.length === 0) {
+        if (!jsonOutput) {
+          log.warn(
+            '--apply-overrides requires --security-only with at least one audit advisory; skipping.',
+          );
+        }
+      } else {
+        try {
+          const { runOverrideFlow, collectDirectDepNames } = await import('./cli/overrideFlow.js');
+          // Build the direct-dep set across every workspace target so we don't mis-classify a
+          // package as transitive when it's actually a direct dep of a workspace member.
+          const directDepNames = new Set<string>();
+          for (const t of report!.targets ?? [{ cwd, packageJson: path.join(cwd, 'package.json') }]) {
+            for (const n of await collectDirectDepNames(t.packageJson)) {
+              directDepNames.add(n);
+            }
+          }
+          const upgradedNames = new Set(
+            report!.upgraded.filter((r) => r.success && !r.skipped).map((r) => r.name),
+          );
+          const overrideManager: PackageManager =
+            packageManager !== 'auto' ? packageManager : report!.project?.manager ?? 'npm';
+          const flowResult = await runOverrideFlow({
+            cwd,
+            manager: overrideManager,
+            advisories: auditResult.advisories,
+            upgradedNames,
+            directDepNames,
+            overwriteConflicts: Boolean(opts.overrideForce),
+            json: jsonOutput,
+          });
+          if (flowResult.attempts.length > 0) {
+            const { overrideFieldFor } = await import('./utils/overrides.js');
+            report!.overrides = {
+              field: overrideFieldFor(overrideManager),
+              attempts: flowResult.attempts,
+            };
+          }
+        } catch (e) {
+          if (!jsonOutput) {
+            log.warn(
+              `--apply-overrides: skipped due to error: ${e instanceof Error ? e.message : String(e)}`,
+            );
+          }
+        }
+      }
+    }
+
+    // Write the --summary file BEFORE emitting the primary report so we can reuse it as the
+    // PR body (when --open-pr is set) and so the JSON consumer sees `pullRequest` reflected in
+    // the final structured report.
+    let summaryFilePath: string | undefined;
+    if (summaryFormat) {
+      const intermediateStructured = buildStructuredReport(report!, {
+        parsedConflicts: report!.parsedConflicts,
+        groups: report!.groupPlan,
+      });
+      const dest = resolveSummaryDestination({
+        format: summaryFormat,
+        file: opts.summaryFile,
+        cwd,
+        toolVersion: version,
+      });
+      const written = await writeSummary(intermediateStructured, {
+        format: summaryFormat,
+        file: opts.summaryFile,
+        cwd,
+        toolVersion: version,
+      });
+      if (written) {
+        summaryFilePath = written;
+        if (!jsonOutput) {
+          const rel = path.relative(cwd, written) || written;
+          log.dim(
+            `Wrote ${summaryFormat.toUpperCase()} summary to ${rel}${dest.append ? ' (appended)' : ''}`,
+          );
+        }
+      }
+    }
+
+    // --open-pr: push the branch and open a PR using `gh`. Runs only when git commits actually
+    // landed on the branch; a dry run, a disabled git flow, or zero commits all skip cleanly.
+    // The result is attached to the report so --json / persisted report show it.
+    if (opts.openPr) {
+      const branch =
+        typeof opts.gitBranch === 'string' && opts.gitBranch.trim() ? opts.gitBranch.trim() : undefined;
+      const hadCommits = gitFlow?.enabled === true && (report!.commits ?? []).some((c) => c.ok);
+      if (!gitFlow?.enabled) {
+        if (!jsonOutput) {
+          log.warn('--open-pr requires --git-commit; skipping.');
+        }
+      } else if (!branch) {
+        if (!jsonOutput) {
+          log.warn('--open-pr requires --git-branch <name>; skipping so we never push to the default branch.');
+        }
+      } else if (dryRun) {
+        if (!jsonOutput) {
+          log.warn('--open-pr: skipping in --dry-run (no commits were made).');
+        }
+      } else if (!hadCommits) {
+        if (!jsonOutput) {
+          log.dim('--open-pr: no successful commits on the branch — nothing to open a PR for.');
+        }
+      } else {
+        const { openPullRequest, readSummaryAsBody, defaultPrBody } = await import('./cli/openPr.js');
+        const body =
+          (summaryFormat === 'md' && (await readSummaryAsBody(cwd, summaryFilePath))) ||
+          defaultPrBody(report!);
+        const prCfg: Parameters<typeof openPullRequest>[0] = { cwd, branch, body };
+        if (typeof opts.openPrTitle === 'string' && opts.openPrTitle.trim()) {
+          prCfg.title = opts.openPrTitle.trim();
+        }
+        if (opts.openPrDraft) prCfg.draft = true;
+        if (typeof opts.openPrBase === 'string' && opts.openPrBase.trim()) {
+          prCfg.base = opts.openPrBase.trim();
+        }
+        if (typeof opts.openPrReviewers === 'string' && opts.openPrReviewers.trim()) {
+          prCfg.reviewers = opts.openPrReviewers.trim();
+        }
+        if (typeof opts.openPrAssignees === 'string' && opts.openPrAssignees.trim()) {
+          prCfg.assignees = opts.openPrAssignees.trim();
+        }
+        const result = await openPullRequest(prCfg, report!);
+        report!.pullRequest = result;
+        if (!jsonOutput) {
+          if (result.ok) {
+            const tag = result.reused ? 'reused existing PR' : 'opened PR';
+            log.success(`gh: ${tag}${result.url ? ` ${result.url}` : ''}`);
+          } else {
+            log.warn(`--open-pr: ${result.error}`);
+          }
+        }
+      }
+    }
+
     const structuredFinal = buildStructuredReport(report!, {
       parsedConflicts: report!.parsedConflicts,
       groups: report!.groupPlan,
     });
 
     // Emit the primary report (JSON to stdout, or human-friendly to stderr) AFTER all post-run
-    // enrichments have run (policy / security / blast-radius / changelog). This guarantees that
-    // every consumer — `--json`, `--summary`, `.dep-up-surgeon.last-run.json`, and the text
-    // report — sees the exact same structured report.
+    // enrichments have run (policy / security / blast-radius / changelog / pull-request). This
+    // guarantees every consumer sees the same final structured report.
     if (jsonOutput) {
       console.log(
         JSON.stringify({ ...structuredFinal, ignored: report!.ignored }, null, 2),
@@ -796,27 +978,6 @@ async function main(): Promise<void> {
       });
       if (written && !jsonOutput) {
         log.dim(`Wrote ${path.relative(cwd, written) || LAST_RUN_FILENAME} for --retry-failed / CI`);
-      }
-    }
-
-    if (summaryFormat) {
-      const dest = resolveSummaryDestination({
-        format: summaryFormat,
-        file: opts.summaryFile,
-        cwd,
-        toolVersion: version,
-      });
-      const written = await writeSummary(structuredFinal, {
-        format: summaryFormat,
-        file: opts.summaryFile,
-        cwd,
-        toolVersion: version,
-      });
-      if (written && !jsonOutput) {
-        const rel = path.relative(cwd, written) || written;
-        log.dim(
-          `Wrote ${summaryFormat.toUpperCase()} summary to ${rel}${dest.append ? ' (appended)' : ''}`,
-        );
       }
     }
 

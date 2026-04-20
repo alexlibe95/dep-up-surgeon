@@ -97,6 +97,13 @@ dep-up-surgeon [options]
 | `--security-only` | Run `npm audit` (or `pnpm`/`yarn` equivalent) first, then upgrade **only** the packages with open advisories. Every successful bump carries the advisory severity + ID into its commit subject (`[security:high]`) and into the summary's **Security fixes** table. Pairs well with `--git-commit-mode per-success` to produce one PR per CVE. See **Security-first mode** below. |
 | `--min-severity <level>` | Minimum advisory severity to consider under `--security-only`: `low` (default), `moderate`, `high`, or `critical`. Lower-severity advisories are filtered out before the upgrade plan is built. |
 | `--blast-radius` / `--no-blast-radius` | Scan project source files to list which files actually `import`/`require` each upgraded package, and surface the list in `--json` + `--summary`. **Default ON** when `--summary` is active. See **Blast radius** below. |
+| `--apply-overrides` | After the main upgrade loop, fix **transitive** CVEs that no direct bump could reach by writing a package-manager override (`overrides` for npm, `pnpm.overrides` for pnpm, `resolutions` for yarn) pinning each vulnerable transitive to its audit-recommended safe version. Runs install + validator after each pin and rolls back automatically when the validator fails. Requires `--security-only`. See **Transitive overrides** below. |
+| `--override-force` | Used with `--apply-overrides`. Overwrite an **existing** override entry whose value conflicts with the audit-recommended version. By default we refuse to clobber user-managed pins and record `conflict` in the report. |
+| `--open-pr` | After `--git-commit --git-branch` pushes the branch, open a GitHub PR with the `--summary` markdown as the body (falls back to a deterministic minimal body). Uses the `gh` CLI (must be installed + authenticated); never fatal — a missing binary, auth failure, or push rejection is recorded as `pullRequest.error` in the JSON report without aborting the run. See **Auto-opening a PR** below. |
+| `--open-pr-title <title>` | Override the PR title. Default: derived from the upgrade counts, e.g. `deps: [breaking+security] bump 3 packages`. |
+| `--open-pr-draft` | Open the PR as a draft. Recommended with `--force` or on Fridays so merge-queue bots don't auto-land it. |
+| `--open-pr-base <branch>` | Target base branch. Default: the repo default branch as reported by `gh repo view`. |
+| `--open-pr-reviewers <users>` / `--open-pr-assignees <users>` | Comma-separated usernames passed straight to `gh pr create --reviewer` / `--assignee`. |
 
 Exit code `1` when any upgrade could not be kept (unless `--force`). The CLI also exits `1` when the **pre-flight** validator (run on the unchanged tree) fails — see **Pre-flight check** below. Fatal errors also exit `1`.
 
@@ -281,6 +288,59 @@ Before handing the PR to a reviewer, `dep-up-surgeon` can list **which of your o
 - **Output**: per-package `{ total, truncated, files[] }` entries in `upgraded[].blastRadius`, plus a collapsible per-package list in the Markdown / HTML summary. Caps at 20 file paths per package by default; `total` keeps counting past the cap so the summary can honestly say "used in 134 files".
 - **Cost**: a single pass over the tree, at most 1 MB read per file, parallel I/O (default concurrency 8). Failures are non-fatal — a broken symlink never aborts the run. Turn it off in huge monorepos with `--no-blast-radius`.
 
+### Breaking-change detection
+
+Whenever a changelog excerpt is fetched, `dep-up-surgeon` scans it for breaking-change markers and flags the upgrade so reviewers catch them before clicking merge. Works alongside `--changelog` (enabled by default with `--git-commit` / `--summary`) with no extra flags.
+
+- **What we match**: `BREAKING CHANGE:` / `BREAKING CHANGES:` footers (Conventional Commits), the `💥` and `⚠️  BREAKING` emoji conventions used by Changesets / tsup / Vitest, explicit Node-version drops (`drop support for Node 16`, `requires Node >= 20`), API-removal bullets (`- Removed the …`), and `no longer supported` / `renamed … to …` phrasing. Deprecation notices alone do **not** trip the scan.
+- **Where it shows up**:
+  - **Commit subjects** gain a `[breaking]` tag (emitted BEFORE `[security:<sev>]` when both apply): `deps: [breaking][security:high] bump axios from 1.6.0 to 2.0.0`.
+  - **Commit bodies** get a `Breaking changes detected:` section listing the exact matched lines, capped at 5 per package.
+  - **`--summary md|html`** renders a prominent `⚠️ Breaking changes detected` section ABOVE the upgraded table, plus a `⚠️ breaking` badge in the Notes column.
+  - **`--json`** → `upgraded[].changelog.breaking = { hasBreaking, matchedLines[], reasons[] }` (only present when the scan matched).
+- **Never fatal, never noisy**: absence of a changelog means no scan, which means no flag. The scan caps matches at 10 per package and dedupes identical lines so verbose changelogs don't drown out the signal.
+
+### Transitive overrides (`--apply-overrides`)
+
+`--security-only` by itself can only fix vulnerabilities reachable from a direct dependency. For CVEs that live in transitives (very common — `lodash@4.17.20` buried six levels deep under a toolchain package), pair `--security-only` with `--apply-overrides` and the tool will write a package-manager override to pin the vulnerable transitive to its safe version.
+
+- **Which field**: `overrides` for npm (>=8.3), `pnpm.overrides` for pnpm, `resolutions` for yarn (classic + berry).
+- **How it picks the pin**: uses the audit's own `fixAvailable.version` when present; otherwise `minVersion` of the first safe range the manager reported.
+- **Rollback on failure**: after each override, the tool runs a full install and then the validator. If either fails, the override is removed, install re-runs to restore the starting state, and the next advisory is still attempted. A failed override never strands the workspace — `report.overrides.attempts[].rolledBack === true` appears in the JSON and the summary.
+- **Conflict protection**: when the user already has a manual override with a value that **conflicts** with the audit recommendation, we refuse to clobber by default (`reason: "conflicts with target ..."`). Pass `--override-force` to overwrite explicitly.
+- **Where it shows up**:
+  - **`--summary`**: dedicated `Overrides applied` table with `Package / Pinned to / Severity / Advisory`.
+  - **`--json`**: `overrides.field` + `overrides.attempts[]` with the full decision trail (`ok`, `skipped`, `reason`, `previous`, `applied`, `installLog`, `rolledBack`).
+
+```bash
+# Weekly security sweep: direct bumps first, then transitive overrides, then a draft PR.
+npx dep-up-surgeon --workspaces \
+  --security-only --min-severity high \
+  --apply-overrides \
+  --git-commit --git-commit-mode per-success --git-branch "deps/security-$(date +%Y-%m-%d)" \
+  --summary md \
+  --open-pr --open-pr-draft
+```
+
+### Auto-opening a PR (`--open-pr`)
+
+When you've already paid the cost of running `--git-commit --git-branch`, `--open-pr` closes the loop by pushing the branch and opening a GitHub pull request via the [GitHub CLI (`gh`)](https://cli.github.com/). Uses your existing `gh auth`; the tool handles nothing sensitive.
+
+- **Body**: the Markdown `--summary` file when one was written, otherwise a deterministic minimal body listing upgraded packages. `gh pr create --body-file -` is used so the body is piped via stdin (no argv quoting hell for multi-KB Markdown).
+- **Title**: derived from the upgrade counts — e.g. `deps: [breaking+security] bump 3 packages` — or any string you pass via `--open-pr-title`.
+- **Base branch**: resolved from `gh repo view` when not explicitly given; respects your default branch setting.
+- **Reuses existing PRs**: if a PR already exists for the same head branch, we return `{ reused: true }` instead of erroring.
+- **Never fatal**: a missing `gh` binary, an unauthenticated session, a rejected push, or a 4xx from the API is recorded as `pullRequest.error` in the JSON report and printed to stderr — the upgrade commits are still on disk, and a subsequent manual `gh pr create` or `git push` will work normally.
+- **Draft mode**: pass `--open-pr-draft` to open as a draft (recommended with `--force` or when the breaking-change badge fires).
+
+```bash
+# Full "open a proper PR" flow with reviewers + draft mode.
+npx dep-up-surgeon --workspaces --summary md \
+  --git-commit --git-commit-mode per-success --git-branch deps/weekly \
+  --open-pr --open-pr-draft \
+  --open-pr-reviewers alice,bob --open-pr-base main
+```
+
 ### Workspaces & package managers
 
 `dep-up-surgeon` is **workspace-aware**:
@@ -459,7 +519,8 @@ The compiled entry is `dist/cli.js` (see `"bin"` in `package.json`).
 
 ## Future work (tracked in code)
 
-- Auto-open a PR after `--git-commit --git-branch` (today the user / CI step runs `gh pr create` themselves)
+- GitLab / Bitbucket auto-PR providers (today `--open-pr` is GitHub-only via `gh`)
+- Nested / parent-scoped override rules beyond the flat `name → version` form (`overrides: { "foo": { ">=2 <3": "3.0.0" } }` in npm, deep pnpm selectors)
 - Deeper automatic resolution using peer-range intersection across a batch
 - Renovate-style scheduling helpers (cron / day-of-week filters, grouping rules)
 - True parallel installs in monorepos that don't share a root lockfile (e.g. nohoist setups), going beyond today's parallel scan + serial install model

@@ -191,12 +191,18 @@ export async function createGitFlow(
       if (!excerpt) {
         return c;
       }
+      // Run the breaking-change scanner here (the cheapest place it touches): we already have
+      // the body in hand, and we only need to do it once per excerpt because the result is
+      // stable for a given (package, toVersion). The scan itself is pure regex; no I/O.
+      const { scanForBreakingChanges } = await import('../utils/changelog.js');
+      const breaking = scanForBreakingChanges(excerpt.body);
       return {
         ...c,
         changelog: {
           source: excerpt.source,
           url: excerpt.url,
           body: excerpt.body,
+          ...(breaking.hasBreaking ? { breaking } : {}),
         },
       };
     } catch {

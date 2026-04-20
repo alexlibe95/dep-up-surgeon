@@ -43,6 +43,10 @@ export interface StructuredReport {
   gitCommitMode?: 'per-success' | 'per-target' | 'all';
   /** Policy engine decisions (only present when `.dep-up-surgeon.policy.{yaml,json}` was found). */
   policy?: PolicyReport;
+  /** Result of the `--apply-overrides` step (only present when the flag was passed). */
+  overrides?: FinalReport['overrides'];
+  /** Result of the `--open-pr` step (only present when the flag was passed). */
+  pullRequest?: FinalReport['pullRequest'];
 }
 
 export function buildStructuredReport(
@@ -76,6 +80,8 @@ export function buildStructuredReport(
     ...(report.commits && report.commits.length > 0 ? { commits: report.commits } : {}),
     ...(report.gitCommitMode ? { gitCommitMode: report.gitCommitMode } : {}),
     ...(report.policy ? { policy: report.policy } : {}),
+    ...(report.overrides ? { overrides: report.overrides } : {}),
+    ...(report.pullRequest ? { pullRequest: report.pullRequest } : {}),
   };
 }
 

@@ -442,6 +442,115 @@ export function truncateText(text: string): { text: string; truncated: boolean }
   return { text: `${head}\n\n(… truncated; see full notes for details)`, truncated: true };
 }
 
+// ---------------------------------------------------------------------------
+// Breaking-change detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of scanning a changelog body for breaking-change markers. Non-destructive — the
+ * original excerpt is left untouched; this is pure signal for reviewers.
+ */
+export interface BreakingChangeScan {
+  /** True when at least one breaking-change marker matched. */
+  hasBreaking: boolean;
+  /**
+   * The actual lines that tripped the scan, capped at 10. Useful for surfacing in the PR body
+   * so reviewers see *which* breaking changes matched, not just a boolean badge.
+   */
+  matchedLines: string[];
+  /**
+   * Short labels describing *why* each line matched ("BREAKING CHANGE", "drops Node 16",
+   * "💥 emoji", etc.). Parallel array to `matchedLines`.
+   */
+  reasons: string[];
+}
+
+/**
+ * Regex patterns matching how the ecosystem *actually* writes breaking changes in release
+ * notes. Ordered roughly by prevalence — the first matching pattern wins per line so the
+ * `reasons` label stays stable. Each entry: `{ re, label }`.
+ *
+ *  - `BREAKING CHANGE` / `BREAKING CHANGES:` — Conventional Commits footer, very common in
+ *    auto-generated changelogs (semantic-release / changesets / lerna).
+ *  - `💥` / `⚠️  BREAKING` — emoji conventions (changesets, tsup, vitest).
+ *  - `drops? (support for )?Node <N>` — explicit Node version drops, the single most common
+ *    silent breaker.
+ *  - `minimum (supported )?Node` / `requires Node >= X` — same family.
+ *  - `dropped? (...|deprecated|legacy)` — general "we removed X" language.
+ *  - `removed?` in a heading / bullet — often signals an API removal (scoped to list items so
+ *    we don't false-match prose like "we've removed the bug"). Kept deliberately conservative.
+ *
+ * Intentional non-matches: "deprecated" alone (too noisy — deprecations are not breaks),
+ * "renamed" alone (often cosmetic), "changed default" (informational).
+ */
+const BREAKING_PATTERNS: ReadonlyArray<{ re: RegExp; label: string }> = [
+  { re: /\bBREAKING[\s_-]?CHANGES?\b/i, label: 'BREAKING CHANGE' },
+  { re: /(?:^|\s)💥(?:\s|$)/u, label: 'breaking-change emoji' },
+  { re: /⚠️\s*BREAKING/i, label: 'warning-tagged breaking' },
+  { re: /\bdrops?(?:\s+support\s+for)?\s+Node(?:\.js)?\s*(?:v?\d+)/i, label: 'drops Node version' },
+  {
+    re: /\b(?:minimum|require\w*)\s+(?:supported\s+)?Node(?:\.js)?\s*(?:version\s+)?(?:is\s+|>=\s*|>\s*|=\s*)?v?\d+/i,
+    label: 'raises minimum Node',
+  },
+  {
+    re: /^[\s>*\-+]*(?:removed?|dropped?)\b(?:.+\b(?:api|option|flag|export|method|hook|prop|field|command|plugin)\b)?/i,
+    label: 'removed API',
+  },
+  { re: /\b(?:is\s+)?no\s+longer\s+(?:supported|exported|available)\b/i, label: 'no longer supported' },
+  { re: /\brenamed?\b.+\bto\b/i, label: 'renamed export' },
+];
+
+/**
+ * Scan a plain-text changelog body (post-sanitize, post-truncate) for breaking-change
+ * markers. Returns `{ hasBreaking: false, matchedLines: [], reasons: [] }` for cleanly
+ * additive releases.
+ *
+ * Design notes:
+ *   - Line-based, not regex-over-whole-body: preserves line context so reviewers can read the
+ *     matched line verbatim in the summary.
+ *   - Caps matches at 10 — past that the signal is saturated and we're just adding noise.
+ *   - Dedupes identical lines (some changelogs repeat "BREAKING CHANGE:" once per bullet).
+ *   - Works on raw or sanitized markdown — strips list markers + emphasis on the fly so the
+ *     user-facing `matchedLines` reads cleanly.
+ */
+export function scanForBreakingChanges(body: string | undefined): BreakingChangeScan {
+  const empty: BreakingChangeScan = { hasBreaking: false, matchedLines: [], reasons: [] };
+  if (!body || body.trim().length === 0) return empty;
+
+  const lines = body.split(/\r?\n/);
+  const matchedLines: string[] = [];
+  const reasons: string[] = [];
+  const seen = new Set<string>();
+
+  for (const raw of lines) {
+    if (matchedLines.length >= 10) break;
+    const line = raw.trim();
+    if (line.length === 0) continue;
+    for (const { re, label } of BREAKING_PATTERNS) {
+      if (!re.test(line)) continue;
+      // Clean markup so the surfaced line reads like prose, not raw markdown.
+      const display = line
+        .replace(/^#+\s*/, '') // heading markers
+        .replace(/^[*>\-+]\s*/, '') // list bullets / quotes
+        .replace(/\*\*([^*]+)\*\*/g, '$1') // bold
+        .replace(/\*([^*]+)\*/g, '$1') // italic
+        .replace(/`([^`]+)`/g, '$1') // inline code
+        .trim();
+      if (seen.has(display)) break;
+      seen.add(display);
+      matchedLines.push(display.length > 200 ? display.slice(0, 197) + '…' : display);
+      reasons.push(label);
+      break;
+    }
+  }
+
+  return {
+    hasBreaking: matchedLines.length > 0,
+    matchedLines,
+    reasons,
+  };
+}
+
 /**
  * Format an excerpt as a commit-body-friendly block. Used by the git commit formatters.
  */
