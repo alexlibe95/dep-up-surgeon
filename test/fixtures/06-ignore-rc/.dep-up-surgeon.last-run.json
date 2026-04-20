@@ -40,7 +40,7 @@
     "lodash"
   ],
   "installMode": "root",
-  "finishedAt": "2026-04-20T13:09:53.083Z",
+  "finishedAt": "2026-04-20T15:41:46.969Z",
   "toolVersion": "2.2.3",
   "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/06-ignore-rc",
   "dryRun": true

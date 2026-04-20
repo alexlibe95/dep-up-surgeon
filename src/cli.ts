@@ -9,6 +9,7 @@ import {
   appendIgnoreToRc,
   loadConfig,
   mergeIgnoreLists,
+  mergeOverrideSources,
   resolveValidateOptions,
 } from './config/loadConfig.js';
 import { buildStructuredReport, printStructuredCliSummary } from './cli/report.js';
@@ -160,6 +161,15 @@ async function main(): Promise<void> {
   if (process.argv[2] === 'doctor') {
     const { runDoctorCommand } = await import('./cli/doctorCommand.js');
     await runDoctorCommand(process.argv, version);
+    return;
+  }
+
+  // `undo` reads `.dep-up-surgeon.last-run.json` and reverses the last run (dep ranges +
+  // overrides + reinstall + validate). Same early-dispatch pattern as `doctor` so the
+  // subcommand doesn't inherit the upgrade flow's 70+ options.
+  if (process.argv[2] === 'undo') {
+    const { runUndoCommand } = await import('./cli/undoCommand.js');
+    await runUndoCommand(process.argv, version);
     return;
   }
 
@@ -433,6 +443,14 @@ async function main(): Promise<void> {
 
   const config = await loadConfig(cwd);
   const ignore = mergeIgnoreLists(config.ignore, opts.ignore);
+  for (const w of config.warnings ?? []) {
+    log.warn(`rc: ${w}`);
+  }
+  if ((config.overrides?.length ?? 0) > 0 && !jsonOutput) {
+    log.info(
+      `rc: loaded ${config.overrides!.length} override pin${config.overrides!.length === 1 ? '' : 's'} from .dep-up-surgeonrc (will run through the same install + validator + rollback cycle as --apply-overrides)`,
+    );
+  }
 
   // ---- Load .dep-up-surgeon.policy.{yaml,json} ----
   const { loadPolicy } = await import('./config/policy.js');
@@ -856,33 +874,34 @@ async function main(): Promise<void> {
     // Runs AFTER enrichments so we have the final `upgraded` list, and BEFORE the summary so
     // the summary writer + JSON consumers see `report.overrides`. `--override` works
     // standalone (no --security-only required); `--apply-overrides` still needs an audit.
-    const hasManualOverrides = Array.isArray(opts.override) && opts.override.length > 0;
+    const hasCliOverrides = Array.isArray(opts.override) && opts.override.length > 0;
+    const hasRcOverrides = (config.overrides?.length ?? 0) > 0;
+    const hasManualOverrides = hasCliOverrides || hasRcOverrides;
     const wantsAdvisoryOverrides = Boolean(opts.applyOverrides);
     if ((wantsAdvisoryOverrides || hasManualOverrides) && !dryRun) {
-      // Parse manual selectors up-front so we can warn about malformed entries even if the
-      // audit path is skipped. A malformed selector is fatal (not just skipped) because the
-      // user asked for something we can't represent.
-      let manualOverrides: Array<{ chain: string[]; range: string; source: string }> = [];
-      let manualError: string | undefined;
-      if (hasManualOverrides) {
-        const { parseOverrideSelector } = await import('./utils/overrides.js');
-        for (const raw of opts.override!) {
-          const parsed = parseOverrideSelector(raw);
-          if (!parsed || !parsed.range) {
-            manualError = `invalid --override selector "${raw}" (expected "<chain>@<range>" where chain is a package name, "parent>child", or "parent/child")`;
-            break;
-          }
-          manualOverrides.push({ chain: parsed.chain, range: parsed.range, source: raw });
-        }
+      // Merge rc-sourced + CLI selectors. The merger dedupes by chain (CLI wins on conflict),
+      // normalizes selector strings, and surfaces malformed CLI entries as warnings — but NOT
+      // as a fatal error, because we still want the valid rc entries to apply even when the
+      // user typo'd one `--override` flag.
+      const merged = mergeOverrideSources(config.overrides, opts.override);
+      for (const w of merged.warnings) {
+        log.warn(w);
       }
+      const manualOverrides = merged.entries.map((e) => {
+        const spec: { chain: string[]; range: string; source?: string; reason?: string } = {
+          chain: e.chain,
+          range: e.range,
+        };
+        if (e.source) spec.source = e.source;
+        if (e.reason) spec.reason = e.reason;
+        return spec;
+      });
+      const effectivelyHasManual = manualOverrides.length > 0;
 
-      if (manualError) {
-        log.error(manualError);
-        process.exitCode = 1;
-      } else if (
+      if (
         wantsAdvisoryOverrides &&
         (!opts.securityOnly || !auditResult || auditResult.advisories.length === 0) &&
-        !hasManualOverrides
+        !effectivelyHasManual
       ) {
         if (!jsonOutput) {
           log.warn(

@@ -336,8 +336,14 @@ export interface FinalReport {
        * npm, `>`-keys for pnpm, `/`-keys for yarn).
        */
       chain?: string[];
-      /** `advisory` = from `--security-only` audit; `manual` = from `--override` CLI flag. */
+      /** `advisory` = from `--security-only` audit; `manual` = from `--override` CLI flag / rc policy. */
       source: 'advisory' | 'manual';
+      /**
+       * Human-readable reason for a manual pin (CVE ID, vendor guidance, etc.) sourced from
+       * the `.dep-up-surgeonrc` `overrides[].reason` field. Present only when the rc entry
+       * carried a `reason` string; CLI-only pins omit it.
+       */
+      policyReason?: string;
       ok: boolean;
       skipped: boolean;
       reason?: string;

@@ -55,10 +55,17 @@ export interface OverrideAttemptRecord {
   chain?: string[];
   /**
    * How this attempt was triggered. `advisory` = fed in by `--security-only` audit; `manual`
-   * = user-supplied via `--override` CLI flag or policy. Consumers can render the two lists
-   * separately (e.g. manual overrides don't map to a CVE).
+   * = user-supplied via `--override` CLI flag or `.dep-up-surgeonrc` `overrides` policy.
+   * Consumers can render the two lists separately (e.g. manual overrides don't map to a CVE).
    */
   source: 'advisory' | 'manual';
+  /**
+   * Human-readable reason the manual pin exists (e.g. `"CVE-2025-1234"`, `"awaiting upstream
+   * PR #123"`). Populated only for pins sourced from the rc policy; CLI-only pins have no
+   * reason attached. Rendered verbatim in the JSON report and the markdown summary so
+   * reviewers see the "why" next to the "what" without grepping commit messages.
+   */
+  policyReason?: string;
   /** Field we touched (`overrides` / `pnpm.overrides` / `resolutions`). */
   field: OverrideField;
   /** True when the write, install, AND validator all succeeded. */
@@ -85,6 +92,12 @@ export interface ManualOverrideSpec {
   range: string;
   /** Original user-supplied selector string, for error messages and the report. */
   source?: string;
+  /**
+   * Optional human-readable reason for the pin. When provided, it's threaded into the
+   * attempt record's `policyReason` so the JSON report + summary can render it alongside
+   * the pinned package. Used by rc-sourced overrides to surface CVE IDs / vendor guidance.
+   */
+  reason?: string;
 }
 
 export interface OverrideFlowOptions {
@@ -210,6 +223,7 @@ export async function runOverrideFlow(opts: OverrideFlowOptions): Promise<Overri
       };
       if (spec.chain.length > 1) rec.chain = [...spec.chain];
       if (spec.source) rec.title = spec.source;
+      if (spec.reason) rec.policyReason = spec.reason;
       const entry: OverrideEntry = { name, range: spec.range };
       if (parentChain.length > 0) entry.parentChain = parentChain;
       await processPin(rec, entry, opts, pkgJson, `--override`);

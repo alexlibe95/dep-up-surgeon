@@ -375,6 +375,73 @@ npx dep-up-surgeon --workspaces \
   --open-pr --open-pr-draft
 ```
 
+#### Override policy file (`.dep-up-surgeonrc` `overrides`)
+
+Re-typing `--override "parent>child@1.2.3"` on every CI run gets old fast. Commit the pins to `.dep-up-surgeonrc` instead and they'll apply on every run the same way `ignore` does — merging with any CLI `--override` flags on the same invocation (**CLI wins on chain conflict**). The committed form supports a `reason` string that flows straight into the report + summary so reviewers can see **why** each transitive is pinned (CVE ID, vendor guidance, upstream PR link) without grepping commit history.
+
+Two input shapes are accepted:
+
+```jsonc
+{
+  "overrides": [
+    // Structured: explicit chain + range. `chain: "lodash"` is shorthand for the flat case.
+    { "chain": ["some-dep", "foo"], "range": "1.2.3", "reason": "CVE-2025-1234" },
+
+    // Selector form: same syntax as the `--override` CLI flag.
+    { "selector": "@babel/core>@babel/traverse@7.23.2", "reason": "upstream PR #16012 pending" },
+    { "selector": "lodash@4.17.21" }
+  ]
+}
+```
+
+Behavior:
+
+- **Merge + dedupe**: entries are merged with CLI `--override` selectors by exact chain. A CLI pin for the same chain **replaces** the rc entry (including the `reason`), so one-off ad-hoc overrides always win over committed policy.
+- **Malformed CLI selectors are warnings**, not fatal: a typo in one `--override` flag won't prevent committed rc pins from applying. rc entries with a bad shape produce per-entry warnings in `.dep-up-surgeonrc.warnings` and the run continues.
+- **Same lifecycle as `--override`**: every pin goes through the install + validator + rollback loop. Failures are per-pin — one bad pin never strands the rest.
+- **`reason` surfaces in the report**: the `Overrides applied` table in `--summary` adds a `Reason` column whenever at least one attempt carries one; `--json` ships `overrides.attempts[].policyReason` verbatim for bots.
+
+```bash
+# Run the committed overrides policy. No CLI flags needed; `overrides: [...]` in
+# `.dep-up-surgeonrc` is enough to trigger the flow.
+npx dep-up-surgeon --summary md
+
+# Add a one-off pin on top of the committed set for this run only:
+npx dep-up-surgeon --override "lodash@4.17.21" --summary md
+```
+
+### Disaster recovery (`dep-up-surgeon undo`)
+
+Every run writes `.dep-up-surgeon.last-run.json` — a structured record of what the tool did (previous ranges, `to` values, every override attempt with `applied`/`previous`, workspace targets). `dep-up-surgeon undo` replays that record **in reverse**:
+
+1. For every successful upgrade row, write the recorded `from` back to `package.json` (in whatever section currently holds the dep, across the root and every workspace target).
+2. For every successful override attempt, drop the pin we added — or, when the attempt recorded a `previous` value (the run replaced an existing pin), restore that previous value.
+3. Run `<manager> install` once per edited target so the lockfile re-converges to the reverted `package.json`.
+4. Run the validator so you see green/red before you commit the revert.
+
+Drift protection:
+
+- If the current `package.json` value for a dep **doesn't match** the `to` the run landed on (another run, or a human edit, moved it), the row is **skipped** with `reason: 'drifted'`. Undo never rewrites state we don't recognize.
+- When the recorded run was `--dry-run`, undo is a **no-op**.
+- Missing / unparseable run report → the command exits with status 2 and a clear error message.
+
+```bash
+# Replay the newest recorded run in this directory.
+npx dep-up-surgeon undo
+
+# Compute the reverse plan WITHOUT touching the disk. Use for review/CI dry-runs.
+npx dep-up-surgeon undo --dry-run
+
+# Replay a specific run file (e.g. from a CI artifact).
+npx dep-up-surgeon undo --file ./ci-logs/2026-04-18-upgrade.last-run.json
+
+# Skip the validator — handy when the project has no test script but you still want the
+# dep ranges rolled back.
+npx dep-up-surgeon undo --no-validate
+```
+
+Exit codes: `0` = reverse pass succeeded (or was a no-op); `1` = install or validator failed during the reverse pass (the JSON report still explains which rows moved); `2` = the run report was missing / invalid. Pair with `--json` for CI pipelines — the full `UndoResult` is emitted on stdout.
+
 ### Lockfile fix (`--fix-lockfile`)
 
 `--fix-lockfile` improves the **lockfile's** dependency graph without touching `package.json`. It's the counterpart to `--apply-overrides`: where overrides fix vulnerable transitives, `--fix-lockfile` collapses redundant ones and surfaces the stale-but-not-vulnerable tail that a direct upgrade loop can never reach.
@@ -547,7 +614,11 @@ Create `.dep-up-surgeonrc` in the project root:
       "packages": ["package-a", "package-b"]
     }
   ],
-  "validate": "tsc -p tsconfig.json --noEmit"
+  "validate": "tsc -p tsconfig.json --noEmit",
+  "overrides": [
+    { "chain": ["some-dep", "foo"], "range": "1.2.3", "reason": "CVE-2025-1234" },
+    { "selector": "lodash@4.17.21", "reason": "awaiting upstream PR #42" }
+  ]
 }
 ```
 
@@ -556,6 +627,8 @@ Ignored packages are never upgraded. The CLI `--ignore` list is merged with this
 **`linkedGroups`** defines **forced** batches **before** the dynamic graph runs (exact npm package names).
 
 **`validate`** overrides the validator command. Accepts either a shell string (`"tsc --noEmit"`) or an object: `{ "command": "pnpm -r build" }` or `{ "skip": true }`. CLI flags (`--validate`, `--no-validate`) always win over this file.
+
+**`overrides`** defines persistent parent-scoped / flat override pins applied on every run. Merges with CLI `--override` flags (CLI wins on exact-chain conflict). Each entry's `reason` flows into `report.overrides.attempts[].policyReason` and the summary's `Reason` column. See [Override policy file](#override-policy-file-dep-up-surgeonrc-overrides) for the full schema.
 
 ## JSON report (`--json`)
 

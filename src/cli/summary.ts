@@ -373,16 +373,24 @@ export function renderSummaryMarkdown(structured: StructuredReport, toolVersion:
     );
     lines.push('');
     if (ok.length > 0) {
-      lines.push(`| Package | Pinned to | Source | Severity | Advisory |`);
-      lines.push(`| --- | --- | --- | --- | --- |`);
+      // Show the `Reason` column only when at least one pin carries a policy reason — keeps
+      // the table narrow for the common advisory-only case.
+      const hasReason = ok.some((a) => typeof a.policyReason === 'string' && a.policyReason);
+      const header = hasReason
+        ? `| Package | Pinned to | Source | Severity | Advisory | Reason |`
+        : `| Package | Pinned to | Source | Severity | Advisory |`;
+      const sep = hasReason
+        ? `| --- | --- | --- | --- | --- | --- |`
+        : `| --- | --- | --- | --- | --- |`;
+      lines.push(header);
+      lines.push(sep);
       for (const a of ok) {
         const advCell = a.url && a.ids[0] ? `[${a.ids[0]}](${a.url})` : a.ids[0] ?? '';
         const label =
           a.chain && a.chain.length > 1 ? a.chain.join(' › ') : a.name;
         const sourceLabel = a.source === 'manual' ? '`--override`' : 'advisory';
-        lines.push(
-          `| \`${label}\` | \`${a.applied ?? '?'}\` | ${sourceLabel} | ${a.severity} | ${advCell} |`,
-        );
+        const base = `| \`${label}\` | \`${a.applied ?? '?'}\` | ${sourceLabel} | ${a.severity} | ${advCell} |`;
+        lines.push(hasReason ? `${base} ${a.policyReason ?? ''} |` : base);
       }
       lines.push('');
     }
