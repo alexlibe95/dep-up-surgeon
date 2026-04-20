@@ -1,23 +1,37 @@
 /**
  * Read / write the package-manager-specific "pin a transitive dep to version X" block inside
- * `package.json`. Used by `--security-only --apply-overrides` so we can fix CVEs that live in
- * transitive dependencies (the kind a direct bump can't reach).
+ * `package.json`. Used by `--security-only --apply-overrides` (flat audit-driven pins) and by
+ * the user-facing `--override <selector>` CLI flag (parent-scoped pins).
  *
- * Manager-specific field layouts (MVP — flat name → range; no nested parent-scoped overrides):
+ * Manager-specific field layouts — we support BOTH the flat form and the parent-scoped /
+ * nested form each manager offers:
  *
- *   - **npm (>=8.3.0)**: `{ "overrides": { "<pkg>": "<range>" } }` — top-level.
- *     Ref: https://docs.npmjs.com/cli/v9/configuring-npm/package-json#overrides
- *   - **pnpm**: `{ "pnpm": { "overrides": { "<pkg>": "<range>" } } }` — nested under `pnpm`.
- *     Ref: https://pnpm.io/package_json#pnpmoverrides
- *   - **yarn (classic + berry)**: `{ "resolutions": { "<pkg>": "<range>" } }` — top-level.
- *     Same field for v1.x and v2+. Berry additionally supports `patches` / `portals` but those
- *     aren't override-shaped, so we ignore them.
- *     Ref: https://classic.yarnpkg.com/lang/en/docs/selective-version-resolutions/
+ *   - **npm (>=8.3.0)**:
+ *       Flat:   `{ "overrides": { "<pkg>": "<range>" } }`
+ *       Nested: `{ "overrides": { "<parent>": { "<pkg>": "<range>" } } }`
+ *               Use `"."` to pin the parent itself.
+ *       Ref: https://docs.npmjs.com/cli/v9/configuring-npm/package-json#overrides
+ *
+ *   - **pnpm**:
+ *       Flat:   `{ "pnpm": { "overrides": { "<pkg>": "<range>" } } }`
+ *       Chain:  `{ "pnpm": { "overrides": { "<parent>>...>":"<range>", "<a>>b>c": "..." } } }`
+ *               pnpm encodes the parent chain directly in the key using `>` as separator.
+ *       Ref: https://pnpm.io/package_json#pnpmoverrides
+ *
+ *   - **yarn (classic + berry)**:
+ *       Flat:  `{ "resolutions": { "<pkg>": "<range>" } }`
+ *       Chain: `{ "resolutions": { "<parent>/<pkg>": "<range>" } }` — path-style, `/`-separated.
+ *       Ref: https://classic.yarnpkg.com/lang/en/docs/selective-version-resolutions/
+ *
+ * Internal model: every override is a `{ chain: string[], range: string }` pair where `chain`
+ * is the parent chain from outermost package down to the pinned package. `chain.length === 1`
+ * is the flat case. On write, we translate the chain into the manager-specific encoding above;
+ * on read, we reverse the encoding so downstream consumers never worry about the format.
  *
  * Design notes:
  *   - Pure I/O helpers here — no engine integration. The higher-level "apply an override, run
- *     install, roll back on failure" loop lives in the caller (`cli.ts` for now).
- *   - `applyOverride` is conservative: it refuses to downgrade an existing override (so a user
+ *     install, roll back on failure" loop lives in the caller (`cli/overrideFlow.ts`).
+ *   - `decideOverride` is conservative: it refuses to downgrade an existing override (so a user
  *     who manually pinned `foo@5.x` never gets auto-bumped to `5.1.x` because audit happens to
  *     suggest it). Upgrades and brand-new entries are always safe.
  *   - Writes preserve the original file's ordering for every untouched key, add the new block
@@ -55,6 +69,28 @@ export interface OverrideEntry {
    * version without speculating that a `>=` range would also be safe.
    */
   range: string;
+  /**
+   * Parent chain from outermost package down to (but not including) `name`. When omitted or
+   * empty, the override is FLAT — written as a top-level key. When non-empty, the override is
+   * PARENT-SCOPED: we walk this chain to the matching nested object (npm) or encode it into
+   * the key with the manager-specific separator (`>` for pnpm, `/` for yarn).
+   *
+   * Example: `{ parentChain: ['some-dep'], name: 'foo', range: '1.2.3' }` →
+   *   - npm:  `{ "overrides": { "some-dep": { "foo": "1.2.3" } } }`
+   *   - pnpm: `{ "pnpm": { "overrides": { "some-dep>foo": "1.2.3" } } }`
+   *   - yarn: `{ "resolutions": { "some-dep/foo": "1.2.3" } }`
+   */
+  parentChain?: string[];
+}
+
+/** Structured representation of an override entry after reading it back, chain included. */
+export interface OverrideEntryRead extends OverrideEntry {
+  /**
+   * Full chain from outermost parent down to `name` (always length ≥ 1). Flat entries have
+   * `chain = [name]`; parent-scoped entries have `chain = [...parentChain, name]`. Provided so
+   * consumers don't need to re-assemble it from `parentChain + name` themselves.
+   */
+  chain: string[];
 }
 
 export interface ReadOverridesResult {
@@ -63,11 +99,16 @@ export interface ReadOverridesResult {
   /** Field layout: `overrides` (npm), `pnpm.overrides` (pnpm), or `resolutions` (yarn). */
   field: OverrideField;
   /**
-   * Flat list of top-level entries. Nested npm/pnpm override shapes (e.g. `{"foo": {"bar": "1"}}`)
-   * are surfaced as-is in `nested` so a caller can decide whether to preserve them.
+   * All entries in the block, flat + parent-scoped mixed together. Each has a `chain` array
+   * describing where it lives; `chain.length === 1` is the flat case. npm nested objects,
+   * pnpm `>`-chains, and yarn `/`-chains are all surfaced uniformly here.
    */
-  entries: OverrideEntry[];
-  /** Any non-string values we saw — handed back raw for round-trip preservation. */
+  entries: OverrideEntryRead[];
+  /**
+   * Anything that didn't fit the string|object pattern we parse (e.g. booleans, arrays, or
+   * unknown extensions pnpm added). Handed back raw so callers that REWRITE the block can
+   * preserve these entries without knowing what they mean.
+   */
   nested: Record<string, unknown>;
 }
 
@@ -87,8 +128,21 @@ export interface ApplyOverrideResult {
 
 /**
  * Read the override block from a given `package.json` object (NOT from disk — caller owns the
- * I/O). Returns a normalized `{ present, entries, nested }` shape that works across managers.
- * Accepts a `pkg` of `unknown` so callers can pass raw JSON.parse output.
+ * I/O). Returns a normalized `{ present, entries, nested }` shape that works across managers
+ * AND flattens all three parent-scoped encodings into a single `chain` array per entry:
+ *
+ *   - npm nested: `{ "overrides": { "foo": { "bar": "1" } } }`
+ *     → entry `{ chain: ['foo', 'bar'], name: 'bar', range: '1', parentChain: ['foo'] }`.
+ *     The special key `"."` (npm's "the parent itself" selector) is folded into the chain
+ *     too: `{"foo": {".": "2"}}` → chain `['foo']` (pins `foo` when nested under itself).
+ *   - pnpm `>`-chain keys: `{ "pnpm": { "overrides": { "foo>bar": "1" } } }`
+ *     → entry `{ chain: ['foo', 'bar'], ... }`.
+ *   - yarn `/`-chain keys: `{ "resolutions": { "a/b": "1" } }`
+ *     → entry `{ chain: ['a', 'b'], ... }`. Scoped names (`@org/foo`) complicate `/` parsing,
+ *     so we treat `/` as a separator ONLY after a non-`@` segment. `"@org/foo"` stays one
+ *     name; `"@org/foo/child"` splits into `["@org/foo", "child"]`.
+ *
+ * Accepts a `pkg` of `unknown` so callers can pass raw `JSON.parse` output.
  */
 export function readOverrides(
   pkg: unknown,
@@ -110,16 +164,99 @@ export function readOverrides(
 
   if (!block || typeof block !== 'object' || Array.isArray(block)) return empty;
 
-  const entries: OverrideEntry[] = [];
+  const entries: OverrideEntryRead[] = [];
   const nested: Record<string, unknown> = {};
+
   for (const [k, v] of Object.entries(block as Record<string, unknown>)) {
     if (typeof v === 'string') {
-      entries.push({ name: k, range: v });
+      // Leaf: a direct `name` OR a chain key for pnpm/yarn.
+      const chain = parseChainKey(k, manager);
+      pushEntry(entries, chain, v);
+    } else if (manager === 'npm' && v && typeof v === 'object' && !Array.isArray(v)) {
+      // npm nested object form. Walk it recursively so grandchildren (`foo>bar>baz` in npm
+      // parlance = `{ foo: { bar: { baz: "X" } } }`) are flattened into a single chain.
+      walkNpmNested([k], v as Record<string, unknown>, entries);
     } else {
+      // Anything we don't recognize — keep it so a rewrite doesn't lose data.
       nested[k] = v;
     }
   }
+
   return { present: true, field, entries, nested };
+}
+
+/**
+ * Split a pnpm / yarn chain key into its package-name segments. The separator is `>` for pnpm
+ * and `/` for yarn — except `/` is ALSO legal inside scoped package names (`@org/pkg`), so we
+ * treat `/` as a separator only when the preceding segment doesn't start with `@`.
+ */
+function parseChainKey(key: string, manager: PackageManager): string[] {
+  const trimmed = key.trim();
+  if (!trimmed) return [trimmed];
+  if (manager === 'pnpm') {
+    // pnpm supports an optional `@<version>` suffix on any segment to constrain WHICH version
+    // of the parent the override applies to. We strip it for identification purposes — the
+    // rest of the pipeline compares by NAME — but keep it verbatim when writing back.
+    return trimmed.split('>').map((s) => s.trim()).filter(Boolean);
+  }
+  if (manager === 'yarn') {
+    const parts: string[] = [];
+    let buf = '';
+    const raw = trimmed;
+    for (let i = 0; i < raw.length; i++) {
+      const c = raw[i]!;
+      if (c === '/' && !buf.startsWith('@')) {
+        if (buf) parts.push(buf);
+        buf = '';
+        continue;
+      }
+      // Allow ONE `/` after a `@scope` so `@scope/pkg` is kept whole; any SECOND `/` splits.
+      if (c === '/' && buf.startsWith('@') && !buf.slice(1).includes('/')) {
+        buf += c;
+        continue;
+      }
+      if (c === '/' && buf.startsWith('@')) {
+        parts.push(buf);
+        buf = '';
+        continue;
+      }
+      buf += c;
+    }
+    if (buf) parts.push(buf);
+    return parts;
+  }
+  // npm: its flat keys never contain chain markers (nesting uses object form handled above).
+  return [trimmed];
+}
+
+function pushEntry(entries: OverrideEntryRead[], chain: string[], range: string): void {
+  if (chain.length === 0) return;
+  const name = chain[chain.length - 1]!;
+  const parentChain = chain.slice(0, -1);
+  const entry: OverrideEntryRead = { chain: [...chain], name, range };
+  if (parentChain.length > 0) entry.parentChain = parentChain;
+  entries.push(entry);
+}
+
+function walkNpmNested(
+  chain: string[],
+  obj: Record<string, unknown>,
+  out: OverrideEntryRead[],
+): void {
+  for (const [k, v] of Object.entries(obj)) {
+    // npm's special `"."` selector means "pin the parent package itself" (the outermost key of
+    // THIS scope). It produces an entry whose name equals the current `chain` tail, not `.`.
+    if (k === '.' && typeof v === 'string') {
+      pushEntry(out, chain, v);
+      continue;
+    }
+    const nextChain = [...chain, k];
+    if (typeof v === 'string') {
+      pushEntry(out, nextChain, v);
+    } else if (v && typeof v === 'object' && !Array.isArray(v)) {
+      walkNpmNested(nextChain, v as Record<string, unknown>, out);
+    }
+  }
 }
 
 /**
@@ -199,10 +336,75 @@ function safeSatisfies(version: string, range: string): boolean {
   }
 }
 
+function chainsEqual(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+/**
+ * Walk `block` along `chain`, delete the leaf, and prune now-empty intermediate objects on
+ * the way back out. Returns `true` when something was actually removed. Works in-place: the
+ * caller should pass a shallow-cloned copy (we own the top level).
+ */
+function removeChainFromNpmNested(
+  block: Record<string, unknown>,
+  chain: string[],
+): boolean {
+  if (chain.length === 0) return false;
+  const [head, ...tail] = chain;
+  if (!(head! in block)) return false;
+  const value = block[head!];
+
+  // Leaf write: chain of length 1. The value MUST be a string for the flat match; if it's a
+  // nested object we instead look for a `"."` key inside (npm's self-pin) — that's the only
+  // way a length-1 chain can have created a nested shape.
+  if (tail.length === 0) {
+    if (typeof value === 'string') {
+      delete block[head!];
+      return true;
+    }
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const inner = { ...(value as Record<string, unknown>) };
+      if ('.' in inner && typeof inner['.'] === 'string') {
+        delete inner['.'];
+        if (Object.keys(inner).length === 0) {
+          delete block[head!];
+        } else {
+          block[head!] = inner;
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Internal node: descend. `value` must be a nested object for the chain to be meaningful.
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const child = { ...(value as Record<string, unknown>) };
+  const ok = removeChainFromNpmNested(child, tail);
+  if (!ok) return false;
+  if (Object.keys(child).length === 0) {
+    delete block[head!];
+  } else {
+    block[head!] = child;
+  }
+  return true;
+}
+
 /**
  * In-memory write: return a new `package.json` object with the override applied. Does NOT
  * touch disk — caller serializes + writes. Preserves ordering for existing keys and inserts
  * the field at a stable position when it's new.
+ *
+ * When `entry.parentChain` is non-empty the write is **parent-scoped**:
+ *   - npm writes a nested object (`{parent: {child: "X"}}`), creating intermediate levels as
+ *     needed and preserving sibling keys at every level.
+ *   - pnpm writes a flat `"parent>child"` key (pnpm's native chain encoding).
+ *   - yarn writes a flat `"parent/child"` key. Scoped names are kept intact thanks to the
+ *     chain being an array rather than a pre-encoded string.
  */
 export function applyOverrideInMemory(
   pkg: Record<string, unknown>,
@@ -211,6 +413,8 @@ export function applyOverrideInMemory(
 ): Record<string, unknown> {
   const field = overrideFieldFor(manager);
   const next = { ...pkg };
+  const chain = [...(entry.parentChain ?? []), entry.name];
+  if (chain.length === 0) return next; // degenerate — nothing to write
 
   if (field === 'pnpm.overrides') {
     const pnpmBlock =
@@ -221,20 +425,127 @@ export function applyOverrideInMemory(
       pnpmBlock.overrides && typeof pnpmBlock.overrides === 'object'
         ? { ...(pnpmBlock.overrides as Record<string, unknown>) }
         : {};
-    overrides[entry.name] = entry.range;
+    overrides[encodeChainKey(chain, 'pnpm')] = entry.range;
     pnpmBlock.overrides = overrides;
     next.pnpm = pnpmBlock;
     return next;
   }
 
+  if (field === 'resolutions') {
+    const current = pkg[field];
+    const block =
+      current && typeof current === 'object' && !Array.isArray(current)
+        ? { ...(current as Record<string, unknown>) }
+        : {};
+    block[encodeChainKey(chain, 'yarn')] = entry.range;
+    next[field] = block;
+    return next;
+  }
+
+  // npm nested-object form. For flat overrides (chain.length === 1) we still write to the top
+  // level; otherwise we descend, cloning every intermediate level so we don't mutate the
+  // input object.
   const current = pkg[field];
-  const block =
+  const rootBlock =
     current && typeof current === 'object' && !Array.isArray(current)
       ? { ...(current as Record<string, unknown>) }
       : {};
-  block[entry.name] = entry.range;
-  next[field] = block;
+
+  if (chain.length === 1) {
+    rootBlock[chain[0]!] = entry.range;
+    next[field] = rootBlock;
+    return next;
+  }
+
+  // Descend into `rootBlock[parent[0]] = {...}`, merging with whatever's already there. If an
+  // existing entry at the parent is a STRING (flat pin), npm's spec promotes it under `"."`
+  // before we nest — that preserves the existing pin AND adds the scoped child.
+  let cursor: Record<string, unknown> = rootBlock;
+  for (let i = 0; i < chain.length - 1; i++) {
+    const seg = chain[i]!;
+    const existing = cursor[seg];
+    if (typeof existing === 'string') {
+      cursor[seg] = { '.': existing };
+    } else if (!existing || typeof existing !== 'object' || Array.isArray(existing)) {
+      cursor[seg] = {};
+    } else {
+      cursor[seg] = { ...(existing as Record<string, unknown>) };
+    }
+    cursor = cursor[seg] as Record<string, unknown>;
+  }
+  cursor[chain[chain.length - 1]!] = entry.range;
+  next[field] = rootBlock;
   return next;
+}
+
+/**
+ * Encode a `chain: string[]` into the single-string key pnpm / yarn store in their flat
+ * overrides map. pnpm uses `>`; yarn uses `/`. Scoped names are preserved verbatim inside
+ * each segment since we only join WITH the separator — we never touch the segment contents.
+ */
+export function encodeChainKey(chain: string[], manager: 'pnpm' | 'yarn'): string {
+  const sep = manager === 'pnpm' ? '>' : '/';
+  return chain.join(sep);
+}
+
+/**
+ * Parse a user-facing selector string into a `chain + range` pair.
+ *
+ * Accepts BOTH the pnpm-style `parent>child@1.2.3` AND the yarn-style `parent/child@1.2.3`
+ * form (after accounting for scoped-name slashes). When neither separator is present the
+ * selector is treated as a flat override. The trailing `@<range>` is optional — callers that
+ * know the range separately (e.g. audit-derived pins) can pass just the chain.
+ *
+ * Returns `undefined` when the selector is malformed (empty, dangling `@`, trailing separator).
+ */
+export function parseOverrideSelector(
+  spec: string,
+): { chain: string[]; range?: string } | undefined {
+  const trimmed = spec.trim();
+  if (!trimmed) return undefined;
+
+  // Split off the `@<range>` suffix. Scoped names start with `@`, so we look for the LAST `@`
+  // that has a separator-free tail (version / range) after it. Missing `@` is OK — caller
+  // supplies the range elsewhere.
+  let chainPart = trimmed;
+  let range: string | undefined;
+  const atIdx = findRangeAt(trimmed);
+  if (atIdx !== -1) {
+    chainPart = trimmed.slice(0, atIdx);
+    range = trimmed.slice(atIdx + 1).trim();
+    if (!range) return undefined;
+  }
+
+  // Chain separator detection: `>` wins if present (pnpm style is unambiguous); else `/`
+  // (yarn style, scoped-name-aware). Plain names fall through as `[chainPart]`.
+  let chain: string[];
+  if (chainPart.includes('>')) {
+    chain = chainPart.split('>').map((s) => s.trim()).filter(Boolean);
+  } else {
+    chain = parseChainKey(chainPart, 'yarn');
+  }
+  if (chain.length === 0) return undefined;
+
+  const result: { chain: string[]; range?: string } = { chain };
+  if (range) result.range = range;
+  return result;
+}
+
+/**
+ * Locate the `@` that separates the chain from the version suffix. Scoped names contain `@`
+ * in front so we skip leading `@`s; the version `@` is always the LAST `@` in the string and
+ * must be followed by at least one non-space character.
+ */
+function findRangeAt(s: string): number {
+  // Walk backwards. The range `@` is the first `@` we encounter that is NOT immediately after
+  // a chain separator (`/` or `>`) and is NOT at position 0 (scoped package prefix).
+  for (let i = s.length - 1; i > 0; i--) {
+    if (s[i] !== '@') continue;
+    const prev = s[i - 1];
+    if (prev === '/' || prev === '>') continue; // scoped name inside chain segment
+    return i;
+  }
+  return -1;
 }
 
 export interface ApplyOverrideToFileOptions {
@@ -284,9 +595,12 @@ export async function applyOverrideToFile(
     };
   }
 
-  // Read existing pin so we can decide skip / write / conflict.
+  // Read existing pin so we can decide skip / write / conflict. Match on the EXACT chain,
+  // not just the name — a flat `foo` pin and a parent-scoped `bar>foo` pin are separate
+  // entries and don't interact (both can coexist; overwriting one must never touch the other).
   const read = readOverrides(pkg, opts.manager);
-  const existing = read.entries.find((e) => e.name === opts.entry.name);
+  const wantChain = [...(opts.entry.parentChain ?? []), opts.entry.name];
+  const existing = read.entries.find((e) => chainsEqual(e.chain, wantChain));
   const decision = decideOverride(existing?.range, opts.entry.range);
 
   if (decision.action === 'skip') {
@@ -340,12 +654,24 @@ export async function applyOverrideToFile(
 /**
  * Inverse of `applyOverrideToFile` — delete a single override entry. Used by the rollback
  * path when the install + validator fails AFTER we added a pin.
+ *
+ * `target` can be a bare package name (drops the flat top-level entry, legacy API) or a
+ * structured `{ chain: string[] }` selector (drops a parent-scoped entry matching the exact
+ * chain). When a parent-scoped write was adjacent to a sibling-writing flat pin, we leave the
+ * sibling intact; same-level empty objects are pruned recursively so the file shrinks back to
+ * what existed before the write.
  */
 export async function removeOverrideFromFile(
   packageJsonPath: string,
   manager: PackageManager,
-  name: string,
+  target: string | { chain: string[] },
 ): Promise<{ ok: boolean; removed: boolean; reason?: string }> {
+  const chain =
+    typeof target === 'string' ? [target] : [...target.chain];
+  if (chain.length === 0) {
+    return { ok: true, removed: false };
+  }
+
   let raw: string;
   try {
     raw = await fs.readFile(packageJsonPath, 'utf8');
@@ -360,14 +686,19 @@ export async function removeOverrideFromFile(
   }
   const field = overrideFieldFor(manager);
   let removed = false;
+
   if (field === 'pnpm.overrides') {
     const pnpm = pkg.pnpm;
     if (pnpm && typeof pnpm === 'object') {
       const pnpmObj = { ...(pnpm as Record<string, unknown>) };
       const overrides = pnpmObj.overrides;
-      if (overrides && typeof overrides === 'object' && name in (overrides as Record<string, unknown>)) {
+      if (overrides && typeof overrides === 'object') {
         const next = { ...(overrides as Record<string, unknown>) };
-        delete next[name];
+        const key = encodeChainKey(chain, 'pnpm');
+        if (key in next) {
+          delete next[key];
+          removed = true;
+        }
         if (Object.keys(next).length === 0) {
           delete pnpmObj.overrides;
           if (Object.keys(pnpmObj).length === 0) {
@@ -379,20 +710,34 @@ export async function removeOverrideFromFile(
           pnpmObj.overrides = next;
           pkg.pnpm = pnpmObj;
         }
-        removed = true;
       }
     }
-  } else {
+  } else if (field === 'resolutions') {
     const block = pkg[field];
-    if (block && typeof block === 'object' && name in (block as Record<string, unknown>)) {
+    if (block && typeof block === 'object') {
       const next = { ...(block as Record<string, unknown>) };
-      delete next[name];
+      const key = encodeChainKey(chain, 'yarn');
+      if (key in next) {
+        delete next[key];
+        removed = true;
+      }
       if (Object.keys(next).length === 0) {
         delete pkg[field];
       } else {
         pkg[field] = next;
       }
-      removed = true;
+    }
+  } else {
+    // npm: flat OR nested object path.
+    const block = pkg[field];
+    if (block && typeof block === 'object' && !Array.isArray(block)) {
+      const nextRoot = { ...(block as Record<string, unknown>) };
+      removed = removeChainFromNpmNested(nextRoot, chain);
+      if (Object.keys(nextRoot).length === 0) {
+        delete pkg[field];
+      } else {
+        pkg[field] = nextRoot;
+      }
     }
   }
 

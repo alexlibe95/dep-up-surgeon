@@ -1,0 +1,55 @@
+{
+  "vulnerabilities": {
+    "axios": {
+      "name": "axios",
+      "severity": "high",
+      "via": [
+        {
+          "source": 1004946,
+          "name": "axios",
+          "title": "Axios Cross-Site Request Forgery Vulnerability",
+          "url": "https://github.com/advisories/GHSA-wf5p-g6vw-rhxx",
+          "severity": "high",
+          "range": "<0.28.0",
+          "ghsa_id": "GHSA-wf5p-g6vw-rhxx"
+        }
+      ],
+      "range": "<0.28.0",
+      "fixAvailable": { "name": "axios", "version": "1.6.0" }
+    },
+    "lodash": {
+      "name": "lodash",
+      "severity": "moderate",
+      "via": [
+        {
+          "source": 1094493,
+          "name": "lodash",
+          "title": "Command Injection in lodash",
+          "url": "https://github.com/advisories/GHSA-35jh-r3h4-6jhm",
+          "severity": "moderate",
+          "range": "<4.17.21",
+          "ghsa_id": "GHSA-35jh-r3h4-6jhm"
+        }
+      ],
+      "range": "<4.17.21",
+      "fixAvailable": { "name": "lodash", "version": "4.17.21" }
+    },
+    "minimist": {
+      "name": "minimist",
+      "severity": "low",
+      "via": [
+        {
+          "source": 1096755,
+          "name": "minimist",
+          "title": "Prototype Pollution in minimist",
+          "url": "https://github.com/advisories/GHSA-xvch-5gv4-984h",
+          "severity": "low",
+          "range": "<1.2.6",
+          "ghsa_id": "GHSA-xvch-5gv4-984h"
+        }
+      ],
+      "range": "<1.2.6",
+      "fixAvailable": { "name": "minimist", "version": "1.2.8" }
+    }
+  }
+}

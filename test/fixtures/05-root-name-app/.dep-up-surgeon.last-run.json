@@ -37,8 +37,8 @@
     }
   ],
   "installMode": "root",
-  "finishedAt": "2026-04-20T11:50:12.924Z",
-  "toolVersion": "2.2.1",
+  "finishedAt": "2026-04-20T13:09:52.165Z",
+  "toolVersion": "2.2.3",
   "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/05-root-name-app",
   "dryRun": true
 }

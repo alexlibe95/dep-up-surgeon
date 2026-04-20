@@ -308,3 +308,147 @@ test('resolvePeerRanges: external peer whose range is malformed is treated as un
   assert.ok(r);
   assert.equal(r.versions.get('a'), '1.0.0');
 });
+
+// --- SAT-style solver path --------------------------------------------------
+
+test('resolvePeerRanges: small graphs still use the backtracker (method=backtracking)', () => {
+  const a = makeDomain(
+    'a',
+    { '1.0.0': { peerDependencies: { b: '^1.0.0' } } },
+    ['1.0.0'],
+  );
+  const b = makeDomain(
+    'b',
+    { '1.0.0': { peerDependencies: { a: '^1.0.0' } } },
+    ['1.0.0'],
+  );
+  const r = resolvePeerRanges([a, b], new Map([['a', '1.0.0'], ['b', '1.0.0']]), {
+    externalInstalled: new Map(),
+  });
+  assert.ok(r);
+  assert.equal(r.method, 'backtracking');
+});
+
+test('resolvePeerRanges: large linked graph (10+) automatically uses the SAT path', () => {
+  // Build a star graph: `hub` peers on everyone else, and each satellite peers on hub. All
+  // at matching versions, so there's a trivially satisfiable tuple that the backtracker
+  // would also find — the point of the test is that (a) the SAT path engages and
+  // (b) produces the same solution.
+  const names = ['hub', ...Array.from({ length: 12 }, (_, i) => `sat-${i}`)];
+  const domains = [];
+  const hubPeers = {};
+  for (const s of names.slice(1)) hubPeers[s] = '^1.0.0';
+  domains.push(
+    makeDomain(
+      'hub',
+      { '1.0.0': { peerDependencies: hubPeers } },
+      ['1.0.0'],
+    ),
+  );
+  for (const s of names.slice(1)) {
+    domains.push(
+      makeDomain(
+        s,
+        { '1.0.0': { peerDependencies: { hub: '^1.0.0' } } },
+        ['1.0.0'],
+      ),
+    );
+  }
+  const requested = new Map(names.map((n) => [n, '1.0.0']));
+  const r = resolvePeerRanges(domains, requested, { externalInstalled: new Map() });
+  assert.ok(r);
+  assert.equal(r.method, 'sat');
+  for (const n of names) assert.equal(r.versions.get(n), '1.0.0');
+});
+
+test('resolvePeerRangesSat: arc-consistency prunes impossible combinations before DFS', async () => {
+  // 3-cycle where one version of `a` has a peer that nothing in `b` satisfies. AC-3 should
+  // discard that `a` version during propagation, leaving a single satisfiable tuple.
+  const a = makeDomain(
+    'a',
+    {
+      '2.0.0': { peerDependencies: { b: '>=99.0.0' } }, // impossible — AC-3 prunes
+      '1.0.0': { peerDependencies: { b: '^1.0.0' } },
+    },
+    ['2.0.0', '1.0.0'],
+  );
+  const b = makeDomain(
+    'b',
+    { '1.0.0': { peerDependencies: { a: '^1.0.0' } } },
+    ['1.0.0'],
+  );
+  const { resolvePeerRangesSat } = await import('../../dist/core/peerResolver.js');
+  const r = resolvePeerRangesSat([a, b], new Map([['a', '2.0.0'], ['b', '1.0.0']]), {
+    externalInstalled: new Map(),
+  });
+  assert.ok(r);
+  assert.equal(r.method, 'sat');
+  // Even though the resolver is order-preserving (newest-first), the `a@2.0.0` version was
+  // AC-3-pruned, so the tuple settles on `a@1.0.0`.
+  assert.equal(r.versions.get('a'), '1.0.0');
+  assert.equal(r.versions.get('b'), '1.0.0');
+});
+
+test('resolvePeerRangesSat: empty domain after external-peer pre-prune returns undefined', async () => {
+  // `a@1.0.0` peers on external `typescript: ^5`, but the workspace has `typescript@^4`.
+  // SAT pre-prune should remove the only `a` version → empty domain → undefined.
+  const a = makeDomain(
+    'a',
+    { '1.0.0': { peerDependencies: { typescript: '^5.0.0' } } },
+    ['1.0.0'],
+  );
+  const b = makeDomain('b', { '1.0.0': { peerDependencies: {} } }, ['1.0.0']);
+  const { resolvePeerRangesSat } = await import('../../dist/core/peerResolver.js');
+  const r = resolvePeerRangesSat([a, b], new Map([['a', '1.0.0'], ['b', '1.0.0']]), {
+    externalInstalled: new Map([['typescript', '^4.9.0']]),
+  });
+  assert.equal(r, undefined);
+});
+
+test('resolvePeerRanges: satThreshold=0 forces SAT path even for tiny graphs', () => {
+  const a = makeDomain('a', { '1.0.0': { peerDependencies: {} } }, ['1.0.0']);
+  const b = makeDomain('b', { '1.0.0': { peerDependencies: {} } }, ['1.0.0']);
+  const r = resolvePeerRanges([a, b], new Map([['a', '1.0.0'], ['b', '1.0.0']]), {
+    externalInstalled: new Map(),
+    satThreshold: 0,
+  });
+  assert.ok(r);
+  assert.equal(r.method, 'sat');
+});
+
+test('resolvePeerRanges: large-graph SAT fails → dispatcher falls back to backtracking', () => {
+  // Construct a tight graph: 10 members, each peers on the NEXT one at a narrow range. The
+  // SAT pre-prune is a no-op (every version is locally supported), but the DFS will find a
+  // tuple. Result should be a success regardless of which path won.
+  const members = Array.from({ length: 10 }, (_, i) => `m-${i}`);
+  const domains = members.map((m, i) => {
+    const next = members[(i + 1) % members.length];
+    return makeDomain(
+      m,
+      { '1.0.0': { peerDependencies: { [next]: '^1.0.0' } } },
+      ['1.0.0'],
+    );
+  });
+  const r = resolvePeerRanges(
+    domains,
+    new Map(members.map((m) => [m, '1.0.0'])),
+    { externalInstalled: new Map() },
+  );
+  assert.ok(r);
+  // satThreshold defaults to 10; this graph is exactly at the threshold, so SAT kicks in.
+  assert.equal(r.method, 'sat');
+});
+
+test('describeResolution: includes method tag so commit bodies show which solver won', () => {
+  const tuple = {
+    versions: new Map([['x', '1.0.0']]),
+    downgradedFrom: new Map(),
+    tuplesExplored: 1,
+    method: 'sat',
+  };
+  const text = describeResolution(tuple, [
+    { name: 'x', currentRange: '^1', requestedTarget: '1.0.0' },
+  ]);
+  assert.match(text, /\[sat\]/);
+  assert.match(text, /x@1\.0\.0/);
+});

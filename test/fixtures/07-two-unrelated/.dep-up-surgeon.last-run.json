@@ -52,8 +52,8 @@
     }
   ],
   "installMode": "root",
-  "finishedAt": "2026-04-20T11:50:14.980Z",
-  "toolVersion": "2.2.1",
+  "finishedAt": "2026-04-20T13:09:54.287Z",
+  "toolVersion": "2.2.3",
   "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/07-two-unrelated",
   "dryRun": true
 }

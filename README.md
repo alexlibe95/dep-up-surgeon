@@ -79,8 +79,9 @@ dep-up-surgeon [options]
 | `--security-only` | Run `npm audit` (or `pnpm`/`yarn` equivalent) first, then upgrade **only** the packages with open advisories. Every successful bump carries the advisory severity + ID into its commit subject (`[security:high]`) and into the summary's **Security fixes** table. Pairs well with `--git-commit-mode per-success` to produce one PR per CVE. See **Security-first mode** below. |
 | `--min-severity <level>` | Minimum advisory severity to consider under `--security-only`: `low` (default), `moderate`, `high`, or `critical`. Lower-severity advisories are filtered out before the upgrade plan is built. |
 | `--blast-radius` / `--no-blast-radius` | Scan project source files to list which files actually `import`/`require` each upgraded package, and surface the list in `--json` + `--summary`. **Default ON** when `--summary` is active. See **Blast radius** below. |
-| `--resolve-peers` / `--no-resolve-peers` | When a linked-group bump (e.g. `react` + `react-dom` + `@types/react`) fails with a peer-dependency conflict, compute the intersection of peer ranges across the registry packument and retry with a satisfiable version tuple (members may land below `latest`). **Default ON**. See **Peer-range intersection resolver** below. |
+| `--resolve-peers` / `--no-resolve-peers` | When a linked-group bump (e.g. `react` + `react-dom` + `@types/react`) **or a single-package bump** fails with a peer-dependency conflict, compute the intersection of peer ranges across the registry packument and retry with a satisfiable version tuple (members may land below `latest`). Linked graphs with 10+ members automatically use a SAT-style AC-3 solver; single-package failures synthesize an **ad-hoc group** from direct-dep blockers named in the install output. **Default ON**. See **Peer-range intersection resolver** below. |
 | `--apply-overrides` | After the main upgrade loop, fix **transitive** CVEs that no direct bump could reach by writing a package-manager override (`overrides` for npm, `pnpm.overrides` for pnpm, `resolutions` for yarn) pinning each vulnerable transitive to its audit-recommended safe version. Runs install + validator after each pin and rolls back automatically when the validator fails. Requires `--security-only`. See **Transitive overrides** below. |
+| `--override <spec...>` | Apply one or more **manual** override pins independent of the audit. Repeatable and also accepts comma-separated values. Syntax: `<chain>@<range>`, where `<chain>` is a bare name (`lodash`), a pnpm-style chain (`some-dep>foo`, any depth), or a yarn-style chain (`parent/child`). Scoped names (`@scope/pkg`) are preserved as single chain segments. Written to the manager-native nested form (npm object, pnpm `>`-keys, yarn `/`-keys) and run through the same install + validator + rollback loop as `--apply-overrides`. Works standalone — `--security-only` is not required. See **Transitive overrides** below. |
 | `--override-force` | Used with `--apply-overrides`. Overwrite an **existing** override entry whose value conflicts with the audit-recommended version. By default we refuse to clobber user-managed pins and record `conflict` in the report. |
 | `--fix-lockfile` | After the main upgrade loop, run the package manager's native dedupe command (`npm dedupe` / `pnpm dedupe` / `yarn dedupe`) to collapse redundant transitive copies **without touching `package.json`**, and flag transitives more than a minor or a full major behind registry `latest`. Lockfile is backed up before dedupe and restored if dedupe OR the post-dedupe validator fails. Yarn classic (v1) has no dedupe subcommand — recorded as `skipped: "unsupported"`. See **Lockfile fix** below. |
 | `--open-pr` | After `--git-commit --git-branch` pushes the branch, open a GitHub PR with the `--summary` markdown as the body (falls back to a deterministic minimal body). Uses the `gh` CLI (must be installed + authenticated); never fatal — a missing binary, auth failure, or push rejection is recorded as `pullRequest.error` in the JSON report without aborting the run. See **Auto-opening a PR** below. |
@@ -235,6 +236,8 @@ npx dep-up-surgeon --workspaces --security-only --min-severity high \
   --git-branch "deps/security-$(date +%Y-%m-%d)"
 ```
 
+The whole path is covered by `test/unit/security-only.test.mjs` — a hermetic regression harness that drives `runAudit` with a canned `npm audit --json` blob, asserts `--min-severity` filters at every tier, and exercises the full `runUpgradeFlow` → install → validator → **rollback** cycle without touching the registry (via the `UpgradeFlowOptions.installer` injection point).
+
 ### Policy engine (policy-as-code)
 
 Drop a `.dep-up-surgeon.policy.yaml` (or `.json`) in the repo root to encode upgrade rules that survive across runs and humans. Loaded automatically on startup; violations are reported per-package and the engine skips the offending bumps instead of failing.
@@ -296,16 +299,21 @@ Linked-group bumps (e.g. `react` + `react-dom` + `@types/react`, or the Jest / T
 2. If the install fails with a **peer** conflict, the resolver fetches each linked package's full registry packument (cached — one call per package per run) and reads every published version's `peerDependencies` block.
 3. Each member gets a candidate domain: every version between `currentRange`'s `minVersion` and the originally-requested target, sorted newest-first, minus deprecated / pre-release versions.
 4. A **newest-first backtracking search** enumerates version tuples (variable = one package, domain = its candidate versions). For each partial assignment, every peer constraint that has become knowable is checked; peers on packages inside the linked group are checked against the chosen version, peers on packages OUTSIDE the group are checked against that package's range in the current `package.json` (via `semver.minVersion`).
-5. The **first** complete tuple to satisfy every constraint is also the least-downgrade one. The engine rewrites the batch's target versions and retries the install + validator. On success, every affected row is tagged with `resolvedPeer = { originalTarget, reason, tuplesExplored }`.
-6. If the resolver can't find a satisfiable tuple, or the retried install still fails, the batch falls back to the pre-resolver behavior (rollback + `kind: 'peer'` failure row).
+5. For **large linked graphs (≥ 10 members)** — where the 400-tuple backtracking budget can be burned before the solver escapes the first variable's domain — the resolver automatically switches to a **SAT-style path** (arc-consistency + least-constraining-value DFS). It pre-prunes every member-version that can't be satisfied against external peers, runs up to 128 AC-3 rounds across every ordered member pair until the pruned domains reach a fixed point, then does an **MRV-ordered** (smallest domain first) newest-first DFS on whatever survived. For monorepo link groups up to ~50 members × ~30 recent versions this finishes in milliseconds where plain DFS would return `undefined`. When the SAT path fails the dispatcher falls back to the plain backtracker automatically.
+6. The **first** complete tuple to satisfy every constraint is also the least-downgrade one. The engine rewrites the batch's target versions and retries the install + validator. On success, every affected row is tagged with `resolvedPeer = { originalTarget, reason, tuplesExplored }` — `reason` carries a `[backtracking]` or `[sat]` method tag so reviewers can tell which solver path produced the tuple.
+7. If the resolver can't find a satisfiable tuple, or the retried install still fails, the batch falls back to the pre-resolver behavior (rollback + `kind: 'peer'` failure row).
+
+**Ad-hoc resolver for non-linked bumps.** Single-package upgrades that fail with a peer conflict used to be rolled back unconditionally — the resolver was linked-groups-only. Now we synthesize an **ad-hoc group** from the parsed install output: the primary + every blocker named in the peer-conflict lines that's **already a direct dep** of the workspace (peers on unknown transitives stay out of scope). The same resolver (and the same SAT fallback) runs on that synthesized group. On success the engine writes a small batch: the primary at whatever version the resolver picked, plus any blocker the resolver wants moved within its **current pinned range** (the ad-hoc path is allowed to downgrade the primary, never to silently bump a blocker past its pin).
 
 Guard rails that keep it safe:
 
-- **Bounded search** — capped at 400 tuples explored per batch. Past that the resolver gives up silently instead of hanging the run on pathological inputs.
+- **Bounded search** — capped at 400 tuples explored per batch (small graphs) or `400 × members` tuples for the SAT path's DFS phase. Past that the resolver gives up silently instead of hanging the run on pathological inputs.
 - **Optional peers** (`peerDependenciesMeta[name].optional === true`) are ignored. An unsatisfied optional peer isn't a hard conflict.
 - **Deprecated versions** never appear in the domain. We'd rather fail to find a solution than auto-suggest a known-bad version.
+- **Ad-hoc group size cap** — default 6 members (primary + up to 5 direct-dep blockers). Prevents registry fetch storms on pathological peer graphs.
+- **Ad-hoc never adds dependencies** — a peer on a transitive that isn't already a direct dep is ignored rather than introduced.
 - **`--force` bypasses the resolver** — the user has explicitly opted into barreling through peer conflicts.
-- **`--no-resolve-peers`** keeps the old behavior when you WANT peer failures to surface so a human resolves them instead of the tool silently nudging versions off latest.
+- **`--no-resolve-peers`** keeps the old behavior when you WANT peer failures to surface so a human resolves them instead of the tool silently nudging versions off latest. Applies to both the linked-group and ad-hoc paths.
 
 Where it shows up:
 
@@ -314,7 +322,7 @@ Where it shows up:
 - **Commit subjects**: `[peer-resolved]` tag sits between `[breaking]` and `[security:<sev>]` (stable order). The body gets a `Peer-range resolutions (kept linked group satisfiable):` footer listing each pinned member.
 - **`--json`**: `upgraded[].resolvedPeer = { originalTarget, reason, tuplesExplored }` plus `upgraded[].requestedLatest` still reflects the pre-resolver target so downstream tools can diff them.
 
-### Transitive overrides (`--apply-overrides`)
+### Transitive overrides (`--apply-overrides` / `--override`)
 
 `--security-only` by itself can only fix vulnerabilities reachable from a direct dependency. For CVEs that live in transitives (very common — `lodash@4.17.20` buried six levels deep under a toolchain package), pair `--security-only` with `--apply-overrides` and the tool will write a package-manager override to pin the vulnerable transitive to its safe version.
 
@@ -323,14 +331,45 @@ Where it shows up:
 - **Rollback on failure**: after each override, the tool runs a full install and then the validator. If either fails, the override is removed, install re-runs to restore the starting state, and the next advisory is still attempted. A failed override never strands the workspace — `report.overrides.attempts[].rolledBack === true` appears in the JSON and the summary.
 - **Conflict protection**: when the user already has a manual override with a value that **conflicts** with the audit recommendation, we refuse to clobber by default (`reason: "conflicts with target ..."`). Pass `--override-force` to overwrite explicitly.
 - **Where it shows up**:
-  - **`--summary`**: dedicated `Overrides applied` table with `Package / Pinned to / Severity / Advisory`.
-  - **`--json`**: `overrides.field` + `overrides.attempts[]` with the full decision trail (`ok`, `skipped`, `reason`, `previous`, `applied`, `installLog`, `rolledBack`).
+  - **`--summary`**: dedicated `Overrides applied` table with `Package / Pinned to / Source / Severity / Advisory`. Parent-scoped pins render as `a › b › c` so the chain is visible at a glance.
+  - **`--json`**: `overrides.field` + `overrides.attempts[]` with the full decision trail (`ok`, `skipped`, `reason`, `previous`, `applied`, `installLog`, `rolledBack`, `chain`, `source`). Parent-scoped pins carry `chain: ["parent", "child"]`; `source` distinguishes `"advisory"` from `"manual"`.
+
+#### Parent-scoped pins (`--override`)
+
+`--apply-overrides` only writes the **flat** `name → version` form — every occurrence of the package gets pinned. When you need to pin a transitive **only when it appears under a specific parent** (e.g. you want `foo@1.2.3` under `some-dep` while the rest of the tree uses `foo@2.x`), use `--override` to write a **parent-scoped** selector. Works standalone — no `--security-only` required.
+
+Syntax: `<chain>@<range>`. The chain supports three forms, all normalized internally:
+
+- **Flat**: `--override lodash@4.17.21` → same shape as a classic flat override.
+- **pnpm-style**: `--override "some-dep>foo@1.2.3"` — pin `foo` only when nested under `some-dep`. Chains of any depth (`a>b>c>d@1.0.0`) are supported.
+- **yarn-style**: `--override "parent/child@1.2.3"` — `/` separator; `@scope/pkg` stays intact as a single chain segment.
+
+Each selector is written to the **manager's native nested encoding**:
+
+| Manager | Shape written |
+| --- | --- |
+| npm | `{ "overrides": { "some-dep": { "foo": "1.2.3" } } }` — nested object; an existing flat pin for the parent is preserved via npm's `"."` self-selector. |
+| pnpm | `{ "pnpm": { "overrides": { "some-dep>foo": "1.2.3" } } }` — pnpm's `>`-chain keys, deep chains supported. |
+| yarn | `{ "resolutions": { "some-dep/foo": "1.2.3" } }` — `/`-chain keys. |
+
+Every pin runs through the same install + validator + rollback loop as advisory-driven pins. A failed manual pin is rolled back (only that specific slot) and the rest of the run continues; a flat pin and a parent-scoped pin with the same leaf name coexist as separate entries.
 
 ```bash
-# Weekly security sweep: direct bumps first, then transitive overrides, then a draft PR.
+# Pin `lodash@4.17.21` ONLY when it's a transitive of `some-dep`, and pin `axios@1.6.0`
+# globally. Both live in the same run; one failing never touches the other.
+npx dep-up-surgeon \
+  --override "some-dep>lodash@4.17.21" \
+  --override "axios@1.6.0" \
+  --validate "npm test"
+```
+
+```bash
+# Weekly security sweep: direct bumps first, then transitive overrides (audit-driven +
+# one manual pin), then a draft PR.
 npx dep-up-surgeon --workspaces \
   --security-only --min-severity high \
   --apply-overrides \
+  --override "@babel/core>@babel/traverse@7.23.2" \
   --git-commit --git-commit-mode per-success --git-branch "deps/security-$(date +%Y-%m-%d)" \
   --summary md \
   --open-pr --open-pr-draft
@@ -605,8 +644,6 @@ The compiled entry is `dist/cli.js` (see `"bin"` in `package.json`).
 ## Future work (tracked in code)
 
 - GitLab / Bitbucket auto-PR providers (today `--open-pr` is GitHub-only via `gh`)
-- Nested / parent-scoped override rules beyond the flat `name → version` form (`overrides: { "foo": { ">=2 <3": "3.0.0" } }` in npm, deep pnpm selectors)
-- Resolver sharpening: SAT-backed peer-range intersection for very large linked graphs (10+ members) where the current 400-tuple backtracking budget gives up; peer-range intersection across **non-linked** packages too (today the resolver only intervenes on linked-group failures)
 - Renovate-style scheduling helpers (cron / day-of-week filters, grouping rules)
 - True parallel installs in monorepos that don't share a root lockfile (e.g. nohoist setups), going beyond today's parallel scan + serial install model
 - AI-assisted failure explanation: feed `install.lastLines` + `validation.lastLines` to an LLM and attach a one-sentence "why this broke" note to failed records

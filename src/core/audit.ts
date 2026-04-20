@@ -350,6 +350,39 @@ export function maxSeverity(a: Severity, b: Severity): Severity {
   return SEVERITY_RANK[a] >= SEVERITY_RANK[b] ? a : b;
 }
 
+/**
+ * Parse a user-supplied `--min-severity` value into a canonical `Severity`. Returns
+ * `undefined` when the string is empty or doesn't match one of the four canonical tiers,
+ * letting callers report a precise error rather than silently accepting `"Critical"` or
+ * `"HIGH"` without case normalization.
+ */
+export function parseMinSeverity(raw: string | undefined): Severity | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim().toLowerCase();
+  if (trimmed === 'low' || trimmed === 'moderate' || trimmed === 'high' || trimmed === 'critical') {
+    return trimmed;
+  }
+  return undefined;
+}
+
+/**
+ * Filter `advisories` down to entries whose `severity` is at least `minSeverity` on the
+ * standard npm-audit rank ladder (`low < moderate < high < critical`). Used by
+ * `--security-only --min-severity <level>` to trim the `restrictToNames` set **after**
+ * parsing — the parsers themselves preserve everything they find so the filter can be
+ * applied once per run and we don't lose data in tests / structured reports.
+ *
+ * Factored out of `cli.ts` so regression tests can feed in canned advisory lists and
+ * assert the exact set the upgrader would receive.
+ */
+export function filterAdvisoriesBySeverity(
+  advisories: SecurityAdvisory[],
+  minSeverity: Severity,
+): SecurityAdvisory[] {
+  const threshold = SEVERITY_RANK[minSeverity];
+  return advisories.filter((a) => SEVERITY_RANK[a.severity] >= threshold);
+}
+
 function dedupe(arr: string[]): string[] {
   return [...new Set(arr)];
 }

@@ -29,7 +29,12 @@ import {
 } from './core/upgrader.js';
 import type { FinalReport } from './types.js';
 import { log } from './utils/logger.js';
-import { runAudit, type AuditResult } from './core/audit.js';
+import {
+  filterAdvisoriesBySeverity,
+  parseMinSeverity,
+  runAudit,
+  type AuditResult,
+} from './core/audit.js';
 import type { PackageManager } from './core/workspaces.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -321,6 +326,12 @@ async function main(): Promise<void> {
       false,
     )
     .option(
+      '--override <spec...>',
+      'Apply a parent-scoped or flat override pin. Repeatable. Syntax: `<chain>@<range>` where <chain> is one of (a) a bare package name `foo` (flat — pins every occurrence), (b) pnpm-style `parent>child` (pins `child` only when nested under `parent`; chains of any depth are supported), or (c) yarn-style `parent/child` (`/` separator; `@scope/pkg` stays intact as a single segment). The pin is written to the manager-native field (`overrides` nested object for npm, `pnpm.overrides` `>`-keys for pnpm, `resolutions` `/`-keys for yarn) and is run through the same install + validator + rollback cycle as --apply-overrides. Examples: `--override lodash@4.17.21`, `--override "some-dep>foo@1.2.3"`, `--override "@scope/parent>@scope/child@2.0.0"`.',
+      (val: string, acc: string[] = []) => acc.concat(val.split(',').map((s) => s.trim()).filter(Boolean)),
+      [] as string[],
+    )
+    .option(
       '--fix-lockfile',
       'Run the package manager\'s native dedupe pass (`npm dedupe` / `pnpm dedupe` / `yarn dedupe`) to collapse redundant transitive copies WITHOUT touching package.json, and scan for transitives more than one minor or a full major behind registry `latest`. The lockfile is backed up before dedupe and restored if the dedupe command OR the post-dedupe validator fails. Yarn classic (v1) has no dedupe subcommand and is recorded as `skipped: "unsupported"`.',
       false,
@@ -388,6 +399,7 @@ async function main(): Promise<void> {
     resolvePeers?: boolean;
     applyOverrides?: boolean;
     overrideForce?: boolean;
+    override?: string[];
     fixLockfile?: boolean;
     openPr?: boolean;
     openPrTitle?: string;
@@ -572,16 +584,14 @@ async function main(): Promise<void> {
     | Map<string, { severity: 'low' | 'moderate' | 'high' | 'critical'; ids: string[]; url?: string; title?: string }>
     | undefined;
   if (opts.securityOnly) {
-    const minSev = String(opts.minSeverity ?? 'low').toLowerCase();
-    if (!['low', 'moderate', 'high', 'critical'].includes(minSev)) {
+    const minSev = parseMinSeverity(opts.minSeverity ?? 'low');
+    if (!minSev) {
       log.error(
         `--min-severity: unknown value "${opts.minSeverity}". Use "low", "moderate", "high", or "critical".`,
       );
       process.exitCode = 1;
       return;
     }
-    const severityRank: Record<string, number> = { low: 1, moderate: 2, high: 3, critical: 4 };
-    const threshold = severityRank[minSev]!;
 
     let auditManager: PackageManager = 'npm';
     if (packageManager !== 'auto') {
@@ -603,9 +613,7 @@ async function main(): Promise<void> {
     if (auditResult.error && !jsonOutput) {
       log.warn(`audit: ${auditResult.error}`);
     }
-    const filtered = auditResult.advisories.filter(
-      (a) => (severityRank[a.severity] ?? 0) >= threshold,
-    );
+    const filtered = filterAdvisoriesBySeverity(auditResult.advisories, minSev);
     restrictToNames = new Set(filtered.map((a) => a.name));
     securityAdvisoryMap = new Map(
       filtered.map((a) => [
@@ -844,11 +852,38 @@ async function main(): Promise<void> {
       }
     }
 
-    // --apply-overrides: fix transitive CVEs that the direct-dep loop couldn't reach. Runs
-    // AFTER enrichments so we have the final `upgraded` list, and BEFORE the summary so the
-    // summary writer + JSON consumers see `report.overrides`.
-    if (opts.applyOverrides && !dryRun) {
-      if (!opts.securityOnly || !auditResult || auditResult.advisories.length === 0) {
+    // --apply-overrides / --override: fix transitive CVEs + user-supplied parent-scoped pins.
+    // Runs AFTER enrichments so we have the final `upgraded` list, and BEFORE the summary so
+    // the summary writer + JSON consumers see `report.overrides`. `--override` works
+    // standalone (no --security-only required); `--apply-overrides` still needs an audit.
+    const hasManualOverrides = Array.isArray(opts.override) && opts.override.length > 0;
+    const wantsAdvisoryOverrides = Boolean(opts.applyOverrides);
+    if ((wantsAdvisoryOverrides || hasManualOverrides) && !dryRun) {
+      // Parse manual selectors up-front so we can warn about malformed entries even if the
+      // audit path is skipped. A malformed selector is fatal (not just skipped) because the
+      // user asked for something we can't represent.
+      let manualOverrides: Array<{ chain: string[]; range: string; source: string }> = [];
+      let manualError: string | undefined;
+      if (hasManualOverrides) {
+        const { parseOverrideSelector } = await import('./utils/overrides.js');
+        for (const raw of opts.override!) {
+          const parsed = parseOverrideSelector(raw);
+          if (!parsed || !parsed.range) {
+            manualError = `invalid --override selector "${raw}" (expected "<chain>@<range>" where chain is a package name, "parent>child", or "parent/child")`;
+            break;
+          }
+          manualOverrides.push({ chain: parsed.chain, range: parsed.range, source: raw });
+        }
+      }
+
+      if (manualError) {
+        log.error(manualError);
+        process.exitCode = 1;
+      } else if (
+        wantsAdvisoryOverrides &&
+        (!opts.securityOnly || !auditResult || auditResult.advisories.length === 0) &&
+        !hasManualOverrides
+      ) {
         if (!jsonOutput) {
           log.warn(
             '--apply-overrides requires --security-only with at least one audit advisory; skipping.',
@@ -870,14 +905,17 @@ async function main(): Promise<void> {
           );
           const overrideManager: PackageManager =
             packageManager !== 'auto' ? packageManager : report!.project?.manager ?? 'npm';
+          const advisoriesForFlow =
+            wantsAdvisoryOverrides && auditResult ? auditResult.advisories : [];
           const flowResult = await runOverrideFlow({
             cwd,
             manager: overrideManager,
-            advisories: auditResult.advisories,
+            advisories: advisoriesForFlow,
             upgradedNames,
             directDepNames,
             overwriteConflicts: Boolean(opts.overrideForce),
             json: jsonOutput,
+            manualOverrides,
           });
           if (flowResult.attempts.length > 0) {
             const { overrideFieldFor } = await import('./utils/overrides.js');
@@ -889,7 +927,7 @@ async function main(): Promise<void> {
         } catch (e) {
           if (!jsonOutput) {
             log.warn(
-              `--apply-overrides: skipped due to error: ${e instanceof Error ? e.message : String(e)}`,
+              `overrides: skipped due to error: ${e instanceof Error ? e.message : String(e)}`,
             );
           }
         }

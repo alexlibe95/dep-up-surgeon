@@ -373,18 +373,24 @@ export function renderSummaryMarkdown(structured: StructuredReport, toolVersion:
     );
     lines.push('');
     if (ok.length > 0) {
-      lines.push(`| Package | Pinned to | Severity | Advisory |`);
-      lines.push(`| --- | --- | --- | --- |`);
+      lines.push(`| Package | Pinned to | Source | Severity | Advisory |`);
+      lines.push(`| --- | --- | --- | --- | --- |`);
       for (const a of ok) {
         const advCell = a.url && a.ids[0] ? `[${a.ids[0]}](${a.url})` : a.ids[0] ?? '';
-        lines.push(`| \`${a.name}\` | \`${a.applied ?? '?'}\` | ${a.severity} | ${advCell} |`);
+        const label =
+          a.chain && a.chain.length > 1 ? a.chain.join(' › ') : a.name;
+        const sourceLabel = a.source === 'manual' ? '`--override`' : 'advisory';
+        lines.push(
+          `| \`${label}\` | \`${a.applied ?? '?'}\` | ${sourceLabel} | ${a.severity} | ${advCell} |`,
+        );
       }
       lines.push('');
     }
     if (failed.length > 0) {
       lines.push(`**Failed overrides** (rolled back):`);
       for (const a of failed) {
-        lines.push(`- \`${a.name}\` — ${a.reason ?? 'unknown'}`);
+        const label = a.chain && a.chain.length > 1 ? a.chain.join(' › ') : a.name;
+        lines.push(`- \`${label}\` — ${a.reason ?? 'unknown'}`);
       }
       lines.push('');
     }

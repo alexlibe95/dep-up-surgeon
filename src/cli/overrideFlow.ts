@@ -34,6 +34,7 @@ import {
   overrideFieldFor,
   removeOverrideFromFile,
   type OverrideField,
+  type OverrideEntry,
 } from '../utils/overrides.js';
 
 export interface OverrideAttemptRecord {
@@ -46,6 +47,18 @@ export interface OverrideAttemptRecord {
   applied?: string;
   /** The previous pin, if any. */
   previous?: string;
+  /**
+   * Full parent chain for parent-scoped pins, outermost → leaf. Omitted for flat pins
+   * (equivalent to `chain: [name]`). Included in the report so consumers know which exact
+   * slot in the overrides block was touched.
+   */
+  chain?: string[];
+  /**
+   * How this attempt was triggered. `advisory` = fed in by `--security-only` audit; `manual`
+   * = user-supplied via `--override` CLI flag or policy. Consumers can render the two lists
+   * separately (e.g. manual overrides don't map to a CVE).
+   */
+  source: 'advisory' | 'manual';
   /** Field we touched (`overrides` / `pnpm.overrides` / `resolutions`). */
   field: OverrideField;
   /** True when the write, install, AND validator all succeeded. */
@@ -58,6 +71,20 @@ export interface OverrideAttemptRecord {
   installLog?: string;
   /** True when a rollback was performed. */
   rolledBack?: boolean;
+}
+
+/**
+ * User-supplied override pin (from `--override` CLI flag or similar). Unlike advisory-driven
+ * pins, these carry an arbitrary parent chain and no CVE metadata. They run through the same
+ * write + install + validator + rollback cycle so a manual pin can't wreck the workspace.
+ */
+export interface ManualOverrideSpec {
+  /** Parent chain + leaf, outermost → leaf (`[name]` for flat pins). */
+  chain: string[];
+  /** Version / range to pin. */
+  range: string;
+  /** Original user-supplied selector string, for error messages and the report. */
+  source?: string;
 }
 
 export interface OverrideFlowOptions {
@@ -82,6 +109,17 @@ export interface OverrideFlowOptions {
   dryRun?: boolean;
   /** True when the CLI is in `--json` mode: suppress human-readable progress log lines. */
   json?: boolean;
+  /**
+   * User-supplied parent-scoped or flat pins (via `--override` CLI flag). These run AFTER
+   * the advisory-driven pins in the same loop so they share the install + validator +
+   * rollback machinery. A failure here never touches advisory results.
+   */
+  manualOverrides?: ManualOverrideSpec[];
+  /**
+   * Optional install runner override. Kept as an injection point so tests can exercise the
+   * write + rollback cycle without actually shelling out.
+   */
+  installer?: typeof runInstall;
 }
 
 export interface OverrideFlowResult {
@@ -107,11 +145,12 @@ export async function runOverrideFlow(opts: OverrideFlowOptions): Promise<Overri
       !opts.upgradedNames.has(a.name),
   );
 
-  if (targets.length === 0) {
+  const hasManual = (opts.manualOverrides?.length ?? 0) > 0;
+  if (targets.length === 0 && !hasManual) {
     return { attempts };
   }
 
-  if (!opts.json) {
+  if (targets.length > 0 && !opts.json) {
     log.info(
       `--apply-overrides: ${targets.length} transitive advisor${targets.length === 1 ? 'y' : 'ies'} to pin (${targets.map((t) => t.name).slice(0, 5).join(', ')}${targets.length > 5 ? ', ...' : ''})`,
     );
@@ -125,6 +164,7 @@ export async function runOverrideFlow(opts: OverrideFlowOptions): Promise<Overri
       field,
       ok: false,
       skipped: false,
+      source: 'advisory',
     };
     if (adv.url) rec.url = adv.url;
     if (adv.title) rec.title = adv.title;
@@ -137,75 +177,43 @@ export async function runOverrideFlow(opts: OverrideFlowOptions): Promise<Overri
       continue;
     }
 
-    if (opts.dryRun) {
-      rec.skipped = true;
-      rec.reason = 'dry-run';
-      rec.applied = target;
-      attempts.push(rec);
-      continue;
-    }
+    await processPin(
+      rec,
+      { name: adv.name, range: target },
+      opts,
+      pkgJson,
+      `--apply-overrides`,
+    );
+    attempts.push(rec);
+  }
 
-    // 1. Write the pin (or skip when already safe).
-    const applied = await applyOverrideToFile({
-      packageJsonPath: pkgJson,
-      manager: opts.manager,
-      entry: { name: adv.name, range: target },
-      ...(opts.overwriteConflicts ? { overwriteConflicts: true } : {}),
-    });
-    if (!applied.ok) {
-      rec.skipped = true;
-      rec.reason = applied.reason;
-      if (applied.previous) rec.previous = applied.previous;
-      attempts.push(rec);
-      continue;
-    }
-    if (!applied.written) {
-      // No-op (already satisfies). Record as skip but mark ok: true so the summary doesn't
-      // mistake it for a failure.
-      rec.skipped = true;
-      rec.ok = true;
-      rec.reason = applied.reason ?? 'already satisfies target';
-      if (applied.applied) rec.applied = applied.applied;
-      if (applied.previous) rec.previous = applied.previous;
-      attempts.push(rec);
-      continue;
-    }
-    rec.applied = applied.applied ?? target;
-    if (applied.previous) rec.previous = applied.previous;
-
-    // 2. Install with the new pin.
+  // Manual --override pins: processed AFTER advisories so any audit-driven pin that clears a
+  // path is visible first. Manual pins share the same install + validator + rollback loop.
+  if (opts.manualOverrides && opts.manualOverrides.length > 0) {
     if (!opts.json) {
       log.info(
-        `--apply-overrides: pinning ${adv.name} → ${target} and running ${opts.manager} install`,
+        `--override: ${opts.manualOverrides.length} manual pin${opts.manualOverrides.length === 1 ? '' : 's'} to apply`,
       );
     }
-    const install = await runInstall(opts.cwd, opts.manager, {});
-    if (!install.ok) {
-      rec.installLog = tailOutput(install);
-      const rb = await rollback(pkgJson, opts, adv.name);
-      rec.rolledBack = rb.rolledBack;
-      rec.reason = `install failed after override (exit ${install.exitCode})`;
+    for (const spec of opts.manualOverrides) {
+      if (spec.chain.length === 0) continue;
+      const name = spec.chain[spec.chain.length - 1]!;
+      const parentChain = spec.chain.slice(0, -1);
+      const rec: OverrideAttemptRecord = {
+        name,
+        severity: 'low',
+        ids: [],
+        field,
+        ok: false,
+        skipped: false,
+        source: 'manual',
+      };
+      if (spec.chain.length > 1) rec.chain = [...spec.chain];
+      if (spec.source) rec.title = spec.source;
+      const entry: OverrideEntry = { name, range: spec.range };
+      if (parentChain.length > 0) entry.parentChain = parentChain;
+      await processPin(rec, entry, opts, pkgJson, `--override`);
       attempts.push(rec);
-      continue;
-    }
-
-    // 3. Validator (when provided).
-    if (opts.runValidator) {
-      const v = await opts.runValidator();
-      if (!v.ok) {
-        rec.installLog = v.message;
-        const rb = await rollback(pkgJson, opts, adv.name);
-        rec.rolledBack = rb.rolledBack;
-        rec.reason = `validator failed after override: ${v.message ?? 'non-zero exit'}`;
-        attempts.push(rec);
-        continue;
-      }
-    }
-
-    rec.ok = true;
-    attempts.push(rec);
-    if (!opts.json) {
-      log.success(`--apply-overrides: pinned ${adv.name}@${target} (severity: ${adv.severity})`);
     }
   }
 
@@ -213,23 +221,107 @@ export async function runOverrideFlow(opts: OverrideFlowOptions): Promise<Overri
 }
 
 /**
+ * Shared write + install + validate + rollback cycle used for BOTH advisory pins and
+ * manual pins. Mutates `rec` in place: callers push it into `attempts` regardless of
+ * outcome. Returns nothing — every outcome is captured on `rec`.
+ */
+async function processPin(
+  rec: OverrideAttemptRecord,
+  entry: OverrideEntry,
+  opts: OverrideFlowOptions,
+  pkgJson: string,
+  logTag: string,
+): Promise<void> {
+  const label =
+    entry.parentChain && entry.parentChain.length > 0
+      ? `${[...entry.parentChain, entry.name].join('>')}`
+      : entry.name;
+
+  if (opts.dryRun) {
+    rec.skipped = true;
+    rec.reason = 'dry-run';
+    rec.applied = entry.range;
+    return;
+  }
+
+  const applied = await applyOverrideToFile({
+    packageJsonPath: pkgJson,
+    manager: opts.manager,
+    entry,
+    ...(opts.overwriteConflicts ? { overwriteConflicts: true } : {}),
+  });
+  if (!applied.ok) {
+    rec.skipped = true;
+    rec.reason = applied.reason;
+    if (applied.previous) rec.previous = applied.previous;
+    return;
+  }
+  if (!applied.written) {
+    rec.skipped = true;
+    rec.ok = true;
+    rec.reason = applied.reason ?? 'already satisfies target';
+    if (applied.applied) rec.applied = applied.applied;
+    if (applied.previous) rec.previous = applied.previous;
+    return;
+  }
+  rec.applied = applied.applied ?? entry.range;
+  if (applied.previous) rec.previous = applied.previous;
+
+  if (!opts.json) {
+    log.info(
+      `${logTag}: pinning ${label} → ${entry.range} and running ${opts.manager} install`,
+    );
+  }
+  const installer = opts.installer ?? runInstall;
+  const install = await installer(opts.cwd, opts.manager, {});
+  if (!install.ok) {
+    rec.installLog = tailOutput(install);
+    const rb = await rollback(pkgJson, opts, entry);
+    rec.rolledBack = rb.rolledBack;
+    rec.reason = `install failed after override (exit ${install.exitCode})`;
+    return;
+  }
+
+  if (opts.runValidator) {
+    const v = await opts.runValidator();
+    if (!v.ok) {
+      if (v.message) rec.installLog = v.message;
+      const rb = await rollback(pkgJson, opts, entry);
+      rec.rolledBack = rb.rolledBack;
+      rec.reason = `validator failed after override: ${v.message ?? 'non-zero exit'}`;
+      return;
+    }
+  }
+
+  rec.ok = true;
+  if (!opts.json) {
+    log.success(`${logTag}: pinned ${label}@${entry.range}`);
+  }
+}
+
+/**
  * Remove the override we just added and re-run install so the workspace ends up in the same
- * state the user had at the start of the attempt. Install failures during rollback are logged
+ * state the user had at the start of the attempt. The entry's parent chain (if any) is
+ * threaded through to `removeOverrideFromFile` so we delete the EXACT slot we wrote and
+ * never touch an adjacent flat pin or sibling. Install failures during rollback are logged
  * but don't crash the flow — the next override attempt will run whatever state we're in.
  */
 async function rollback(
   pkgJson: string,
   opts: OverrideFlowOptions,
-  name: string,
+  entry: OverrideEntry,
 ): Promise<{ rolledBack: boolean; reinstallOk: boolean }> {
-  const removed = await removeOverrideFromFile(pkgJson, opts.manager, name);
+  const chain = [...(entry.parentChain ?? []), entry.name];
+  const label = chain.join('>');
+  const removed = await removeOverrideFromFile(pkgJson, opts.manager, { chain });
   if (!removed.ok || !removed.removed) {
     return { rolledBack: false, reinstallOk: false };
   }
-  const reinstall = await runInstall(opts.cwd, opts.manager, {});
+  const installer = opts.installer ?? runInstall;
+  const reinstall = await installer(opts.cwd, opts.manager, {});
   if (!reinstall.ok && !opts.json) {
     log.warn(
-      `rollback: re-install after removing override for ${name} exited ${reinstall.exitCode}; workspace may need manual cleanup.`,
+      `rollback: re-install after removing override for ${label} exited ${reinstall.exitCode}; workspace may need manual cleanup.`,
     );
   }
   return { rolledBack: true, reinstallOk: reinstall.ok };

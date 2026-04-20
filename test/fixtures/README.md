@@ -32,6 +32,7 @@ in each directory and check the JSON report.
 | `11-nest-sample-cats` | Nest + RxJS (from Nest `sample/01-cats-app`, trimmed). |
 | `12-express-style` | Subset of Express’s runtime `dependencies` (many small packages). |
 | `13-random` | Synthetic “medium” React + Vite + Tailwind + ESLint stack (many deps). |
+| `14-security-only` | Vulnerable tree + canned `npm audit --json` blob consumed by `test/unit/security-only.test.mjs` (hermetic — no real audit / install). |
 
 ## Manual run
 

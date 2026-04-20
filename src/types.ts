@@ -139,9 +139,13 @@ export interface UpgradeRecord {
     files: string[];
   };
   /**
-   * Optional peer-range intersection resolver breadcrumb. Populated ONLY when a linked-group
-   * bump originally failed with a peer conflict, the resolver (`src/core/peerResolver.ts`)
-   * found a satisfiable version tuple, and the retried batch install + validation PASSED.
+   * Optional peer-range intersection resolver breadcrumb. Populated when:
+   *   - A **linked-group** bump initially failed with a peer conflict, the resolver
+   *     (`src/core/peerResolver.ts`) found a satisfiable version tuple, and the retried
+   *     batch install + validation PASSED.
+   *   - A **single-package** bump failed with a peer conflict, the **ad-hoc** resolver
+   *     (`src/core/peerResolverAdHoc.ts`) synthesized a group from the primary + direct-dep
+   *     blockers named in the install output, and the retried batch PASSED.
    *
    * `originalTarget` is the version the engine first tried (usually registry `latest`);
    * `to` on the parent record holds the finally-installed version. When `originalTarget ===
@@ -150,6 +154,8 @@ export interface UpgradeRecord {
    *
    * The field is reviewer signal only; it never changes engine control flow. Summary,
    * commit body, and JSON all render it so humans can see why a package isn't at latest.
+   * `reason` includes a `[backtracking]` or `[sat]` tag so reviewers can tell which solver
+   * path produced the tuple (SAT kicks in for linked graphs with 10+ members).
    */
   resolvedPeer?: {
     originalTarget: string;
@@ -315,7 +321,7 @@ export interface FinalReport {
   overrides?: {
     /** Which field we wrote to: `overrides`, `pnpm.overrides`, or `resolutions`. */
     field: 'overrides' | 'pnpm.overrides' | 'resolutions';
-    /** Ordered list of per-advisory attempts. */
+    /** Ordered list of attempts. Advisory-driven + manual (via `--override`) pins mixed in. */
     attempts: Array<{
       name: string;
       severity: 'low' | 'moderate' | 'high' | 'critical';
@@ -324,6 +330,14 @@ export interface FinalReport {
       title?: string;
       applied?: string;
       previous?: string;
+      /**
+       * Full parent chain (outermost → leaf) for parent-scoped pins. Flat pins omit this. The
+       * shape mirrors what was written to the manager's override field (nested object for
+       * npm, `>`-keys for pnpm, `/`-keys for yarn).
+       */
+      chain?: string[];
+      /** `advisory` = from `--security-only` audit; `manual` = from `--override` CLI flag. */
+      source: 'advisory' | 'manual';
       ok: boolean;
       skipped: boolean;
       reason?: string;

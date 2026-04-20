@@ -54,6 +54,7 @@ import {
   type ResolvedTuple,
   type ResolverInput,
 } from './peerResolver.js';
+import { tryResolveAdHocPeerConflict } from './peerResolverAdHoc.js';
 
 const BACKUP_FILENAME = 'package.json.dep-up-surgeon.bak';
 
@@ -197,6 +198,16 @@ export interface UpgradeEngineOptions {
    * silently bump things off latest.
    */
   resolvePeers?: boolean;
+  /**
+   * Override for the install step. When omitted, the engine uses `runInstall` from
+   * `utils/npm.ts` which shells out to `<manager> install`. Tests inject a stub so the
+   * rollback / peer / validator paths can be exercised without actually installing from
+   * the registry. Signature is the same as `runInstall` so switching to a real binary is
+   * zero-cost at runtime.
+   *
+   * Never exposed on the CLI — this is a programmatic hook exclusively.
+   */
+  installer?: typeof runInstall;
 }
 
 /**
@@ -496,12 +507,13 @@ async function attemptSingleUpgradeUnlocked(
   const installCwd = opts.installCwd ?? cwd;
   const installOpts = installFilterOptions(opts);
   const previousRange = scanned.currentRange;
+  const install$ = opts.installer ?? runInstall;
 
   let pkg = await readPackageJson(cwd);
   pkg = setRange(pkg, scanned.section, scanned.name, targetVersion);
   await writePackageJson(cwd, pkg);
 
-  const install = await runInstall(installCwd, manager, installOpts);
+  const install = await install$(installCwd, manager, installOpts);
   const installDiag = toInstallDiagnostic(install);
   const classified = classifyInstallOutput(install.output, opts);
   const peerHit = shouldRollbackAfterSuccessfulInstall(classified, force);
@@ -509,7 +521,7 @@ async function attemptSingleUpgradeUnlocked(
   if (!install.ok) {
     const esm = detectEsmCommonJsBlockage(install.output);
     await writeDepRange(cwd, scanned.section, scanned.name, previousRange);
-    await runInstall(installCwd, manager, installOpts);
+    await install$(installCwd, manager, installOpts);
     return {
       ok: false,
       kind: 'install',
@@ -525,7 +537,7 @@ async function attemptSingleUpgradeUnlocked(
 
   if (peerHit && !force) {
     await writeDepRange(cwd, scanned.section, scanned.name, previousRange);
-    await runInstall(installCwd, manager, installOpts);
+    await install$(installCwd, manager, installOpts);
     return {
       ok: false,
       kind: 'peer',
@@ -547,7 +559,7 @@ async function attemptSingleUpgradeUnlocked(
   const diag = validation.skipped ? undefined : toValidationDiagnostic(validation);
   if (!validation.ok && !force) {
     await writeDepRange(cwd, scanned.section, scanned.name, previousRange);
-    await runInstall(installCwd, manager, installOpts);
+    await install$(installCwd, manager, installOpts);
     return {
       ok: false,
       kind: 'validation-script',
@@ -605,6 +617,7 @@ async function attemptBatchUpgradeUnlocked(
   const manager = (opts.projectInfo?.manager ?? 'npm') as InstallManager;
   const installCwd = opts.installCwd ?? cwd;
   const installOpts = installFilterOptions(opts);
+  const install$ = opts.installer ?? runInstall;
   if (bumps.length === 0) {
     return { ok: true };
   }
@@ -620,7 +633,7 @@ async function attemptBatchUpgradeUnlocked(
   }
   await writePackageJson(cwd, pkg);
 
-  const install = await runInstall(installCwd, manager, installOpts);
+  const install = await install$(installCwd, manager, installOpts);
   const installDiag = toInstallDiagnostic(install);
   const classified = classifyInstallOutput(install.output, opts);
   const peerHit = shouldRollbackAfterSuccessfulInstall(classified, force);
@@ -633,7 +646,7 @@ async function attemptBatchUpgradeUnlocked(
       }
       await writeDepRange(cwd, snap.section, scanned.name, snap.range);
     }
-    await runInstall(installCwd, manager, installOpts);
+    await install$(installCwd, manager, installOpts);
   };
 
   if (!install.ok) {
@@ -817,6 +830,91 @@ async function upgradeWithReleaseLineFallbacks(
   };
 }
 
+/**
+ * Retry a single-package upgrade as a small ad-hoc batch. The batch includes the primary
+ * (at whatever version the resolver picked) plus each blocker the resolver wants moved.
+ * Blocker sections are discovered from the current `package.json` so we write to the same
+ * section they already live in. On failure we roll back every edit — same contract as the
+ * linked-group retry.
+ *
+ * Shape of the returned tuple matches `upgradeWithReleaseLineFallbacks` so the caller can
+ * do an in-place reassignment (`{ result, chosenVersion, usedFallback, lastAttemptedVersion }`).
+ */
+async function retryWithAdHocBumps(
+  cwd: string,
+  primary: ScannedPackage,
+  adHoc: {
+    bumps: Array<{ name: string; from: string; to: string; isPrimary: boolean }>;
+    reason: string;
+  },
+  opts: UpgradeEngineOptions,
+): Promise<{
+  result: AttemptResult;
+  chosenVersion: string | null;
+  usedFallback: boolean;
+  lastAttemptedVersion: string;
+}> {
+  const pkg = await readPackageJson(cwd);
+  // Translate ad-hoc bumps → the engine's `Bump[]` shape. The primary already has a
+  // `ScannedPackage`; for each blocker we synthesize a minimal one (section + range are
+  // all the batch upgrader needs).
+  const bumps: Bump[] = [];
+  const primaryBump = adHoc.bumps.find((b) => b.isPrimary);
+  if (primaryBump) {
+    bumps.push({ scanned: primary, targetVersion: primaryBump.to });
+  }
+  for (const b of adHoc.bumps) {
+    if (b.isPrimary) continue;
+    const section = findSectionFor(pkg, b.name);
+    if (!section) continue; // shouldn't happen — ad-hoc only picks direct deps
+    const scanned: ScannedPackage = {
+      name: b.name,
+      section,
+      currentRange: b.from,
+    };
+    bumps.push({ scanned, targetVersion: b.to, resolvedFrom: b.from, resolvedReason: adHoc.reason });
+  }
+  // If we couldn't resolve any section (pathological), bail with the primary alone — that
+  // collapses to the original single-install behavior.
+  const primaryTarget = primaryBump?.to ?? primary.currentRange;
+  if (bumps.length === 0) {
+    const fallback: AttemptResult = {
+      ok: false,
+      kind: 'peer',
+      message: 'ad-hoc resolver produced no actionable bumps',
+    };
+    return {
+      result: fallback,
+      chosenVersion: null,
+      usedFallback: false,
+      lastAttemptedVersion: primaryTarget,
+    };
+  }
+
+  const result = await attemptBatchUpgrade(cwd, bumps, opts);
+  return {
+    result,
+    chosenVersion: result.ok ? primaryTarget : null,
+    usedFallback: false,
+    lastAttemptedVersion: primaryTarget,
+  };
+}
+
+/** First dep section that mentions `name`, or `undefined`. */
+function findSectionFor(pkg: PackageJson, name: string): DepSection | undefined {
+  const sections: DepSection[] = [
+    'dependencies',
+    'devDependencies',
+    'peerDependencies',
+    'optionalDependencies',
+  ];
+  for (const section of sections) {
+    const block = pkg[section];
+    if (block && typeof block[name] === 'string') return section;
+  }
+  return undefined;
+}
+
 async function promptAfterFailure(
   pkgName: string,
   interactive: boolean,
@@ -974,6 +1072,61 @@ async function runSinglePackageUpgrade(
     lastAttemptedVersion,
   } = await upgradeWithReleaseLineFallbacks(cwd, scanned, cur.version, latest, opts);
 
+  // Ad-hoc peer-range resolver for **non-linked** single-package bumps. The resolver in
+  // `peerResolver.ts` traditionally only fires for linked groups — a single bump that
+  // failed with a peer conflict was rolled back unconditionally. We now try the same
+  // intersection logic on a synthesized ad-hoc group (primary + direct-dep blockers from
+  // the parsed conflict output). Guarded by:
+  //   - `--no-resolve-peers`: user opted out.
+  //   - `--force`: user already said "barrel through", no point asking the resolver.
+  //   - Result kind !== 'peer': only peer conflicts are in-scope for this resolver.
+  // Success path writes the resolved bumps as a small batch + runs one more install.
+  let adHocResolved:
+    | { bumps: Array<{ name: string; from: string; to: string; isPrimary: boolean }>; reason: string; tuplesExplored: number; method: ResolvedTuple['method'] }
+    | undefined;
+  if (!result.ok && result.kind === 'peer' && opts.resolvePeers !== false && !opts.force) {
+    const classified = result.classified ?? classifyInstallOutput(result.installOutput, opts);
+    if (classified.length > 0) {
+      try {
+        const pkg = await readPackageJson(cwd);
+        const adHoc = await tryResolveAdHocPeerConflict({
+          primary: scanned,
+          primaryTarget: lastAttemptedVersion,
+          classified,
+          pkg,
+          ...(opts.registryCache ? { registryCache: opts.registryCache } : {}),
+        });
+        if (adHoc) {
+          adHocResolved = adHoc;
+          if (!jsonOutput) {
+            const label = adHoc.bumps
+              .map((b) => `${b.name}@${b.to}${b.isPrimary ? '' : ' (blocker)'}`)
+              .join(', ');
+            log.info(
+              `Ad-hoc peer-range resolver found a compatible tuple for ${scanned.name}; retrying with ${label}`,
+            );
+          }
+          const retry = await retryWithAdHocBumps(cwd, scanned, adHoc, opts);
+          result = retry.result;
+          chosenVersion = retry.chosenVersion;
+          usedFallback = retry.usedFallback;
+          lastAttemptedVersion = retry.lastAttemptedVersion;
+        } else if (!jsonOutput) {
+          log.dim(`Ad-hoc peer-range resolver could not find a compatible tuple for ${scanned.name}`);
+        }
+      } catch (e) {
+        // The ad-hoc resolver is a best-effort shortcut — any unexpected failure (registry
+        // down, malformed packument, filesystem hiccup) falls back to the existing "mark
+        // failed" path. We swallow-and-log rather than propagate so one flaky package can't
+        // take out the whole run.
+        if (!jsonOutput) {
+          const msg = e instanceof Error ? e.message : String(e);
+          log.dim(`Ad-hoc peer-range resolver skipped for ${scanned.name}: ${msg}`);
+        }
+      }
+    }
+  }
+
   if (!result.ok && interactive) {
     const action = await promptAfterFailure(scanned.name, true);
     if (action === 'pin') {
@@ -1014,6 +1167,39 @@ async function runSinglePackageUpgrade(
       row.detail = result.message;
     } else if (usedFallback) {
       row.detail = `latest (${latest}) failed; kept highest working in older release lines`;
+    }
+    // Ad-hoc peer-range resolver succeeded — attach the audit trail and emit companion
+    // rows for each blocker that moved. The primary row carries `resolvedPeer` so the
+    // summary/JSON know this upgrade rode the ad-hoc path; blocker rows are tagged with
+    // the same reason but keyed by `resolvedPeerBlocker` semantics (success + detail).
+    if (adHocResolved) {
+      const primaryBump = adHocResolved.bumps.find((b) => b.isPrimary);
+      if (primaryBump) {
+        row.to = primaryBump.to;
+        if (primaryBump.to !== latest) {
+          row.resolvedPeer = {
+            originalTarget: latest,
+            reason: adHocResolved.reason,
+            tuplesExplored: adHocResolved.tuplesExplored,
+          };
+        }
+        row.detail = `ad-hoc peer-range intersection [${adHocResolved.method}] — primary ${scanned.name}: ${latest} → ${primaryBump.to}`;
+      }
+      for (const b of adHocResolved.bumps) {
+        if (b.isPrimary) continue;
+        addUpgrade(report, {
+          name: b.name,
+          success: true,
+          from: b.from,
+          to: b.to,
+          detail: `ad-hoc peer-range blocker for ${scanned.name}: ${b.from} → ${b.to}`,
+          resolvedPeer: {
+            originalTarget: b.from,
+            reason: adHocResolved.reason,
+            tuplesExplored: adHocResolved.tuplesExplored,
+          },
+        });
+      }
     }
     addUpgrade(report, row);
     if (!jsonOutput) {
@@ -1674,7 +1860,6 @@ export interface UpgradeFlowOptions
     | 'skipPreflight'
     | 'installFilter'
     | 'installLock'
-    | 'registryCache'
     | 'onUpgradeApplied'
   > {
   /** Workspace root (where the lockfile and the `workspaces` field live). */
@@ -1924,7 +2109,10 @@ export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalRep
   // hook is wired (the hook may itself touch shared state — git index, lockfile, etc. — and
   // benefits from the same serialization guarantees the install path gets). When neither
   // applies, `withInstallLock` no-ops at zero overhead.
-  const registryCache = createRegistryCache();
+  // Reuse a caller-supplied cache when provided (programmatic tests rely on pre-seeded entries
+  // so the upgrade flow never touches the real registry). Production CLI callers always omit it
+  // and get a fresh one per run.
+  const registryCache = opts.registryCache ?? createRegistryCache();
   const installLock =
     effectiveConcurrency > 1 || opts.onUpgradeApplied ? new KeyedMutex() : undefined;
 

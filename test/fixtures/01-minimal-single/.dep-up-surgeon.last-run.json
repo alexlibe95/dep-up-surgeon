@@ -37,8 +37,8 @@
     }
   ],
   "installMode": "root",
-  "finishedAt": "2026-04-20T11:50:15.792Z",
-  "toolVersion": "2.2.1",
+  "finishedAt": "2026-04-20T13:09:55.051Z",
+  "toolVersion": "2.2.3",
   "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/01-minimal-single",
   "dryRun": true
 }
