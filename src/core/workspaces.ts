@@ -48,6 +48,28 @@ export interface ProjectInfo {
    * focused install instead of falling back to a root install.
    */
   yarnSupportsFocus?: boolean;
+  /**
+   * True when the project is set up with **per-workspace lockfiles** rather than a single
+   * shared one at the root (aka "nohoist" / isolated-lockfile monorepo). Detected for:
+   *
+   *   - **pnpm**: `shared-workspace-lockfile=false` in any `.npmrc` that affects the root
+   *     (root `.npmrc`, user-level config is ignored — we can only see what's committed).
+   *   - **any manager**: every workspace member directory contains its own lockfile of the
+   *     right kind (`package-lock.json` / `pnpm-lock.yaml` / `yarn.lock`). This is the
+   *     "folder of independent projects" case; rare but it shows up in corporate monorepos.
+   *
+   * When true, the upgrader's keyed install mutex lets different workspace targets install
+   * **concurrently** — since each has its own lockfile, the install steps don't race.
+   * When false (or in single-package projects), every install keys off the root `cwd` and
+   * behaves exactly as before (fully serialized).
+   */
+  isolatedLockfiles?: boolean;
+  /**
+   * Reason / source for `isolatedLockfiles === true`. Surfaced in the structured report so
+   * users can see why the tool chose parallel installs. Never populated when
+   * `isolatedLockfiles` is false / undefined.
+   */
+  isolatedLockfilesSource?: 'pnpm-npmrc' | 'per-workspace-lockfiles';
 }
 
 const PNPM_WORKSPACE_FILE = 'pnpm-workspace.yaml';
@@ -357,6 +379,8 @@ export async function detectProjectInfo(
     yarnSupportsFocus = probe.supportsFocus;
   }
 
+  const isolated = detectIsolatedLockfiles(cwd, manager, workspaceMembers);
+
   return {
     cwd,
     manager,
@@ -369,5 +393,61 @@ export async function detectProjectInfo(
     workspacePackageNames: new Set(workspaceMembers.map((m) => m.name)),
     ...(yarnMajorVersion !== undefined ? { yarnMajorVersion } : {}),
     ...(yarnSupportsFocus !== undefined ? { yarnSupportsFocus } : {}),
+    ...(isolated.isolated ? { isolatedLockfiles: true, isolatedLockfilesSource: isolated.source } : {}),
   };
+}
+
+/**
+ * Decide whether this project has per-workspace lockfiles rather than a single shared one.
+ *
+ * Two detection paths:
+ *
+ *   1. **pnpm `.npmrc` opt-out**: if we can read the root `.npmrc` and it contains
+ *      `shared-workspace-lockfile=false`, pnpm will generate a `pnpm-lock.yaml` in each
+ *      workspace member. We don't need to verify the lockfiles exist on disk — the setting
+ *      IS the contract. (This also covers the pre-install case where members don't have
+ *      their lockfiles yet.)
+ *   2. **On-disk evidence**: for any manager, if every workspace member already has its own
+ *      lockfile of the matching kind, we treat the project as isolated-lockfile. This also
+ *      catches the "folder of independent projects accidentally treated as workspaces" case.
+ *
+ * Returns `{ isolated: false }` when neither applies OR when `hasWorkspaces` is false.
+ */
+function detectIsolatedLockfiles(
+  cwd: string,
+  manager: PackageManager,
+  members: WorkspaceMember[],
+): { isolated: false } | { isolated: true; source: 'pnpm-npmrc' | 'per-workspace-lockfiles' } {
+  if (members.length === 0) {
+    return { isolated: false };
+  }
+
+  // pnpm-specific: look for the canonical `.npmrc` opt-out. We parse conservatively — a
+  // commented-out line (`# shared-workspace-lockfile=false`) shouldn't trigger detection.
+  if (manager === 'pnpm') {
+    const npmrc = path.join(cwd, '.npmrc');
+    try {
+      if (fs.existsSync(npmrc)) {
+        const raw = fs.readFileSync(npmrc, 'utf8');
+        for (const line of raw.split(/\r?\n/)) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith(';')) continue;
+          const m = trimmed.match(/^shared-workspace-lockfile\s*=\s*(false|no|0)$/i);
+          if (m) {
+            return { isolated: true, source: 'pnpm-npmrc' };
+          }
+        }
+      }
+    } catch {
+      // Unreadable .npmrc is effectively absent — fall through.
+    }
+  }
+
+  // Generic path: every workspace member has its own lockfile of the matching kind.
+  const expected = manager === 'pnpm' ? 'pnpm-lock.yaml' : manager === 'yarn' ? 'yarn.lock' : 'package-lock.json';
+  const allPresent = members.every((m) => fs.existsSync(path.join(m.dir, expected)));
+  if (allPresent) {
+    return { isolated: true, source: 'per-workspace-lockfiles' };
+  }
+  return { isolated: false };
 }

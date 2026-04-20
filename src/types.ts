@@ -209,6 +209,15 @@ export interface ProjectInfoReport {
    * `--install-mode filtered` produces a focused install or falls back to the root install.
    */
   yarnSupportsFocus?: boolean;
+  /**
+   * True when the project was detected as an **isolated-lockfile** monorepo — each workspace
+   * has (or will have) its own lockfile rather than sharing a single root one. When true AND
+   * `--concurrency > 1`, the orchestrator runs installs + validation in parallel per
+   * workspace; when false, installs stay serialized via a single root-keyed mutex.
+   */
+  isolatedLockfiles?: boolean;
+  /** Why `isolatedLockfiles` is true (only present when it IS true). */
+  isolatedLockfilesSource?: 'pnpm-npmrc' | 'per-workspace-lockfiles';
 }
 
 export interface FinalReport {
@@ -262,6 +271,14 @@ export interface FinalReport {
    * mode or capped at the target count).
    */
   concurrency?: number;
+  /**
+   * True when this run used **per-workspace parallel installs** (isolated-lockfile monorepo,
+   * see `ProjectInfo.isolatedLockfiles`). When true, `install` + `validate` ran concurrently
+   * across workspaces — bounded by `concurrency` — keyed by each target's install directory.
+   * When false or undefined, installs were strictly serialized via a shared root mutex. This
+   * flag is purely informational; the report is otherwise identical either way.
+   */
+  parallelInstalls?: boolean;
   /**
    * Git commits that were created during this run (always empty when `--git-commit` was not
    * passed). Each entry records the commit's short SHA, its message, and the repo-root-relative

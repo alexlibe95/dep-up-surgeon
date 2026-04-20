@@ -148,6 +148,16 @@ async function postRunInteractive(cwd: string, report: FinalReport): Promise<voi
 async function main(): Promise<void> {
   const version = await readSelfVersion();
 
+  // `doctor` is a read-only diagnostic subcommand — we dispatch it BEFORE the main commander
+  // program is wired up so it doesn't have to inherit the upgrade flow's 70+ options (most
+  // of which don't apply to a read-only run). `doctor` has its own small commander program
+  // with a focused option set; when it runs, it prints its report and exits directly.
+  if (process.argv[2] === 'doctor') {
+    const { runDoctorCommand } = await import('./cli/doctorCommand.js');
+    await runDoctorCommand(process.argv, version);
+    return;
+  }
+
   program
     .name('dep-up-surgeon')
     .description(
@@ -208,8 +218,12 @@ async function main(): Promise<void> {
     )
     .option(
       '--concurrency <n>',
-      'Maximum number of workspace targets to scan/plan in parallel (1-16; default 1). Higher values overlap registry fetches across targets while a shared mutex keeps installs and validation serialized (the lockfile is shared). Requires --json to keep per-target log lines from interleaving — non-JSON mode silently downgrades to 1 with a warning.',
+      'Maximum number of workspace targets to scan/plan in parallel (1-16; default 1). Higher values overlap registry fetches across targets while a shared mutex keeps installs and validation serialized (the lockfile is shared). In **isolated-lockfile** monorepos (pnpm `shared-workspace-lockfile=false`, or every workspace member shipping its own lockfile) the installs + validation ALSO run in parallel, keyed per workspace directory. Requires --json to keep per-target log lines from interleaving — non-JSON mode silently downgrades to 1 with a warning.',
       '1',
+    )
+    .option(
+      '--no-parallel-installs',
+      'Force installs + validation to stay serialized even when an isolated-lockfile monorepo is detected. Useful when debugging a flaky install step (parallel installs mask the ordering) or when a per-workspace postinstall script touches shared state outside the workspace tree.',
     )
     .option(
       '--no-persist-report',
@@ -355,6 +369,7 @@ async function main(): Promise<void> {
     workspace?: string;
     installMode?: string;
     concurrency?: string;
+    parallelInstalls?: boolean; // commander turns `--no-parallel-installs` into `parallelInstalls: false`
     persistReport?: boolean; // commander turns `--no-persist-report` into `persistReport: false`
     retryFailed?: boolean;
     summary?: string;
@@ -688,6 +703,9 @@ async function main(): Promise<void> {
       workspaceMode,
       installMode,
       concurrency,
+      // commander turns `--no-parallel-installs` into `parallelInstalls: false`; everything
+      // else (undefined, true, or the flag absent) means "auto-detect from project info".
+      ...(opts.parallelInstalls === false ? { forceSerialInstalls: true } : {}),
       restrictToNames,
       policy,
       // `--no-resolve-peers` sets opts.resolvePeers to false (commander convention);

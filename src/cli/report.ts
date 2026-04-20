@@ -33,6 +33,8 @@ export interface StructuredReport {
   installMode?: 'root' | 'filtered';
   /** Effective number of targets traversed in parallel (`1` = serial). */
   concurrency?: number;
+  /** True when installs + validation ran concurrently per-workspace (isolated-lockfile monorepo). */
+  parallelInstalls?: boolean;
   /**
    * Git commits created during the run (only present when `--git-commit` was set). Failed
    * commit attempts are also recorded here with `ok: false` so CI can surface the reason
@@ -79,6 +81,7 @@ export function buildStructuredReport(
     ...(report.ignored?.length ? { ignored: report.ignored } : {}),
     ...(report.installMode ? { installMode: report.installMode } : {}),
     ...(report.concurrency && report.concurrency > 1 ? { concurrency: report.concurrency } : {}),
+    ...(report.parallelInstalls ? { parallelInstalls: true } : {}),
     ...(report.commits && report.commits.length > 0 ? { commits: report.commits } : {}),
     ...(report.gitCommitMode ? { gitCommitMode: report.gitCommitMode } : {}),
     ...(report.policy ? { policy: report.policy } : {}),
@@ -102,6 +105,9 @@ export function printStructuredCliSummary(structured: StructuredReport): void {
   }
   if (structured.targets && structured.targets.length > 1) {
     log.dim(`  targets: ${structured.targets.map((t) => t.label).join(', ')}`);
+  }
+  if (structured.parallelInstalls) {
+    log.dim(`  parallel installs: per-workspace (isolated-lockfile monorepo)`);
   }
 
   if (structured.groups.length) {

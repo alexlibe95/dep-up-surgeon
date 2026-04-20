@@ -1,0 +1,216 @@
+{
+  "upgraded": [],
+  "skipped": [
+    {
+      "name": "@types/fs-extra",
+      "success": true,
+      "skipped": true,
+      "from": "11.0.4",
+      "to": "11.0.4",
+      "reason": "skipped",
+      "detail": "already latest",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "fs-extra",
+      "success": true,
+      "skipped": true,
+      "from": "11.3.4",
+      "to": "11.3.4",
+      "reason": "skipped",
+      "detail": "already latest",
+      "linkedGroupId": "graph-0"
+    },
+    {
+      "name": "@types/node",
+      "success": true,
+      "skipped": true,
+      "from": "25.6.0",
+      "to": "25.6.0",
+      "reason": "skipped",
+      "detail": "already latest"
+    },
+    {
+      "name": "@types/prompts",
+      "success": true,
+      "skipped": true,
+      "from": "2.4.9",
+      "to": "2.4.9",
+      "reason": "skipped",
+      "detail": "already latest",
+      "linkedGroupId": "graph-1"
+    },
+    {
+      "name": "prompts",
+      "success": true,
+      "skipped": true,
+      "from": "2.4.2",
+      "to": "2.4.2",
+      "reason": "skipped",
+      "detail": "already latest",
+      "linkedGroupId": "graph-1"
+    },
+    {
+      "name": "@types/semver",
+      "success": true,
+      "skipped": true,
+      "from": "7.7.1",
+      "to": "7.7.1",
+      "reason": "skipped",
+      "detail": "already latest",
+      "linkedGroupId": "graph-2"
+    },
+    {
+      "name": "semver",
+      "success": true,
+      "skipped": true,
+      "from": "7.7.4",
+      "to": "7.7.4",
+      "reason": "skipped",
+      "detail": "already latest",
+      "linkedGroupId": "graph-2"
+    },
+    {
+      "name": "chalk",
+      "success": true,
+      "skipped": true,
+      "from": "5.6.2",
+      "to": "5.6.2",
+      "reason": "skipped",
+      "detail": "already latest"
+    },
+    {
+      "name": "commander",
+      "success": true,
+      "skipped": true,
+      "from": "14.0.3",
+      "to": "14.0.3",
+      "reason": "skipped",
+      "detail": "already latest"
+    },
+    {
+      "name": "execa",
+      "success": true,
+      "skipped": true,
+      "from": "9.6.1",
+      "to": "9.6.1",
+      "reason": "skipped",
+      "detail": "already latest"
+    },
+    {
+      "name": "pacote",
+      "success": true,
+      "skipped": true,
+      "from": "21.5.0",
+      "to": "21.5.0",
+      "reason": "skipped",
+      "detail": "already latest"
+    },
+    {
+      "name": "typescript",
+      "success": true,
+      "skipped": true,
+      "from": "6.0.3",
+      "to": "6.0.3",
+      "reason": "skipped",
+      "detail": "already latest"
+    },
+    {
+      "name": "yaml",
+      "success": true,
+      "skipped": true,
+      "from": "2.8.3",
+      "to": "2.8.3",
+      "reason": "skipped",
+      "detail": "already latest"
+    }
+  ],
+  "failed": [],
+  "conflicts": [],
+  "unresolved": [],
+  "groups": [
+    {
+      "id": "graph-0",
+      "packages": [
+        "@types/fs-extra",
+        "fs-extra"
+      ]
+    },
+    {
+      "id": "single:@types/node",
+      "packages": [
+        "@types/node"
+      ]
+    },
+    {
+      "id": "graph-1",
+      "packages": [
+        "@types/prompts",
+        "prompts"
+      ]
+    },
+    {
+      "id": "graph-2",
+      "packages": [
+        "@types/semver",
+        "semver"
+      ]
+    },
+    {
+      "id": "single:chalk",
+      "packages": [
+        "chalk"
+      ]
+    },
+    {
+      "id": "single:commander",
+      "packages": [
+        "commander"
+      ]
+    },
+    {
+      "id": "single:execa",
+      "packages": [
+        "execa"
+      ]
+    },
+    {
+      "id": "single:pacote",
+      "packages": [
+        "pacote"
+      ]
+    },
+    {
+      "id": "single:typescript",
+      "packages": [
+        "typescript"
+      ]
+    },
+    {
+      "id": "single:yaml",
+      "packages": [
+        "yaml"
+      ]
+    }
+  ],
+  "project": {
+    "manager": "npm",
+    "managerSource": "lockfile",
+    "lockfile": "package-lock.json",
+    "hasWorkspaces": false,
+    "workspaceGlobs": [],
+    "workspaceMembers": []
+  },
+  "targets": [
+    {
+      "label": "root",
+      "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon",
+      "packageJson": "/Users/alex/Desktop/projects/dep-up-surgeon/package.json"
+    }
+  ],
+  "installMode": "root",
+  "finishedAt": "2026-04-20T11:50:00.936Z",
+  "toolVersion": "2.2.1",
+  "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon",
+  "dryRun": true
+}

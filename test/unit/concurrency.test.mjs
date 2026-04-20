@@ -21,9 +21,8 @@ import os from 'node:os';
 import fs from 'node:fs/promises';
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const { AsyncMutex, runWithConcurrency, createRegistryCache, mapWithConcurrency } = await import(
-  path.join(root, 'dist/utils/concurrency.js')
-);
+const { AsyncMutex, KeyedMutex, runWithConcurrency, createRegistryCache, mapWithConcurrency } =
+  await import(path.join(root, 'dist/utils/concurrency.js'));
 const { runUpgradeFlow } = await import(path.join(root, 'dist/core/upgrader.js'));
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -219,4 +218,209 @@ test('runUpgradeFlow: parallel run still merges target rows in deterministic ord
   // Targets, in input order, are: root, then alphabetical workspace members.
   const labels = r.targets.map((t) => t.label);
   assert.deepStrictEqual(labels, ['root', '@org/a', '@org/b']);
+});
+
+// ---------------------------------------------------------------------------
+// KeyedMutex
+// ---------------------------------------------------------------------------
+
+test('KeyedMutex: same key serializes, different keys run concurrently', async () => {
+  const km = new KeyedMutex();
+  const perKey = new Map();
+  let maxSameKey = 0;
+  let maxAcrossKeys = 0;
+  let inFlight = 0;
+
+  const body = async (key, ms) => {
+    const before = (perKey.get(key) ?? 0) + 1;
+    perKey.set(key, before);
+    maxSameKey = Math.max(maxSameKey, before);
+    inFlight++;
+    maxAcrossKeys = Math.max(maxAcrossKeys, inFlight);
+    await sleep(ms);
+    inFlight--;
+    perKey.set(key, perKey.get(key) - 1);
+  };
+
+  // 3 tasks on key A (must serialize), 3 on key B (must serialize), but A and B run in
+  // parallel — so we should see up to 2 in flight across keys at any moment.
+  await Promise.all([
+    km.runExclusive('A', () => body('A', 30)),
+    km.runExclusive('A', () => body('A', 30)),
+    km.runExclusive('A', () => body('A', 30)),
+    km.runExclusive('B', () => body('B', 30)),
+    km.runExclusive('B', () => body('B', 30)),
+    km.runExclusive('B', () => body('B', 30)),
+  ]);
+
+  assert.strictEqual(maxSameKey, 1, 'same-key tasks must never run in parallel');
+  assert.ok(maxAcrossKeys >= 2, 'different-key tasks must be allowed to run in parallel');
+  assert.strictEqual(km.keyCount, 2, 'KeyedMutex should track one lock per observed key');
+});
+
+test('KeyedMutex: thrown fn releases the key, queue continues', async () => {
+  const km = new KeyedMutex();
+  const order = [];
+  const results = await Promise.allSettled([
+    km.runExclusive('k', async () => {
+      order.push('a-start');
+      await sleep(10);
+      order.push('a-end');
+      throw new Error('boom');
+    }),
+    km.runExclusive('k', async () => {
+      order.push('b-start');
+      await sleep(5);
+      order.push('b-end');
+      return 'ok';
+    }),
+  ]);
+  assert.strictEqual(results[0].status, 'rejected');
+  assert.strictEqual(results[1].status, 'fulfilled');
+  assert.strictEqual(results[1].value, 'ok');
+  // Ordering: a must fully complete before b even starts — key serialization wins over the
+  // thrown rejection.
+  assert.deepStrictEqual(order, ['a-start', 'a-end', 'b-start', 'b-end']);
+});
+
+// ---------------------------------------------------------------------------
+// Isolated-lockfile detection + orchestrator parallel-install wiring
+// ---------------------------------------------------------------------------
+
+const { detectProjectInfo } = await import(path.join(root, 'dist/core/workspaces.js'));
+
+test('detectProjectInfo: pnpm .npmrc shared-workspace-lockfile=false → isolatedLockfiles', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dus-isol-'));
+  await fs.writeFile(
+    path.join(dir, 'package.json'),
+    JSON.stringify({ name: 'mono', private: true, workspaces: ['packages/*'] }),
+  );
+  await fs.writeFile(path.join(dir, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
+  await fs.writeFile(path.join(dir, '.npmrc'), 'shared-workspace-lockfile=false\n');
+  await fs.mkdir(path.join(dir, 'packages', 'a'), { recursive: true });
+  await fs.writeFile(
+    path.join(dir, 'packages', 'a', 'package.json'),
+    JSON.stringify({ name: '@org/a', version: '0.0.1' }),
+  );
+
+  const info = await detectProjectInfo(dir, 'pnpm');
+  assert.strictEqual(info.isolatedLockfiles, true);
+  assert.strictEqual(info.isolatedLockfilesSource, 'pnpm-npmrc');
+});
+
+test('detectProjectInfo: commented-out shared-workspace-lockfile is NOT detected', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dus-isol-cmt-'));
+  await fs.writeFile(
+    path.join(dir, 'package.json'),
+    JSON.stringify({ name: 'mono', private: true, workspaces: ['packages/*'] }),
+  );
+  await fs.writeFile(path.join(dir, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
+  await fs.writeFile(path.join(dir, '.npmrc'), '# shared-workspace-lockfile=false\n');
+  await fs.mkdir(path.join(dir, 'packages', 'a'), { recursive: true });
+  await fs.writeFile(
+    path.join(dir, 'packages', 'a', 'package.json'),
+    JSON.stringify({ name: '@org/a', version: '0.0.1' }),
+  );
+  const info = await detectProjectInfo(dir, 'pnpm');
+  // No per-workspace lockfile either, so this must stay "shared" — isolatedLockfiles absent.
+  assert.ok(!info.isolatedLockfiles);
+});
+
+test('detectProjectInfo: every member has own lockfile → isolatedLockfiles=per-workspace-lockfiles', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dus-isol-ws-'));
+  await fs.writeFile(
+    path.join(dir, 'package.json'),
+    JSON.stringify({ name: 'mono', private: true, workspaces: ['packages/*'] }),
+  );
+  await fs.writeFile(path.join(dir, 'package-lock.json'), '{"lockfileVersion":2,"packages":{}}');
+  for (const name of ['a', 'b']) {
+    const m = path.join(dir, 'packages', name);
+    await fs.mkdir(m, { recursive: true });
+    await fs.writeFile(path.join(m, 'package.json'), JSON.stringify({ name: `@org/${name}`, version: '0.0.1' }));
+    await fs.writeFile(path.join(m, 'package-lock.json'), '{"lockfileVersion":2,"packages":{}}');
+  }
+  const info = await detectProjectInfo(dir, 'npm');
+  assert.strictEqual(info.isolatedLockfiles, true);
+  assert.strictEqual(info.isolatedLockfilesSource, 'per-workspace-lockfiles');
+});
+
+test('detectProjectInfo: shared root lockfile only → isolatedLockfiles not set', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dus-isol-shared-'));
+  await fs.writeFile(
+    path.join(dir, 'package.json'),
+    JSON.stringify({ name: 'mono', private: true, workspaces: ['packages/*'] }),
+  );
+  await fs.writeFile(path.join(dir, 'package-lock.json'), '{"lockfileVersion":2,"packages":{}}');
+  for (const name of ['a', 'b']) {
+    const m = path.join(dir, 'packages', name);
+    await fs.mkdir(m, { recursive: true });
+    await fs.writeFile(path.join(m, 'package.json'), JSON.stringify({ name: `@org/${name}`, version: '0.0.1' }));
+  }
+  const info = await detectProjectInfo(dir, 'npm');
+  assert.ok(!info.isolatedLockfiles, 'must not flag isolated when members share the root lockfile');
+});
+
+test('runUpgradeFlow: isolated-lockfile monorepo sets parallelInstalls=true at concurrency>1', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dus-isol-flow-'));
+  await fs.writeFile(
+    path.join(dir, 'package.json'),
+    JSON.stringify({ name: 'mono', private: true, workspaces: ['packages/*'] }),
+  );
+  await fs.writeFile(path.join(dir, 'package-lock.json'), '{"lockfileVersion":2,"packages":{}}');
+  for (const name of ['a', 'b', 'c']) {
+    const m = path.join(dir, 'packages', name);
+    await fs.mkdir(m, { recursive: true });
+    await fs.writeFile(path.join(m, 'package.json'), JSON.stringify({ name: `@org/${name}`, version: '0.0.1' }));
+    await fs.writeFile(path.join(m, 'package-lock.json'), '{"lockfileVersion":2,"packages":{}}');
+  }
+  const r = await runUpgradeFlow({
+    cwd: dir,
+    dryRun: true,
+    interactive: false,
+    force: false,
+    jsonOutput: true,
+    ignore: new Set(),
+    fallbackStrategy: 'highest-stable',
+    linkGroups: 'off',
+    linkedGroupsConfig: [],
+    validate: { skip: true },
+    workspaceMode: 'all',
+    packageManager: 'npm',
+    concurrency: 4,
+  });
+  assert.strictEqual(r.parallelInstalls, true, 'isolated-lockfile monorepo must flip parallelInstalls on');
+  assert.strictEqual(r.project?.isolatedLockfiles, true);
+});
+
+test('runUpgradeFlow: forceSerialInstalls pins parallelInstalls back off', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dus-isol-force-'));
+  await fs.writeFile(
+    path.join(dir, 'package.json'),
+    JSON.stringify({ name: 'mono', private: true, workspaces: ['packages/*'] }),
+  );
+  await fs.writeFile(path.join(dir, 'package-lock.json'), '{"lockfileVersion":2,"packages":{}}');
+  for (const name of ['a', 'b']) {
+    const m = path.join(dir, 'packages', name);
+    await fs.mkdir(m, { recursive: true });
+    await fs.writeFile(path.join(m, 'package.json'), JSON.stringify({ name: `@org/${name}`, version: '0.0.1' }));
+    await fs.writeFile(path.join(m, 'package-lock.json'), '{"lockfileVersion":2,"packages":{}}');
+  }
+  const r = await runUpgradeFlow({
+    cwd: dir,
+    dryRun: true,
+    interactive: false,
+    force: false,
+    jsonOutput: true,
+    ignore: new Set(),
+    fallbackStrategy: 'highest-stable',
+    linkGroups: 'off',
+    linkedGroupsConfig: [],
+    validate: { skip: true },
+    workspaceMode: 'all',
+    packageManager: 'npm',
+    concurrency: 4,
+    forceSerialInstalls: true,
+  });
+  assert.ok(!r.parallelInstalls, 'forceSerialInstalls must suppress parallel installs');
+  assert.strictEqual(r.project?.isolatedLockfiles, true, 'project detection should still record the isolated-lockfile facts');
 });

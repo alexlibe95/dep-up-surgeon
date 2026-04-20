@@ -62,7 +62,8 @@ dep-up-surgeon [options]
 | `--workspaces-only` | Like `--workspaces` but **skips** the root `package.json`. Only workspace members are traversed. |
 | `--workspace <names>` | Comma-separated workspace member **names** (the `name` field from each child `package.json`) to traverse. Pass `root` to also include the root. Example: `--workspace "@org/core,@org/web,root"`. Unknown names produce a friendly error listing the known members. |
 | `--install-mode <mode>` | Workspace install strategy. **`root`** (default) always runs `<mgr> install` from the workspace root after every mutation — the safest option, supported by every package manager. **`filtered`** rewrites per-child installs to their workspace-scoped form: **npm 7+** uses `npm install --workspace <name>`, **pnpm** uses `pnpm install --filter <name>`, **yarn berry (v2+) with `@yarnpkg/plugin-workspace-tools`** uses `yarn workspaces focus <name>`, and **yarn classic / berry without the plugin** falls back to a full root install with a one-time warning explaining the upgrade path. The capability is auto-detected at startup (yarn version + plugin probe) and reported as `project.yarnMajorVersion` + `project.yarnSupportsFocus` in `--json`. Only meaningful with `--workspaces` / `--workspaces-only` / `--workspace <names>`. |
-| `--concurrency <n>` | Maximum number of workspace targets to traverse in parallel (1–16; default `1`). Higher values overlap registry **scan + plan** phases across targets while a shared mutex keeps **install + validation strictly serialized** — the workspace lockfile is shared, so concurrent installs would corrupt it. The default in-process registry cache also deduplicates `pacote.manifest` / `pacote.packument` calls across targets, so even at concurrency `1` you get a speedup when the same dep appears in many workspaces. **Requires `--json`** so per-target log lines don't interleave; non-JSON mode silently downgrades to `1` with a warning. |
+| `--concurrency <n>` | Maximum number of workspace targets to traverse in parallel (1–16; default `1`). Higher values overlap registry **scan + plan** phases across targets while a shared mutex keeps **install + validation strictly serialized** — the workspace lockfile is shared, so concurrent installs would corrupt it. The default in-process registry cache also deduplicates `pacote.manifest` / `pacote.packument` calls across targets, so even at concurrency `1` you get a speedup when the same dep appears in many workspaces. **Requires `--json`** so per-target log lines don't interleave; non-JSON mode silently downgrades to `1` with a warning. In an **isolated-lockfile** monorepo (pnpm `shared-workspace-lockfile=false`, or every workspace member shipping its own lockfile) installs + validation are ALSO run in parallel — see **Parallel installs** below. |
+| `--no-parallel-installs` | Force installs + validation to stay serialized even when an isolated-lockfile monorepo is detected. Useful when debugging a flaky install step (parallel installs mask the ordering) or when a per-workspace postinstall script touches shared state outside its workspace. |
 | `--retry-failed` | Read `.dep-up-surgeon.last-run.json` from the previous run and only re-attempt entries that failed for **non-terminal** reasons (`install`, `validation-conflicts`, `versions`, `unknown`). Successful upgrades + terminal failures (`peer`, `validation-script`) from the last run are added to the ignore list automatically. See **Persisted last-run report** below. |
 | `--no-persist-report` | Do **not** write `.dep-up-surgeon.last-run.json` after the run. By default the structured report is written next to the workspace root for `--retry-failed` and CI consumers. |
 | `--summary <format>` | Write a human-friendly summary of the run as `md` (default) or `html`. Destination is `$GITHUB_STEP_SUMMARY` if set (appended), otherwise `--summary-file <path>`, otherwise `./dep-up-surgeon-summary.<ext>`. |
@@ -362,6 +363,50 @@ Where it shows up:
 npx dep-up-surgeon --security-only --apply-overrides --fix-lockfile --summary md
 ```
 
+### Doctor subcommand (`dep-up-surgeon doctor`)
+
+`doctor` is a **read-only** diagnostic that answers one question: "is this project in good shape for an upgrade pass right now?". Run it before trusting an upgrade loop (or as a CI pre-check); it never mutates anything. Output is a **traffic-light report** — green/yellow/red per check with a remediation hint on anything non-green.
+
+What it checks, in order (stable IDs for `--json` consumers):
+
+1. **`node-version`** — current Node satisfies `engines.node` (if set). Red when a mismatched Node would tear down peer-dep resolution in ways that look like CVE-driven failures later.
+2. **`manager`** — a single package manager was resolved cleanly. Yellow when multiple lockfiles coexist or the tool had to fall back to the `npm` default without any signal.
+3. **`lockfile`** — the lockfile is parseable. Yellow on npm v1 shape (upgrades to v2 recommended); red on unreadable / corrupt files.
+4. **`workspace-coherence`** — declared workspace members resolve on disk with their own `package.json`.
+5. **`policy`** — `.dep-up-surgeon.policy.{yaml,json}` (when present) parses without warnings.
+6. **`preflight-validator`** — your `<mgr> test` / `<mgr> run build` (or `--validate <cmd>`) passes right now, before any upgrade. Red here means the project is broken **before** the upgrade loop — fix that first or every failure downstream will look like a regression.
+7. **`peer-deps`** — existing peer / missing dep warnings (via `npm ls --all`, `pnpm install --frozen-lockfile --offline`, or `yarn check`). Catches "already broken before you touched it" cases.
+8. **`audit`** — `<mgr> audit` dry-run with severity breakdown. Red on any high/critical advisory, yellow on low/moderate.
+9. **`stale-transitives`** — up to 100 transitives scanned against registry `latest`; yellow when any are more than a minor or a full major behind. Informational (never red); run `--fix-lockfile` to clean up the easy ones.
+
+Exit codes:
+
+- `0` — all checks green (or yellow-only without `--strict`)
+- `1` — any yellow under `--strict`
+- `2` — any red
+
+Options are focused (no entanglement with the 70+ upgrade-flow flags):
+
+| Option | Description |
+|--------|-------------|
+| `--json` | Emit the full `DoctorReport` as JSON on stdout instead of the human format. |
+| `--strict` | Treat yellow checks as failures (exit 1 instead of 0). Use for CI gates. |
+| `--no-validate` | Skip the pre-flight validator check. |
+| `--validate <cmd>` | Override the validator command used by the pre-flight check. |
+| `--skip-audit` | Skip the audit dry-run. Use for air-gapped CI / offline dev. |
+| `--skip-peer-scan` | Skip the peer-dep scan (slow on huge trees). |
+| `--skip-stale-scan` | Skip the registry-backed stale-transitive scan. |
+| `--package-manager <mgr>` | Override detected manager: `auto`, `npm`, `pnpm`, `yarn`. |
+| `--cwd <path>` | Run against a different directory. |
+
+```bash
+# Quick CI pre-check
+npx dep-up-surgeon doctor --strict --json
+
+# Local "should I trust the upgrade loop?" check
+npx dep-up-surgeon doctor
+```
+
 ### Auto-opening a PR (`--open-pr`)
 
 When you've already paid the cost of running `--git-commit --git-branch`, `--open-pr` closes the loop by pushing the branch and opening a GitHub pull request via the [GitHub CLI (`gh`)](https://cli.github.com/). Uses your existing `gh auth`; the tool handles nothing sensitive.
@@ -397,7 +442,7 @@ npx dep-up-surgeon --workspaces --summary md \
   - **yarn berry without the plugin** → falls back to a full root install with a one-time warning telling you the exact `yarn plugin import` command to fix it
 
   The yarn capability is auto-probed at startup (`yarn --version` + `yarn workspaces focus --help`) and surfaced as `project.yarnMajorVersion` and `project.yarnSupportsFocus` in `--json`. The mode actually used is recorded as `installMode` in the report, and the exact filtered command appears under `failed[].install.command` when an upgrade rolls back.
-- **Parallel target traversal (`--concurrency <n>`).** With more than one target, pass `--concurrency 4` (or up to `16`) to run target **scans + plans** concurrently. Registry IO (`pacote.manifest` / `pacote.packument`) is the slow part of each engine pass and is fully parallel-safe — overlapping it across targets gives a real wall-clock speedup on monorepos with many workspaces. **Installs and validations stay serialized** under a shared async mutex because they all touch the same root lockfile and `node_modules`; running them in parallel would corrupt the lockfile. An in-process registry cache (always on) also deduplicates fetches so the same dependency name in many workspaces only hits the network once. The effective concurrency is reported as `concurrency` in `--json` output. Parallelism requires `--json`; non-JSON mode silently downgrades to `1` to keep per-target log lines legible.
+- **Parallel target traversal (`--concurrency <n>`).** With more than one target, pass `--concurrency 4` (or up to `16`) to run target **scans + plans** concurrently. Registry IO (`pacote.manifest` / `pacote.packument`) is the slow part of each engine pass and is fully parallel-safe — overlapping it across targets gives a real wall-clock speedup on monorepos with many workspaces. In a **shared-lockfile** monorepo (the common case) installs and validations stay serialized under a keyed async mutex because they all touch the same root lockfile and `node_modules`; running them in parallel would corrupt the lockfile. In an **isolated-lockfile** monorepo (pnpm `shared-workspace-lockfile=false`, or every workspace member shipping its own lockfile) the installs and validations ALSO run in parallel — the keyed mutex keys off each target's install directory, so same-dir operations still serialize while different-dir operations unlock. The detection is automatic and surfaced as `project.isolatedLockfiles` + `parallelInstalls: true` in `--json`; pass `--no-parallel-installs` to force the old serialized behavior. An in-process registry cache (always on) also deduplicates fetches so the same dependency name in many workspaces only hits the network once. The effective concurrency is reported as `concurrency` in `--json` output. Parallelism requires `--json`; non-JSON mode silently downgrades to `1` to keep per-target log lines legible.
 
 The detected manager + members are surfaced under `project` in `--json` output:
 

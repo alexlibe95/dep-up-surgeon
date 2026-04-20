@@ -31,7 +31,7 @@ import {
 import { detectProjectInfo, type PackageManager, type ProjectInfo } from './workspaces.js';
 import { tailLines } from '../utils/output.js';
 import {
-  AsyncMutex,
+  KeyedMutex,
   createRegistryCache,
   runWithConcurrency,
   type RegistryCache,
@@ -163,12 +163,15 @@ export interface UpgradeEngineOptions {
    */
   registryCache?: RegistryCache;
   /**
-   * Shared async mutex. When set, the engine acquires it around every install + post-install
-   * validation step so concurrent target traversals don't race the lockfile. The orchestrator
-   * creates one lock per `runUpgradeFlow` invocation when `--concurrency > 1`. At
-   * concurrency 1 the lock is omitted (zero overhead, same behavior as before).
+   * Keyed install mutex. The engine acquires it around every install + post-install
+   * validation step, keyed by the install **directory**. Two targets that install into the
+   * same directory (shared-lockfile monorepo — the common case) still serialize fully, but
+   * targets that install into different directories (isolated-lockfile / nohoist setups) run
+   * concurrently. The orchestrator creates one `KeyedMutex` per `runUpgradeFlow` invocation
+   * when `--concurrency > 1`. At concurrency 1 the mutex is omitted (zero overhead, same
+   * behavior as before).
    */
-  installLock?: AsyncMutex;
+  installLock?: KeyedMutex;
   /**
    * Hook fired AFTER each successful single OR batch upgrade (after the row has been added to
    * `report.upgraded` but before the next attempt begins). Used by the CLI's git integration
@@ -367,16 +370,23 @@ function installFilterOptions(opts: UpgradeEngineOptions): InstallOptions {
 }
 
 /**
- * Run `fn` under the shared install/validate mutex if one was provided. At concurrency 1 the
- * orchestrator omits the lock entirely → we run inline with zero overhead. The lock guarantees
- * that no two targets simultaneously touch the workspace lockfile / `node_modules` tree.
+ * Run `fn` under the keyed install mutex if one was provided. At concurrency 1 the
+ * orchestrator omits the lock entirely → we run inline with zero overhead.
+ *
+ * The lock key is the **install directory**: `opts.installCwd ?? opts.cwd`. Two calls with
+ * the same key serialize (they'd race on the same lockfile / `node_modules`); calls with
+ * different keys run concurrently. For a shared-lockfile monorepo every target passes the
+ * same `installCwd = rootCwd`, so this collapses back to strict serialization. For an
+ * isolated-lockfile monorepo each target passes its own workspace directory as `installCwd`,
+ * so installs parallelize automatically.
  */
 async function withInstallLock<T>(
   opts: UpgradeEngineOptions,
   fn: () => Promise<T>,
 ): Promise<T> {
   if (opts.installLock) {
-    return opts.installLock.runExclusive(fn);
+    const key = opts.installCwd ?? opts.cwd;
+    return opts.installLock.runExclusive(key, fn);
   }
   return fn();
 }
@@ -1496,6 +1506,14 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
     ...(projectInfo.yarnSupportsFocus !== undefined
       ? { yarnSupportsFocus: projectInfo.yarnSupportsFocus }
       : {}),
+    ...(projectInfo.isolatedLockfiles
+      ? {
+          isolatedLockfiles: true,
+          ...(projectInfo.isolatedLockfilesSource
+            ? { isolatedLockfilesSource: projectInfo.isolatedLockfilesSource }
+            : {}),
+        }
+      : {}),
   };
 
   if (!jsonOutput && !opts.skipPreflight) {
@@ -1689,6 +1707,15 @@ export interface UpgradeFlowOptions
    * interleave per-target output unreadably). Pass `--json` or `--ci` to use values > 1.
    */
   concurrency?: number;
+  /**
+   * Force installs + validation to stay serialized even when `ProjectInfo.isolatedLockfiles`
+   * is true. By default the orchestrator parallelizes installs across workspaces in isolated-
+   * lockfile setups (`pnpm shared-workspace-lockfile=false` or every member has its own
+   * lockfile on disk); setting this to `true` pins the old serialized behavior. Useful when
+   * a postinstall script in one workspace touches shared state outside the workspace tree
+   * (npm scripts, generated files, etc.) and can't tolerate concurrent peers.
+   */
+  forceSerialInstalls?: boolean;
 }
 
 export interface TargetCompleteEvent {
@@ -1801,6 +1828,14 @@ export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalRep
     ...(projectInfo.yarnSupportsFocus !== undefined
       ? { yarnSupportsFocus: projectInfo.yarnSupportsFocus }
       : {}),
+    ...(projectInfo.isolatedLockfiles
+      ? {
+          isolatedLockfiles: true,
+          ...(projectInfo.isolatedLockfilesSource
+            ? { isolatedLockfilesSource: projectInfo.isolatedLockfilesSource }
+            : {}),
+        }
+      : {}),
   };
 
   if (!dryRun) {
@@ -1891,25 +1926,50 @@ export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalRep
   // applies, `withInstallLock` no-ops at zero overhead.
   const registryCache = createRegistryCache();
   const installLock =
-    effectiveConcurrency > 1 || opts.onUpgradeApplied ? new AsyncMutex() : undefined;
+    effectiveConcurrency > 1 || opts.onUpgradeApplied ? new KeyedMutex() : undefined;
+
+  // Isolated-lockfile monorepos (pnpm `shared-workspace-lockfile=false`, or every workspace
+  // member shipping its own lockfile) can install IN PARALLEL — different workspaces touch
+  // different lockfiles. `detectProjectInfo` sets `isolatedLockfiles` when it can prove this
+  // is safe. When true, `installCwd` becomes the target's own dir (not `rootCwd`), the keyed
+  // mutex gives each target its own lock, and the `installFilter` is dropped (running a
+  // manager-scoped install at the workspace dir is the simpler + more correct path).
+  const parallelInstalls =
+    Boolean(projectInfo.isolatedLockfiles) &&
+    effectiveConcurrency > 1 &&
+    !opts.forceSerialInstalls;
+  aggregate.parallelInstalls = parallelInstalls;
 
   if (effectiveConcurrency > 1 && !jsonOutput) {
-    log.dim(
-      `Parallel traversal: scan/plan up to ${effectiveConcurrency} targets concurrently; install + validate stay serialized via a shared lock.`,
-    );
+    if (parallelInstalls) {
+      log.dim(
+        `Parallel traversal: up to ${effectiveConcurrency} targets concurrently — isolated lockfiles detected (${projectInfo.isolatedLockfilesSource}), installs run in parallel per workspace.`,
+      );
+    } else {
+      log.dim(
+        `Parallel traversal: scan/plan up to ${effectiveConcurrency} targets concurrently; install + validate stay serialized (shared root lockfile).`,
+      );
+    }
   }
 
   const buildEngineOpts = (target: { label: string; cwd: string; packageJson: string }) => ({
     ...opts,
     cwd: target.cwd,
-    installCwd: rootCwd,
+    // In parallel-install mode each target installs into its OWN directory; otherwise we
+    // install at the root as before. Either way, `withInstallLock` keys off this value, so
+    // serialization lines up with lockfile boundaries.
+    installCwd: parallelInstalls && target.cwd !== rootCwd ? target.cwd : rootCwd,
     projectInfo,
     targetLabel: namespaceGroups ? target.label : undefined,
     skipPreflight: true,
-    // Filter only applies when (a) user opted into filtered mode and (b) we're mutating a
-    // workspace child (root targets always need a full install — nothing to filter).
+    // Filter only applies when (a) user opted into filtered mode, (b) we're mutating a
+    // workspace child (root targets always need a full install — nothing to filter), and
+    // (c) we're NOT in parallel-install mode (there the install already runs at the
+    // workspace dir, so the filter is redundant and can confuse pnpm/yarn).
     installFilter:
-      opts.installMode === 'filtered' && target.cwd !== rootCwd ? target.label : undefined,
+      opts.installMode === 'filtered' && target.cwd !== rootCwd && !parallelInstalls
+        ? target.label
+        : undefined,
     registryCache,
     installLock,
     onUpgradeApplied: opts.onUpgradeApplied,

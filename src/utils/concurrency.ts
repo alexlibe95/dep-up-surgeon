@@ -34,6 +34,54 @@ export class AsyncMutex {
 }
 
 /**
+ * A keyed asynchronous mutex — `runExclusive(key, fn)` serializes calls that share the same
+ * `key` while allowing callers with DIFFERENT keys to run concurrently.
+ *
+ * Why: in an isolated-lockfile monorepo (e.g. pnpm with `shared-workspace-lockfile=false`,
+ * or a folder of independent projects each with its own lockfile), installs into different
+ * workspace directories are independent — they only race when they touch the same directory.
+ * The keyed mutex lets the upgrader serialize "same install directory" operations while
+ * letting "different install directories" run in parallel, turning the full monorepo
+ * traversal from strictly serial into actually parallel.
+ *
+ * Keys are intended to be the **absolute install directory path** (the same thing the engine
+ * passes to `runInstall(cwd, …)`). When a single shared lockfile at the root is in play,
+ * every target's key will collapse to the same root path → behaviorally identical to the
+ * old single `AsyncMutex`. When keys differ, parallelism unlocks automatically — no explicit
+ * opt-in needed from the caller.
+ *
+ * Internally this is just a `Map<string, AsyncMutex>`; we create one mutex per observed key
+ * on first access. Entries are never evicted (there's at most one mutex per workspace member,
+ * which is bounded by the project size). The class is otherwise a drop-in for `AsyncMutex`
+ * when callers supply a stable key.
+ */
+export class KeyedMutex {
+  private readonly locks = new Map<string, AsyncMutex>();
+
+  /**
+   * Run `fn` with exclusive access to `key`. Calls with the same key are FIFO-serialized;
+   * calls with different keys run concurrently. A thrown `fn` releases its key's lock as
+   * usual (errors never poison the queue — see `AsyncMutex`).
+   */
+  async runExclusive<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    let lock = this.locks.get(key);
+    if (!lock) {
+      lock = new AsyncMutex();
+      this.locks.set(key, lock);
+    }
+    return lock.runExclusive(fn);
+  }
+
+  /**
+   * Current number of tracked keys. Purely informational — used by the orchestrator's
+   * summary log line ("running across N install directories concurrently").
+   */
+  get keyCount(): number {
+    return this.locks.size;
+  }
+}
+
+/**
  * Run `worker` for every item in `items` with at most `concurrency` in flight at any time.
  * Returns results in the **original input order** (not completion order) so callers can
  * deterministically merge / display per-item output.
