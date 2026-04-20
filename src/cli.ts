@@ -29,6 +29,8 @@ import {
 } from './core/upgrader.js';
 import type { FinalReport } from './types.js';
 import { log } from './utils/logger.js';
+import { runAudit, type AuditResult } from './core/audit.js';
+import type { PackageManager } from './core/workspaces.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -259,6 +261,32 @@ async function main(): Promise<void> {
       '--git-allow-dirty',
       'Allow --git-commit on a dirty working tree. We still only `git add` files we touched, but YOUR pre-existing dirty files will land in the same commit if you also stage them manually.',
       false,
+    )
+    .option(
+      '--changelog',
+      'Fetch changelog excerpts for every successful upgrade (GitHub Releases first, then tarball CHANGELOG.md) and attach them to git commit bodies + the summary report. Default ON when --git-commit or --summary is set; use --no-changelog to skip fetches entirely.',
+    )
+    .option(
+      '--no-changelog',
+      'Disable changelog enrichment even when --git-commit / --summary would normally trigger it. Use this in offline / air-gapped CI where GitHub + registry tarball fetches would fail.',
+    )
+    .option(
+      '--security-only',
+      'Security-first mode: run `<manager> audit --json` up-front and attempt upgrades ONLY for packages with known advisories. Every upgraded row in the report carries its advisory id, severity, and URL. Useful as a minimal-risk weekly cron that ONLY ships CVE fixes.',
+      false,
+    )
+    .option(
+      '--min-severity <level>',
+      'Minimum advisory severity to consider under --security-only: one of "low", "moderate", "high", "critical". Lower severities are filtered out. Default: "low" (accept all).',
+      'low',
+    )
+    .option(
+      '--blast-radius',
+      'Scan project source files to list which files actually import each upgraded package. Attaches the file list to every upgrade record + surfaces it in --summary. Default ON when --summary is active.',
+    )
+    .option(
+      '--no-blast-radius',
+      'Disable blast-radius source scanning. Useful in very large monorepos where the scan is slower than the install itself.',
     );
 
   program.parse(process.argv);
@@ -289,6 +317,10 @@ async function main(): Promise<void> {
     gitBranch?: string;
     gitSign?: boolean;
     gitAllowDirty?: boolean;
+    changelog?: boolean;
+    securityOnly?: boolean;
+    minSeverity?: string;
+    blastRadius?: boolean;
   }>();
 
   const cwd = process.cwd();
@@ -315,6 +347,36 @@ async function main(): Promise<void> {
 
   const config = await loadConfig(cwd);
   const ignore = mergeIgnoreLists(config.ignore, opts.ignore);
+
+  // ---- Load .dep-up-surgeon.policy.{yaml,json} ----
+  const { loadPolicy } = await import('./config/policy.js');
+  const policyResult = await loadPolicy(cwd);
+  const policy = policyResult.policy;
+  if (policyResult.present && !jsonOutput) {
+    const bits: string[] = [];
+    if (policy.freeze.length) bits.push(`${policy.freeze.length} freeze`);
+    if (policy.maxVersion.length) bits.push(`${policy.maxVersion.length} maxVersion`);
+    if (policy.allowMajorAfter.length) bits.push(`${policy.allowMajorAfter.length} allowMajorAfter`);
+    if (policy.requireReviewers) bits.push('requireReviewers');
+    if (policy.autoMerge) bits.push('autoMerge');
+    log.info(
+      `policy: loaded ${path.basename(policy.sourceFile ?? '')} — ${bits.join(', ') || '(no rules)'}`,
+    );
+  }
+  for (const w of policy.warnings) {
+    log.warn(`policy: ${w}`);
+  }
+  // Freeze rules: contribute to the ignore list. Using matchPattern to support `*` wildcards.
+  if (policy.freeze.length > 0) {
+    // We don't know the full package list yet, so freeze patterns containing `*` are expanded
+    // downstream inside the engine (it already sees every scanned name). Plain patterns (no
+    // wildcard) can be added to `ignore` directly.
+    for (const f of policy.freeze) {
+      if (!f.pattern.includes('*')) {
+        ignore.add(f.pattern);
+      }
+    }
+  }
 
   if (opts.retryFailed) {
     const last = await loadLastRunReport(cwd);
@@ -419,6 +481,80 @@ async function main(): Promise<void> {
     log.warn('git options were passed without --git-commit; they will be ignored.');
   }
 
+  // Changelog enrichment defaults:
+  //   - Explicit `--changelog` / `--no-changelog` always wins.
+  //   - Otherwise ON whenever `--git-commit` or `--summary` is active (the two consumers that
+  //     actually surface changelog content). Pure `--json` runs stay OFF by default — the JSON
+  //     consumer can always re-enable explicitly with `--changelog`.
+  const includeChangelog =
+    typeof opts.changelog === 'boolean'
+      ? opts.changelog
+      : Boolean(opts.gitCommit) || Boolean(summaryFormat);
+
+  // ---- --security-only: run audit up front (before gitFlow so per-success commits see it) ----
+  let auditResult: AuditResult | undefined;
+  let restrictToNames: Set<string> | undefined;
+  let securityAdvisoryMap:
+    | Map<string, { severity: 'low' | 'moderate' | 'high' | 'critical'; ids: string[]; url?: string; title?: string }>
+    | undefined;
+  if (opts.securityOnly) {
+    const minSev = String(opts.minSeverity ?? 'low').toLowerCase();
+    if (!['low', 'moderate', 'high', 'critical'].includes(minSev)) {
+      log.error(
+        `--min-severity: unknown value "${opts.minSeverity}". Use "low", "moderate", "high", or "critical".`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    const severityRank: Record<string, number> = { low: 1, moderate: 2, high: 3, critical: 4 };
+    const threshold = severityRank[minSev]!;
+
+    let auditManager: PackageManager = 'npm';
+    if (packageManager !== 'auto') {
+      auditManager = packageManager;
+    } else {
+      try {
+        const { detectProjectInfo } = await import('./core/workspaces.js');
+        const info = await detectProjectInfo(cwd);
+        auditManager = info.manager;
+      } catch {
+        auditManager = 'npm';
+      }
+    }
+
+    if (!jsonOutput) {
+      log.info(`--security-only: running ${auditManager} audit --json (min-severity: ${minSev})`);
+    }
+    auditResult = await runAudit({ manager: auditManager, cwd });
+    if (auditResult.error && !jsonOutput) {
+      log.warn(`audit: ${auditResult.error}`);
+    }
+    const filtered = auditResult.advisories.filter(
+      (a) => (severityRank[a.severity] ?? 0) >= threshold,
+    );
+    restrictToNames = new Set(filtered.map((a) => a.name));
+    securityAdvisoryMap = new Map(
+      filtered.map((a) => [
+        a.name,
+        {
+          severity: a.severity,
+          ids: a.ids,
+          ...(a.url ? { url: a.url } : {}),
+          ...(a.title ? { title: a.title } : {}),
+        },
+      ]),
+    );
+    if (!jsonOutput) {
+      if (restrictToNames.size === 0) {
+        log.success(`No advisories at "${minSev}+" severity — nothing to do.`);
+      } else {
+        log.info(
+          `Audit: ${restrictToNames.size} package${restrictToNames.size === 1 ? '' : 's'} with advisories — ${[...restrictToNames].slice(0, 10).join(', ')}${restrictToNames.size > 10 ? ', ...' : ''}`,
+        );
+      }
+    }
+  }
+
   let gitFlow: GitFlowController | undefined;
   if (gitEnabled) {
     if (typeof opts.gitBranch === 'string' && opts.gitBranch.trim()) {
@@ -444,6 +580,8 @@ async function main(): Promise<void> {
         prefix: typeof opts.gitCommitPrefix === 'string' ? opts.gitCommitPrefix : 'deps: ',
         sign: Boolean(opts.gitSign),
         allowDirty: Boolean(opts.gitAllowDirty),
+        includeChangelog,
+        securityAdvisories: securityAdvisoryMap,
       },
       jsonOutput,
       dryRun,
@@ -491,6 +629,8 @@ async function main(): Promise<void> {
       workspaceMode,
       installMode,
       concurrency,
+      restrictToNames,
+      policy,
       onUpgradeApplied: gitFlow?.onUpgradeApplied,
       onTargetComplete: gitFlow
         ? async (ev) => {
@@ -510,40 +650,143 @@ async function main(): Promise<void> {
       report.gitCommitMode = gitFlow.mode;
     }
 
-    if (jsonOutput) {
-      console.log(
-        JSON.stringify(
-          {
-            ...buildStructuredReport(report!, {
-              parsedConflicts: report!.parsedConflicts,
-              groups: report!.groupPlan,
-            }),
-            ignored: report!.ignored,
-          },
-          null,
-          2,
-        ),
-      );
-    } else {
-      printHumanReport(report!);
-      if (report!.parsedConflicts?.length) {
-        printStructuredCliSummary(
-          buildStructuredReport(report!, {
-            parsedConflicts: report!.parsedConflicts,
-            groups: report!.groupPlan,
-          }),
-        );
+    // Attach policy report (always when a policy file was loaded, even if zero rules fired).
+    if (policyResult.present || policy.warnings.length > 0 || policy.sourceFile) {
+      const frozen: NonNullable<typeof report.policy>['frozen'] = [];
+      const applied: NonNullable<typeof report.policy>['applied'] = [];
+      // Walk `report.ignored` to identify which were frozen by policy vs user `ignore`.
+      const { matchPattern } = await import('./config/policy.js');
+      for (const name of report!.ignored) {
+        const hit = policy.freeze.find((f) => matchPattern(f.pattern, name));
+        if (hit) {
+          const entry: (typeof frozen)[number] = { name, pattern: hit.pattern };
+          if (hit.reason) entry.reason = hit.reason;
+          frozen.push(entry);
+        }
+      }
+      for (const r of report!.upgraded) {
+        if (r.reason === 'policy' && r.detail) {
+          applied.push({ name: r.name, rule: 'maxVersion', detail: r.detail });
+        }
+      }
+      const pr: NonNullable<typeof report.policy> = {
+        counts: {
+          freeze: policy.freeze.length,
+          maxVersion: policy.maxVersion.length,
+          allowMajorAfter: policy.allowMajorAfter.length,
+        },
+        frozen,
+        applied,
+        warnings: policy.warnings,
+      };
+      if (policy.sourceFile) {
+        pr.sourceFile = path.basename(policy.sourceFile);
+      }
+      if (policy.requireReviewers) pr.requireReviewers = policy.requireReviewers;
+      if (policy.autoMerge) pr.autoMerge = policy.autoMerge;
+      report!.policy = pr;
+    }
+
+    // Attach security metadata from the up-front audit to every successful upgrade row, so the
+    // summary / JSON consumers can show "which CVE this commit closes". We only annotate rows
+    // that match the advisory name AND actually upgraded successfully — skipped / failed rows
+    // keep their existing shape.
+    if (auditResult && report!.upgraded.length > 0) {
+      const byName = new Map<string, (typeof auditResult.advisories)[number]>();
+      for (const a of auditResult.advisories) byName.set(a.name, a);
+      for (const r of report!.upgraded) {
+        const adv = byName.get(r.name);
+        if (!adv || !r.success || r.skipped) continue;
+        r.security = {
+          severity: adv.severity,
+          ids: adv.ids,
+          url: adv.url,
+          vulnerableRange: adv.vulnerableRange,
+          recommendedVersion: adv.recommendedVersion,
+          title: adv.title,
+        };
       }
     }
 
-    if (interactive && !jsonOutput && report!.failed.length > 0) {
-      await postRunInteractive(cwd, report!);
+    // ---- Blast radius: scan project source for imports of upgraded packages ----
+    // Default ON when --summary is active; explicit --blast-radius / --no-blast-radius wins.
+    const includeBlastRadius =
+      typeof opts.blastRadius === 'boolean' ? opts.blastRadius : Boolean(summaryFormat);
+    if (includeBlastRadius && report!.upgraded.length > 0) {
+      try {
+        const { computeBlastRadius } = await import('./utils/blastRadius.js');
+        const successfulNames = [
+          ...new Set(
+            report!.upgraded.filter((r) => r.success && !r.skipped).map((r) => r.name),
+          ),
+        ];
+        if (successfulNames.length > 0) {
+          const br = await computeBlastRadius({
+            cwd,
+            packageNames: successfulNames,
+          });
+          for (const r of report!.upgraded) {
+            if (!r.success || r.skipped) continue;
+            const hits = br.byPackage.get(r.name);
+            if (!hits) continue;
+            r.blastRadius = {
+              total: hits.total,
+              truncated: hits.truncated,
+              files: hits.hits.map((h) => h.relativePath),
+            };
+          }
+          if (!jsonOutput) {
+            const touched = [...br.byPackage.values()].filter((h) => h.total > 0).length;
+            log.dim(
+              `blast radius: scanned ${br.filesScanned} source files (${touched}/${successfulNames.length} upgraded packages had direct imports)`,
+            );
+          }
+        }
+      } catch {
+        // best-effort — scanning errors never abort the run
+      }
+    }
+
+    // Post-run changelog enrichment for the summary / JSON report. Only happens when the user
+    // opted in (default when `--git-commit` or `--summary` is set). Uses a fresh cache; the
+    // git-commit path already attached its own excerpts to the commit bodies during the run and
+    // records that `.changelog` was populated so we don't double-fetch here.
+    if (includeChangelog && !dryRun && report!.upgraded.length > 0) {
+      try {
+        const { enrichWithChangelogs } = await import('./cli/changelogEnricher.js');
+        const { createChangelogCache } = await import('./utils/changelog.js');
+        await enrichWithChangelogs(report!.upgraded, {
+          cache: createChangelogCache(),
+          concurrency: 4,
+        });
+      } catch {
+        // never block the run on enrichment failure
+      }
     }
 
     const structuredFinal = buildStructuredReport(report!, {
       parsedConflicts: report!.parsedConflicts,
       groups: report!.groupPlan,
     });
+
+    // Emit the primary report (JSON to stdout, or human-friendly to stderr) AFTER all post-run
+    // enrichments have run (policy / security / blast-radius / changelog). This guarantees that
+    // every consumer — `--json`, `--summary`, `.dep-up-surgeon.last-run.json`, and the text
+    // report — sees the exact same structured report.
+    if (jsonOutput) {
+      console.log(
+        JSON.stringify({ ...structuredFinal, ignored: report!.ignored }, null, 2),
+      );
+    } else {
+      printHumanReport(report!);
+      if (report!.parsedConflicts?.length) {
+        printStructuredCliSummary(structuredFinal);
+      }
+    }
+
+    if (interactive && !jsonOutput && report!.failed.length > 0) {
+      await postRunInteractive(cwd, report!);
+    }
 
     if (opts.persistReport !== false) {
       const written = await persistLastRunReport(structuredFinal, {

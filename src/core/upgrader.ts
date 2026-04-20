@@ -62,6 +62,19 @@ export interface UpgradeEngineOptions {
   jsonOutput: boolean;
   ignore: Set<string>;
   /**
+   * When set, only packages whose `name` is in this set are candidates for upgrade. Every other
+   * scanned package is treated as if it were in `ignore`. Used by `--security-only` to restrict
+   * the plan to audited (vulnerable) packages. `undefined` disables the restriction entirely.
+   */
+  restrictToNames?: Set<string>;
+  /**
+   * Optional policy (from `.dep-up-surgeon.policy.{yaml,json}`). Applied during target
+   * resolution: freeze entries filter out packages upfront (usually handled at the CLI level
+   * by contributing to `ignore`), maxVersion / allowMajorAfter filter the candidate list
+   * before the fallback walker runs.
+   */
+  policy?: import('../config/policy.js').Policy;
+  /**
    * `major-lines` (default): after `@latest` fails, try one best version per **major**
    * (fewer installs; good when whole majors flip e.g. ESM-only).
    * `minor-lines`: one best version per **(major.minor)** (finer steps).
@@ -262,7 +275,8 @@ type FailureKind =
   | 'peer'
   | 'validation' // generic, kept for backwards compat
   | 'validation-script' // build/test script crashed independently of npm install
-  | 'validation-conflicts'; // npm install logged structured peer/version conflicts post-success
+  | 'validation-conflicts' // npm install logged structured peer/version conflicts post-success
+  | 'policy'; // .dep-up-surgeon.policy.{yaml,json} refused every candidate version
 
 interface AttemptResult {
   ok: boolean;
@@ -665,6 +679,52 @@ async function upgradeWithReleaseLineFallbacks(
     }
   }
 
+  // Apply policy before the fallback walker so we never install a version the user
+  // explicitly blocked. Keeping the candidates in their original order preserves the
+  // "try latest first, then walk down" behavior the user expects; we just drop entries.
+  if (opts.policy) {
+    const { evaluatePolicy } = await import('../config/policy.js');
+    const decision = evaluatePolicy(opts.policy, scanned.name);
+    if (decision.frozen) {
+      if (!jsonOutput) {
+        log.dim(`policy: ${scanned.name} is frozen — skipping`);
+      }
+      return {
+        result: { ok: false, kind: 'policy', message: decision.reason ?? 'frozen by policy' },
+        chosenVersion: null,
+        usedFallback: false,
+        lastAttemptedVersion: registryLatest,
+      };
+    }
+    const beforeCount = candidates.length;
+    candidates = candidates.filter((v) => {
+      if (!semver.valid(v)) return true; // defensive: keep dist-tag or whatever
+      if (decision.maxRange && !semver.satisfies(v, decision.maxRange)) return false;
+      if (decision.blockedMajorUntil) {
+        const currentClean = semver.coerce(currentSemver)?.version;
+        if (currentClean && semver.major(v) > semver.major(currentClean)) return false;
+      }
+      return true;
+    });
+    if (candidates.length === 0) {
+      if (!jsonOutput) {
+        log.warn(
+          `policy: no candidate versions remain for ${scanned.name} after applying ${decision.reason ?? 'rules'}`,
+        );
+      }
+      return {
+        result: {
+          ok: false,
+          kind: 'policy',
+          message: `policy filtered out all ${beforeCount} candidate version(s): ${decision.reason ?? 'see .dep-up-surgeon.policy'}`,
+        },
+        chosenVersion: null,
+        usedFallback: false,
+        lastAttemptedVersion: registryLatest,
+      };
+    }
+  }
+
   if (candidates.length === 0) {
     return {
       result: { ok: false, kind: 'install', message: 'no suitable version candidates' },
@@ -747,6 +807,8 @@ function failureReason(kind: FailureKind): FailureReason {
       return 'validation-script';
     case 'validation-conflicts':
       return 'validation-conflicts';
+    case 'policy':
+      return 'policy';
     default:
       return 'install';
   }
@@ -922,6 +984,22 @@ async function runSinglePackageUpgrade(
     await fireUpgradeApplied(opts, [row], cwd, undefined);
   } else {
     const kind = result.kind ?? 'install';
+    // Policy refusal is a deliberate choice, not a failure — record it as a skip so retry-failed
+    // doesn't loop and so summary tables show it under "ignored" instead of "failed".
+    if (kind === 'policy') {
+      addUpgrade(report, {
+        name: scanned.name,
+        success: true,
+        skipped: true,
+        from: cur.version,
+        reason: 'policy',
+        detail: result.message,
+      });
+      if (!jsonOutput) {
+        log.dim(`policy-skipped: ${scanned.name} — ${result.message ?? 'refused by policy'}`);
+      }
+      return;
+    }
     const classified = result.classified ?? classifyInstallOutput(result.installOutput, opts);
     pushParsedConflicts(report, classified);
     addFailure(report, {
@@ -1251,12 +1329,37 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
 
   const packages = await scanProject(cwd);
 
+  const restrictToNames = opts.restrictToNames;
+  const policyFreezeWildcards = (opts.policy?.freeze ?? []).filter((f) => f.pattern.includes('*'));
   for (const scanned of packages) {
     if (ignore.has(scanned.name)) {
       report.ignored.push(scanned.name);
       if (!jsonOutput) {
         log.dim(`Skipping ignored package: ${scanned.name}`);
       }
+      continue;
+    }
+    // Expand wildcard freeze patterns (e.g. `@types/*`) against the scanned names. Literal
+    // patterns have already been absorbed into `ignore` at the CLI level.
+    if (policyFreezeWildcards.length > 0) {
+      const { matchPattern } = await import('../config/policy.js');
+      const match = policyFreezeWildcards.find((f) => matchPattern(f.pattern, scanned.name));
+      if (match) {
+        ignore.add(scanned.name);
+        report.ignored.push(scanned.name);
+        if (!jsonOutput) {
+          const why = match.reason ? ` — ${match.reason}` : '';
+          log.dim(`policy-frozen: ${scanned.name} (matches ${match.pattern})${why}`);
+        }
+        continue;
+      }
+    }
+    // --security-only: every non-audited package is treated as ignored. We also push the name
+    // into `ignore` so downstream code (group planner, batch execution) skips it uniformly
+    // without having to learn about the restriction set.
+    if (restrictToNames && !restrictToNames.has(scanned.name)) {
+      ignore.add(scanned.name);
+      report.ignored.push(scanned.name);
     }
   }
 

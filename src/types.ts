@@ -30,6 +30,7 @@ export type FailureReason =
   | 'validation-conflicts'
   | 'peer'
   | 'install'
+  | 'policy'
   | 'skipped';
 
 /**
@@ -87,6 +88,45 @@ export interface UpgradeRecord {
    * no workspace traversal was performed.
    */
   workspace?: string;
+  /**
+   * Optional changelog excerpt for the `from → to` transition, populated when `--changelog` is
+   * active (default when `--git-commit` or `--summary` is set). Sourced from GitHub Releases
+   * when we can resolve the repo URL from the published manifest, otherwise from `CHANGELOG.md`
+   * extracted from the package tarball. Never present when the fetch failed / was disabled.
+   */
+  changelog?: {
+    source: 'github-release' | 'changelog.md';
+    url?: string;
+    body: string;
+  };
+  /**
+   * Optional security metadata attached by `--security-only` mode. When set, this upgrade was
+   * chosen because the installed version has a known vulnerability per `<manager> audit`.
+   */
+  security?: {
+    severity: 'low' | 'moderate' | 'high' | 'critical';
+    /** Whichever of `CVE-...` / `GHSA-...` / advisory URL the manager returned. */
+    ids: string[];
+    /** First non-empty advisory URL we could find (GitHub Advisory or npm advisory). */
+    url?: string;
+    /** Semver range of versions known to be vulnerable (e.g. `"<1.2.3"`). */
+    vulnerableRange?: string;
+    /** First safe version per the audit data (may differ from the registry `latest`). */
+    recommendedVersion?: string;
+    /** Short human-readable title (usually the advisory's own title). */
+    title?: string;
+  };
+  /**
+   * Optional "blast radius" information — a best-effort list of project source files that
+   * import this package directly. Populated by `src/utils/blastRadius.ts` when `--blast-radius`
+   * (the default when `--summary` is active) is on. `files` is the first N paths found and
+   * `total` counts every match even beyond that cap.
+   */
+  blastRadius?: {
+    total: number;
+    truncated: boolean;
+    files: string[];
+  };
 }
 
 export interface ConflictEntry {
@@ -207,6 +247,38 @@ export interface FinalReport {
    * config file disagrees with the CLI flag).
    */
   gitCommitMode?: 'per-success' | 'per-target' | 'all';
+  /**
+   * Summary of which policy rules fired during this run. Populated when a
+   * `.dep-up-surgeon.policy.{yaml,json}` file is present, regardless of whether any rule
+   * actually matched. Empty arrays are OK and mean the file was valid but didn't apply.
+   */
+  policy?: PolicyReport;
+}
+
+export interface PolicyReport {
+  /** Basename of the loaded file (e.g. `.dep-up-surgeon.policy.yaml`). Absent when no file. */
+  sourceFile?: string;
+  /** Number of each rule kind that was loaded from the file. */
+  counts: {
+    freeze: number;
+    maxVersion: number;
+    allowMajorAfter: number;
+  };
+  /** Packages that were filtered out by `freeze` (by exact match OR wildcard). */
+  frozen: { name: string; pattern: string; reason?: string }[];
+  /** Packages whose target was capped / whose majors were blocked this run. */
+  applied: { name: string; rule: 'maxVersion' | 'allowMajorAfter'; detail: string }[];
+  /** `requireReviewers` as loaded — purely metadata for downstream PR senders. */
+  requireReviewers?: Partial<Record<'major' | 'minor' | 'patch', number>>;
+  /** `autoMerge` as loaded — purely metadata for downstream PR senders. */
+  autoMerge?: {
+    major?: boolean;
+    minor?: boolean;
+    patch?: boolean;
+    include?: string[];
+  };
+  /** Non-fatal parse warnings collected while loading the policy file. */
+  warnings: string[];
 }
 
 export interface GitCommitRecord {

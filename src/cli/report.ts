@@ -1,5 +1,11 @@
 import chalk from 'chalk';
-import type { Conflict, GitCommitRecord, ProjectInfoReport, ValidationDiagnostic } from '../types.js';
+import type {
+  Conflict,
+  GitCommitRecord,
+  PolicyReport,
+  ProjectInfoReport,
+  ValidationDiagnostic,
+} from '../types.js';
 import type { ConflictEntry, FinalReport, UpgradeRecord } from '../types.js';
 import { log } from '../utils/logger.js';
 
@@ -35,6 +41,8 @@ export interface StructuredReport {
   commits?: GitCommitRecord[];
   /** Resolved git commit grouping mode (only present when `--git-commit` was set). */
   gitCommitMode?: 'per-success' | 'per-target' | 'all';
+  /** Policy engine decisions (only present when `.dep-up-surgeon.policy.{yaml,json}` was found). */
+  policy?: PolicyReport;
 }
 
 export function buildStructuredReport(
@@ -67,6 +75,7 @@ export function buildStructuredReport(
     ...(report.concurrency && report.concurrency > 1 ? { concurrency: report.concurrency } : {}),
     ...(report.commits && report.commits.length > 0 ? { commits: report.commits } : {}),
     ...(report.gitCommitMode ? { gitCommitMode: report.gitCommitMode } : {}),
+    ...(report.policy ? { policy: report.policy } : {}),
   };
 }
 

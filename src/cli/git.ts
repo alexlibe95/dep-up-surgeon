@@ -227,6 +227,26 @@ export interface UpgradeChange {
   workspace?: string;
   /** Linked-group id when this change was part of a batch. */
   groupId?: string;
+  /**
+   * Optional changelog excerpt body (from GitHub Releases or the package tarball CHANGELOG.md).
+   * When present, formatters append it to the commit body under a clearly demarcated section so
+   * reviewers can see *why* the version moved without opening a browser tab.
+   */
+  changelog?: {
+    source: 'github-release' | 'changelog.md';
+    url?: string;
+    body: string;
+  };
+  /**
+   * Security metadata from `--security-only` audit. Surfaced in commit subjects and bodies so
+   * the merge queue / code-review tools can pivot on severity + advisory id.
+   */
+  security?: {
+    severity: 'low' | 'moderate' | 'high' | 'critical';
+    ids: string[];
+    url?: string;
+    title?: string;
+  };
 }
 
 /** Strip the leading caret/tilde/etc. for a clean "from → to" message. */
@@ -234,21 +254,101 @@ function tidyVersion(v: string): string {
   return v.trim();
 }
 
+/**
+ * Render a changelog-excerpt block for the commit body. Returns an empty string when the change
+ * has no attached excerpt. Each block is prefixed with a fenced separator so `git log -p` stays
+ * legible even when a commit carries multiple excerpts (linked groups).
+ */
+function formatChangelogBlock(change: UpgradeChange): string {
+  if (!change.changelog?.body) {
+    return '';
+  }
+  const cl = change.changelog;
+  const attribution =
+    cl.source === 'github-release'
+      ? cl.url
+        ? `source: GitHub Release (${cl.url})`
+        : 'source: GitHub Release'
+      : 'source: CHANGELOG.md';
+  return [
+    `--- ${change.name} ${tidyVersion(change.from)} → ${tidyVersion(change.to)} ---`,
+    attribution,
+    '',
+    cl.body,
+  ].join('\n');
+}
+
+/** Concatenate every available changelog block, separated by blank lines. */
+function changelogSection(changes: UpgradeChange[]): string {
+  const blocks = changes.map(formatChangelogBlock).filter(Boolean);
+  return blocks.length > 0 ? `\n\n${blocks.join('\n\n')}` : '';
+}
+
+/**
+ * Prepend a conventional-commits-ish `security` scope and severity tag when ANY change in the
+ * batch carries security metadata. Keeps the subject parseable by dashboards that group by
+ * keyword while still fitting in a normal 72-char commit subject line.
+ */
+function securitySubjectTag(changes: UpgradeChange[]): string {
+  const highest = changes.reduce<'low' | 'moderate' | 'high' | 'critical' | undefined>((acc, c) => {
+    const s = c.security?.severity;
+    if (!s) return acc;
+    if (!acc) return s;
+    const rank = { low: 1, moderate: 2, high: 3, critical: 4 } as const;
+    return rank[s] > rank[acc] ? s : acc;
+  }, undefined);
+  return highest ? `[security:${highest}] ` : '';
+}
+
+/** Render a per-change security footer (inside the commit body). */
+function securityFooter(changes: UpgradeChange[]): string {
+  const rows = changes
+    .filter((c) => c.security)
+    .map((c) => {
+      const s = c.security!;
+      const id = s.ids[0] ? ` ${s.ids[0]}` : '';
+      const title = s.title ? ` — ${s.title}` : '';
+      const url = s.url ? ` (${s.url})` : '';
+      return `- ${c.name}: ${s.severity}${id}${title}${url}`;
+    });
+  return rows.length > 0 ? `\n\nSecurity fixes:\n${rows.join('\n')}` : '';
+}
+
 export function formatPerSuccessMessage(prefix: string, changes: UpgradeChange[]): string {
+  const secTag = securitySubjectTag(changes);
   if (changes.length === 1) {
     const c = changes[0];
     const ws = c.workspace && c.workspace !== 'root' ? ` (${c.workspace})` : '';
-    return `${prefix}bump ${c.name} from ${tidyVersion(c.from)} to ${tidyVersion(c.to)}${ws}`;
+    const subject = `${prefix}${secTag}bump ${c.name} from ${tidyVersion(c.from)} to ${tidyVersion(c.to)}${ws}`;
+    return subject + securityFooter(changes) + changelogSection(changes);
   }
   // Linked group → multi-line message with each member listed.
   const head = changes[0];
   const ws = head.workspace && head.workspace !== 'root' ? ` (${head.workspace})` : '';
   const lines = [
-    `${prefix}bump ${changes.length} linked packages${ws}`,
+    `${prefix}${secTag}bump ${changes.length} linked packages${ws}`,
     '',
     ...changes.map((c) => `- ${c.name}: ${tidyVersion(c.from)} → ${tidyVersion(c.to)}`),
   ];
-  return lines.join('\n');
+  return lines.join('\n') + securityFooter(changes) + changelogSection(changes);
+}
+
+/**
+ * Compact one-line changelog reference for per-target / all-in-one commit modes where embedding
+ * full release notes per package would balloon the message. We surface the best-known URL when
+ * we have one, otherwise a short `(CHANGELOG.md)` marker.
+ */
+function compactChangelogMark(change: UpgradeChange): string {
+  if (!change.changelog?.body) {
+    return '';
+  }
+  if (change.changelog.source === 'github-release' && change.changelog.url) {
+    return `  (release notes: ${change.changelog.url})`;
+  }
+  if (change.changelog.source === 'github-release') {
+    return '  (see GitHub release)';
+  }
+  return '  (see CHANGELOG.md)';
 }
 
 export function formatPerTargetMessage(
@@ -259,19 +359,23 @@ export function formatPerTargetMessage(
   if (changes.length === 0) {
     return `${prefix}no changes for ${workspace}`;
   }
+  const secTag = securitySubjectTag(changes);
   const wsLabel = workspace === 'root' ? '' : ` in ${workspace}`;
   const lines = [
-    `${prefix}${changes.length} upgrade${changes.length === 1 ? '' : 's'}${wsLabel}`,
+    `${prefix}${secTag}${changes.length} upgrade${changes.length === 1 ? '' : 's'}${wsLabel}`,
     '',
-    ...changes.map((c) => `- ${c.name}: ${tidyVersion(c.from)} → ${tidyVersion(c.to)}`),
+    ...changes.map(
+      (c) => `- ${c.name}: ${tidyVersion(c.from)} → ${tidyVersion(c.to)}${compactChangelogMark(c)}`,
+    ),
   ];
-  return lines.join('\n');
+  return lines.join('\n') + securityFooter(changes);
 }
 
 export function formatAllInOneMessage(prefix: string, changes: UpgradeChange[]): string {
   if (changes.length === 0) {
     return `${prefix}no upgrades`;
   }
+  const secTag = securitySubjectTag(changes);
   const targets = new Map<string, UpgradeChange[]>();
   for (const c of changes) {
     const key = c.workspace ?? 'root';
@@ -282,15 +386,15 @@ export function formatAllInOneMessage(prefix: string, changes: UpgradeChange[]):
   const targetCount = targets.size;
   const head =
     targetCount === 1
-      ? `${prefix}${changes.length} upgrade${changes.length === 1 ? '' : 's'}`
-      : `${prefix}${changes.length} upgrades across ${targetCount} targets`;
+      ? `${prefix}${secTag}${changes.length} upgrade${changes.length === 1 ? '' : 's'}`
+      : `${prefix}${secTag}${changes.length} upgrades across ${targetCount} targets`;
   const lines: string[] = [head, ''];
   for (const [ws, list] of targets) {
     if (targetCount > 1) {
       lines.push(`[${ws}]`);
     }
     for (const c of list) {
-      lines.push(`- ${c.name}: ${tidyVersion(c.from)} → ${tidyVersion(c.to)}`);
+      lines.push(`- ${c.name}: ${tidyVersion(c.from)} → ${tidyVersion(c.to)}${compactChangelogMark(c)}`);
     }
     if (targetCount > 1) {
       lines.push('');
@@ -300,5 +404,5 @@ export function formatAllInOneMessage(prefix: string, changes: UpgradeChange[]):
   while (lines.length > 0 && lines[lines.length - 1] === '') {
     lines.pop();
   }
-  return lines.join('\n');
+  return lines.join('\n') + securityFooter(changes);
 }

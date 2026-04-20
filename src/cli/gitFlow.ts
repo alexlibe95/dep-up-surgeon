@@ -24,6 +24,12 @@ import type { GitCommitRecord } from '../types.js';
 import type { UpgradeAppliedEvent } from '../core/upgrader.js';
 import { log } from '../utils/logger.js';
 import {
+  createChangelogCache,
+  fetchChangelog,
+  type ChangelogCache,
+  type ChangelogFetchers,
+} from '../utils/changelog.js';
+import {
   formatAllInOneMessage,
   formatPerSuccessMessage,
   formatPerTargetMessage,
@@ -43,6 +49,31 @@ export interface GitFlowConfig {
   sign: boolean;
   allowDirty: boolean;
   branch?: string;
+  /**
+   * When true, the flow fetches a changelog excerpt for every successful upgrade and appends it
+   * to the commit body (per-success mode) or a one-line link (per-target / all modes). Fetching
+   * is best-effort — missing / rate-limited changelogs are silently dropped and never abort the
+   * upgrade or the commit. Off by default only when the user passes `--no-changelog`.
+   */
+  includeChangelog?: boolean;
+  /** Injection point for tests. Bypasses the real GitHub + pacote calls. */
+  changelogFetchers?: ChangelogFetchers;
+  /** Explicit GitHub token (otherwise read from `GITHUB_TOKEN` / `GH_TOKEN`). */
+  githubToken?: string;
+  /**
+   * Map of package-name → `SecurityAdvisory` from the `--security-only` pre-flight audit.
+   * When a change matches an advisory, gitFlow stamps it onto the `UpgradeChange.security`
+   * field so the commit subject gets the `[security:<sev>]` tag + the body lists the CVE.
+   */
+  securityAdvisories?: Map<
+    string,
+    {
+      severity: 'low' | 'moderate' | 'high' | 'critical';
+      ids: string[];
+      url?: string;
+      title?: string;
+    }
+  >;
 }
 
 export interface GitFlowController {
@@ -128,6 +159,50 @@ export async function createGitFlow(
   const prefix = config.prefix;
   const sign = config.sign;
   const mode = config.mode;
+  const includeChangelog = config.includeChangelog ?? false;
+  const changelogCache: ChangelogCache | undefined = includeChangelog
+    ? createChangelogCache()
+    : undefined;
+
+  /**
+   * Enrich an `UpgradeChange` with a changelog excerpt. Best-effort: any failure is swallowed
+   * and returns the change unchanged. We only try when we have a concrete new version (`to`)
+   * that looks like real semver — caret/tilde ranges and `workspace:*` style aren't useful to
+   * the release-notes fetcher.
+   */
+  const attachChangelog = async (c: UpgradeChange): Promise<UpgradeChange> => {
+    if (!includeChangelog || !changelogCache) {
+      return c;
+    }
+    const clean = c.to.trim().replace(/^[\^~=]/, '');
+    // Cheapest possible gate: require at least major.minor.patch digits before attempting.
+    if (!/^\d+\.\d+\.\d+/.test(clean)) {
+      return c;
+    }
+    try {
+      const excerpt = await fetchChangelog({
+        packageName: c.name,
+        toVersion: clean,
+        fromVersion: c.from,
+        cache: changelogCache,
+        fetchers: config.changelogFetchers,
+        githubToken: config.githubToken,
+      });
+      if (!excerpt) {
+        return c;
+      }
+      return {
+        ...c,
+        changelog: {
+          source: excerpt.source,
+          url: excerpt.url,
+          body: excerpt.body,
+        },
+      };
+    } catch {
+      return c;
+    }
+  };
 
   // Per-workspace buffer of changes that have been applied but not yet committed. Keys are
   // workspace labels ('root' or member name). Used by per-target (flushed each target) and
@@ -191,13 +266,32 @@ export async function createGitFlow(
 
   const onUpgradeApplied = async (ev: UpgradeAppliedEvent): Promise<void> => {
     const ws = ev.workspace ?? 'root';
-    const changes: UpgradeChange[] = ev.records.map((r) => ({
-      name: r.name,
-      from: r.from ?? '?',
-      to: r.to ?? '?',
-      workspace: ws,
-      groupId: ev.groupId,
-    }));
+    const baseChanges: UpgradeChange[] = ev.records.map((r) => {
+      const base: UpgradeChange = {
+        name: r.name,
+        from: r.from ?? '?',
+        to: r.to ?? '?',
+        workspace: ws,
+        groupId: ev.groupId,
+      };
+      // Prefer the advisory attached to the record (populated AFTER the flow in post-run
+      // enrichment), else fall back to the map injected via GitFlowConfig (populated BEFORE
+      // the flow by the CLI's `--security-only` path, so per-success commits have it too).
+      const adv = r.security ?? config.securityAdvisories?.get(r.name);
+      if (adv) {
+        base.security = {
+          severity: adv.severity,
+          ids: adv.ids,
+          url: adv.url,
+          title: adv.title,
+        };
+      }
+      return base;
+    });
+    // Fetch changelogs in parallel (each call is independent; the cache makes repeats free).
+    const changes = includeChangelog
+      ? await Promise.all(baseChanges.map(attachChangelog))
+      : baseChanges;
 
     if (mode === 'per-success') {
       const message = formatPerSuccessMessage(prefix, changes);

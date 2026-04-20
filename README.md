@@ -93,6 +93,10 @@ dep-up-surgeon [options]
 | `--git-branch <name>` | Create + checkout this branch before any commits. If the branch already exists, switches to it. Pairs nicely with `--ci` for PR-bot workflows (e.g. `--git-branch "deps/auto-$(date +%Y-%m-%d)"`). |
 | `--git-sign` | Pass `--gpg-sign` to every commit. Requires a signing key configured in git (`user.signingkey` + `gpg.format`). Failed signatures are recorded as failed commits in the JSON report rather than aborting the run. |
 | `--git-allow-dirty` | Allow `--git-commit` to run on a dirty working tree. We still only `git add` files we touched, so your WIP isn't swept up — but if you also `git add` your own files manually, they'll land in dep-up-surgeon's commits. |
+| `--changelog` / `--no-changelog` | Fetch the bumped package's release notes (GitHub Releases first, then its published `CHANGELOG.md`) and include them in commit bodies + `--summary`. **Default ON** when `--git-commit` or `--summary` is active. Network failures are non-fatal — missing changelogs are silently skipped. See **Changelog excerpts** below. |
+| `--security-only` | Run `npm audit` (or `pnpm`/`yarn` equivalent) first, then upgrade **only** the packages with open advisories. Every successful bump carries the advisory severity + ID into its commit subject (`[security:high]`) and into the summary's **Security fixes** table. Pairs well with `--git-commit-mode per-success` to produce one PR per CVE. See **Security-first mode** below. |
+| `--min-severity <level>` | Minimum advisory severity to consider under `--security-only`: `low` (default), `moderate`, `high`, or `critical`. Lower-severity advisories are filtered out before the upgrade plan is built. |
+| `--blast-radius` / `--no-blast-radius` | Scan project source files to list which files actually `import`/`require` each upgraded package, and surface the list in `--json` + `--summary`. **Default ON** when `--summary` is active. See **Blast radius** below. |
 
 Exit code `1` when any upgrade could not be kept (unless `--force`). The CLI also exits `1` when the **pre-flight** validator (run on the unchanged tree) fails — see **Pre-flight check** below. Fatal errors also exit `1`.
 
@@ -208,6 +212,74 @@ npx dep-up-surgeon --workspaces --ci \
   ]
 }
 ```
+
+### Changelog excerpts
+
+Every successful upgrade can be annotated with the package's release notes so reviewers don't have to open five GitHub tabs per PR. Enabled by default when `--git-commit` or `--summary` is set; disable with `--no-changelog`.
+
+- **Source.** First preference is the **GitHub Releases API** (`GET /repos/:owner/:repo/releases/tags/:tag`), resolved from the package's `repository` field in its `package.json`. Fallback is the `CHANGELOG.md` extracted from the published tarball via `pacote.extract` — the matching version section is parsed out with a Markdown-aware heading scanner (handles `## 1.2.3`, `## [1.2.3] - 2024-...`, `## v1.2.3`, etc.).
+- **Where it shows up.** In `--git-commit-mode per-success`, the excerpt is embedded directly in the commit body. In `per-target` / `all` modes it collapses to a compact `See: <release-url>` footer so the commit doesn't balloon. `--summary md` / `--summary html` renders each excerpt in a collapsible `<details>` block — clean in PR bodies, compact in GitHub's Job Summary.
+- **Caching & resilience.** A run-local cache deduplicates fetches across workspaces. Network errors, missing tags, private repos, and malformed `CHANGELOG.md` files are all silently skipped — a missing excerpt never fails a commit.
+- **GitHub auth.** Anonymous GitHub API requests are rate-limited to 60/hour. Set `GITHUB_TOKEN` (or `GH_TOKEN`) in the environment to lift that to 5,000/hour — `dep-up-surgeon` uses it automatically for changelog fetches and nothing else.
+
+### Security-first mode
+
+`--security-only` flips the tool from "bump everything safely" to "bump only packages with known CVEs". Competes directly with Dependabot's security-alert surface, but runs locally and respects your validator / policy / link groups.
+
+1. Runs `npm audit --json` (or `pnpm audit --json` / `yarn audit` depending on the detected manager) **before** the upgrade plan is built.
+2. Filters the audit to advisories at or above `--min-severity <low|moderate|high|critical>`.
+3. Builds a `restrictToNames` set from the vulnerable package names and passes it to the engine — every other dependency gets added to the ignore list automatically (visible as `reason: "ignored"` in the report).
+4. Attaches the severity + advisory ID + title to every upgraded record's `security` field, which the CLI then propagates into:
+   - **Commit subjects**: `deps: [security:high] bump axios from 1.6.0 to 1.7.2`
+   - **Commit bodies**: full advisory ID, URL, and title
+   - **`--summary`**: a prominent **Security fixes** table above the normal upgraded table
+   - **`--json`**: `upgraded[].security = { severity, ids, url, title, vulnerableRange, recommendedVersion }`
+
+```bash
+# Only critical + high; one commit per CVE on a dedicated branch.
+npx dep-up-surgeon --workspaces --security-only --min-severity high \
+  --git-commit --git-commit-mode per-success \
+  --git-branch "deps/security-$(date +%Y-%m-%d)"
+```
+
+### Policy engine (policy-as-code)
+
+Drop a `.dep-up-surgeon.policy.yaml` (or `.json`) in the repo root to encode upgrade rules that survive across runs and humans. Loaded automatically on startup; violations are reported per-package and the engine skips the offending bumps instead of failing.
+
+```yaml
+# .dep-up-surgeon.policy.yaml
+freeze:
+  - pattern: react               # never touch it
+    reason: "React 18 pinned until Q3 refactor"
+  - pattern: "@types/*"          # wildcard — freezes every @types/* scope
+maxVersion:
+  - pattern: next
+    range: "<=14"                # refuse anything outside this semver range
+allowMajorAfter:
+  - pattern: eslint
+    date: "2026-06-01"           # patch/minor OK now, majors blocked until the date
+requireReviewers: 2              # metadata: surfaced in --summary / --json for your bot to consume
+autoMerge: false                 # metadata: ditto
+```
+
+**How rules interact**
+
+- **`freeze`** always wins. Exact names go straight into the ignore list; wildcards are matched against the scanned deps inside the engine so rules like `@types/*` don't have to be unrolled by hand. Freezes produce a `reason: "policy"` skip record with the originating pattern.
+- **`maxVersion`** caps the candidate list. If no candidate satisfies the range, the package is skipped with `reason: "policy"` — it won't degrade to a no-op install.
+- **`allowMajorAfter`** blocks **cross-major** bumps until the specified date (checked against `Date.now()`), demoting the candidate to the newest in-major version. Patch/minor still flow through normally.
+- **`requireReviewers`** and **`autoMerge`** are **metadata only** — attached to the `policy` block of `--json` + `--summary` for downstream automation (GitHub Actions PR-opener, the SaaS bot, etc.) to consume.
+
+Every applied rule appears in the **Policy** section of `--summary` and under `policy.applied` / `policy.frozen` / `policy.warnings` in `--json`, so audits show exactly which rule blocked which package.
+
+### Blast radius
+
+Before handing the PR to a reviewer, `dep-up-surgeon` can list **which of your own source files actually import each upgraded package**. Surfaced automatically under `--summary`; attach it to `--json` too with `--blast-radius`.
+
+- **Scans**: `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.mts`, `.cts`, `.vue`, `.svelte`, `.astro`.
+- **Skips**: `node_modules`, `dist`, `build`, `coverage`, `.git`, `.next`, `.turbo`, `.vercel`, `.cache`, `.parcel-cache`, `out`, `.output`.
+- **Detects**: ES imports (`import x from '<pkg>'`), re-exports (`export … from '<pkg>'`), CommonJS `require('<pkg>')`, dynamic `import('<pkg>')`, and subpath imports (`from '<pkg>/sub'` still counts as a hit on `<pkg>`). Word-boundary safe — looking for `react` does not falsely match `react-dom`; looking for `@types/node` does not match `@types/node-ipc`.
+- **Output**: per-package `{ total, truncated, files[] }` entries in `upgraded[].blastRadius`, plus a collapsible per-package list in the Markdown / HTML summary. Caps at 20 file paths per package by default; `total` keeps counting past the cap so the summary can honestly say "used in 134 files".
+- **Cost**: a single pass over the tree, at most 1 MB read per file, parallel I/O (default concurrency 8). Failures are non-fatal — a broken symlink never aborts the run. Turn it off in huge monorepos with `--no-blast-radius`.
 
 ### Workspaces & package managers
 
@@ -387,8 +459,10 @@ The compiled entry is `dist/cli.js` (see `"bin"` in `package.json`).
 
 ## Future work (tracked in code)
 
-- Auto-open a PR after `--git-commit --git-branch` (today the user / CI step runs `gh pr create` themselves)  
-- Per-commit changelog excerpt in the commit body (pull `CHANGELOG.md` / GitHub Releases for the bumped version)  
-- Deeper automatic resolution using peer-range intersection across a batch  
-- Renovate-style scheduling helpers (cron / day-of-week filters, grouping rules)  
-- True parallel installs in monorepos that don't share a root lockfile (e.g. nohoist setups), going beyond today's parallel scan + serial install model  
+- Auto-open a PR after `--git-commit --git-branch` (today the user / CI step runs `gh pr create` themselves)
+- Deeper automatic resolution using peer-range intersection across a batch
+- Renovate-style scheduling helpers (cron / day-of-week filters, grouping rules)
+- True parallel installs in monorepos that don't share a root lockfile (e.g. nohoist setups), going beyond today's parallel scan + serial install model
+- AI-assisted failure explanation: feed `install.lastLines` + `validation.lastLines` to an LLM and attach a one-sentence "why this broke" note to failed records
+- Integration catalog: webhooks into Slack / Discord / Linear / Jira so the bot can ping a channel when a security bump lands, not just a GitHub PR
+

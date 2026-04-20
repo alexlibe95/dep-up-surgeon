@@ -16,7 +16,13 @@ declare module 'pacote' {
   export function manifest(
     spec: string,
     opts?: { fullMetadata?: boolean },
-  ): Promise<Manifest>;
+  ): Promise<Manifest & { repository?: unknown; homepage?: unknown }>;
 
   export function packument(spec: string, opts?: Record<string, unknown>): Promise<Packument>;
+
+  export function extract(
+    spec: string,
+    dest: string,
+    opts?: Record<string, unknown>,
+  ): Promise<{ from: string; resolved: string; integrity?: string }>;
 }
