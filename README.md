@@ -19,26 +19,7 @@
 
 **Website:** [https://dep-up-surgeon.netlify.app/](https://dep-up-surgeon.netlify.app/)
 
-**Quick links:** [Website](https://dep-up-surgeon.netlify.app/) · [npm package](https://www.npmjs.com/package/dep-up-surgeon) · [GitHub repository](https://github.com/alexlibe95/dep-up-surgeon) · [Issues](https://github.com/alexlibe95/dep-up-surgeon/issues) · [Pull requests](https://github.com/alexlibe95/dep-up-surgeon/pulls) · [Socket (supply chain & maintenance)](https://socket.dev/npm/package/dep-up-surgeon) · [deps.dev (Open Source Insights)](https://deps.dev/npm/dep-up-surgeon) · [Libraries.io](https://libraries.io/npm/dep-up-surgeon) · [npms score](https://npms.io/search?q=dep-up-surgeon) · [Bundlephobia](https://bundlephobia.com/package/dep-up-surgeon) · [OpenSSF Scorecard (repo)](https://scorecard.dev/viewer/?uri=github.com/alexlibe95/dep-up-surgeon)
-
 Production-oriented CLI that upgrades **npm** dependencies with **`npm install` + validation** after each change, and **rolls back** on failure. It is **framework-agnostic**: grouping and conflict handling come from **registry metadata** and **parsed npm output**, not hardcoded stacks (React, Angular, etc.).
-
-### Package listings and security tools
-
-| Where | What you get |
-|--------|----------------|
-| **[Website](https://dep-up-surgeon.netlify.app/)** | Project landing page: overview, live demo/session log, feature highlights, install commands, and flag reference. |
-| **[npm](https://www.npmjs.com/package/dep-up-surgeon)** | Current version, **readme**, **dependencies**, dist tags, publish time, tarball **integrity** (`sha512`), download counts, maintainers, and npm’s own **Security** / advisory context for the ecosystem. |
-| **[GitHub](https://github.com/alexlibe95/dep-up-surgeon)** | **Stars**, **forks**, **issues**, **pull requests**, **commits**, **contributors**, source tree, and (if enabled) **Dependabot** / **Security** advisories for the repo. |
-| **[Socket](https://socket.dev/npm/package/dep-up-surgeon)** | Supply-chain style view: **maintenance**, **license**, **dependencies**, and related signals npm users often open in dedicated security UIs. |
-| **[deps.dev](https://deps.dev/npm/dep-up-surgeon)** | Google **Open Source Insights**: dependency graph, versions, licenses, and cross-ecosystem metadata. |
-| **[Libraries.io](https://libraries.io/npm/dep-up-surgeon)** | Release history, **reverse dependencies** (who depends on this package), and ecosystem metadata. |
-| **[npms](https://npms.io/search?q=dep-up-surgeon)** | Search **quality score** (maintenance, popularity, dependencies) used by many npm search front-ends. |
-| **[OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/alexlibe95/dep-up-surgeon)** | Automated **security health** checks for the GitHub repository (when the project is indexed). |
-
-**Note:** Badges above pull live data from **npm**, **GitHub**, and **Libraries.io**; numbers change as the package and repo evolve. For **your** app’s risk after installing any tool, always run **`npm audit`** (and your own policy) in the project directory.
-
-With **`--link-groups auto`** (default) it **clusters** upgrades using a **dependency graph** built from the npm registry (see below) plus optional **`.dep-up-surgeonrc`** `linkedGroups`. Use **`--link-groups none`** for strict one-package-at-a-time behavior.
 
 ## Install
 
@@ -97,8 +78,10 @@ dep-up-surgeon [options]
 | `--security-only` | Run `npm audit` (or `pnpm`/`yarn` equivalent) first, then upgrade **only** the packages with open advisories. Every successful bump carries the advisory severity + ID into its commit subject (`[security:high]`) and into the summary's **Security fixes** table. Pairs well with `--git-commit-mode per-success` to produce one PR per CVE. See **Security-first mode** below. |
 | `--min-severity <level>` | Minimum advisory severity to consider under `--security-only`: `low` (default), `moderate`, `high`, or `critical`. Lower-severity advisories are filtered out before the upgrade plan is built. |
 | `--blast-radius` / `--no-blast-radius` | Scan project source files to list which files actually `import`/`require` each upgraded package, and surface the list in `--json` + `--summary`. **Default ON** when `--summary` is active. See **Blast radius** below. |
+| `--resolve-peers` / `--no-resolve-peers` | When a linked-group bump (e.g. `react` + `react-dom` + `@types/react`) fails with a peer-dependency conflict, compute the intersection of peer ranges across the registry packument and retry with a satisfiable version tuple (members may land below `latest`). **Default ON**. See **Peer-range intersection resolver** below. |
 | `--apply-overrides` | After the main upgrade loop, fix **transitive** CVEs that no direct bump could reach by writing a package-manager override (`overrides` for npm, `pnpm.overrides` for pnpm, `resolutions` for yarn) pinning each vulnerable transitive to its audit-recommended safe version. Runs install + validator after each pin and rolls back automatically when the validator fails. Requires `--security-only`. See **Transitive overrides** below. |
 | `--override-force` | Used with `--apply-overrides`. Overwrite an **existing** override entry whose value conflicts with the audit-recommended version. By default we refuse to clobber user-managed pins and record `conflict` in the report. |
+| `--fix-lockfile` | After the main upgrade loop, run the package manager's native dedupe command (`npm dedupe` / `pnpm dedupe` / `yarn dedupe`) to collapse redundant transitive copies **without touching `package.json`**, and flag transitives more than a minor or a full major behind registry `latest`. Lockfile is backed up before dedupe and restored if dedupe OR the post-dedupe validator fails. Yarn classic (v1) has no dedupe subcommand — recorded as `skipped: "unsupported"`. See **Lockfile fix** below. |
 | `--open-pr` | After `--git-commit --git-branch` pushes the branch, open a GitHub PR with the `--summary` markdown as the body (falls back to a deterministic minimal body). Uses the `gh` CLI (must be installed + authenticated); never fatal — a missing binary, auth failure, or push rejection is recorded as `pullRequest.error` in the JSON report without aborting the run. See **Auto-opening a PR** below. |
 | `--open-pr-title <title>` | Override the PR title. Default: derived from the upgrade counts, e.g. `deps: [breaking+security] bump 3 packages`. |
 | `--open-pr-draft` | Open the PR as a draft. Recommended with `--force` or on Fridays so merge-queue bots don't auto-land it. |
@@ -149,6 +132,8 @@ Pass `--summary md` (or `--summary html`) to render a human-friendly report alon
 - **Default**: `./dep-up-surgeon-summary.<md|html>`.
 
 The summary contains: counts (upgraded / failed / skipped), detected project info, target list, an **Upgraded** table (`Package | Workspace | From | To | Notes`), a **Failed** table (`Package | Workspace | Reason | Attempted | Detail`), pre-flight status when it aborted, and the ignored list. HTML output escapes all dynamic content. Designed to be ~40 lines of code on the producer side and easy to embed in PR comments / dashboards.
+
+The **HTML output** is self-contained and styled: an inline `<style>` block scoped to `.dep-up-surgeon-report` gives severity chips (critical / high / moderate / low), breaking / peer-resolved / fallback / forced badges on the **Upgraded** table, clickable advisory IDs linking to `github.com/advisories/...`, and responsive tables. No external CSS or web-font requests — the file opens cleanly in any browser, and when the style tag is stripped (GitHub step-summary sanitizer) the tables still render as plain HTML. Release notes and **Blast radius** per-package blocks are folded inside `<details>` elements so the summary stays scannable.
 
 ### CI / bot mode (`--ci`)
 
@@ -300,6 +285,34 @@ Whenever a changelog excerpt is fetched, `dep-up-surgeon` scans it for breaking-
   - **`--json`** → `upgraded[].changelog.breaking = { hasBreaking, matchedLines[], reasons[] }` (only present when the scan matched).
 - **Never fatal, never noisy**: absence of a changelog means no scan, which means no flag. The scan caps matches at 10 per package and dedupes identical lines so verbose changelogs don't drown out the signal.
 
+### Peer-range intersection resolver
+
+Linked-group bumps (e.g. `react` + `react-dom` + `@types/react`, or the Jest / Testing-Library / Vitest families) frequently fail because one member's **latest** demands a peer version another member can't yet satisfy. Without help, the whole batch rolls back and the user has to figure out the right tuple by hand.
+
+`--resolve-peers` (default ON) turns this into an automated constraint-satisfaction problem:
+
+1. The first batch attempt runs exactly like today — every linked member goes to its registry `latest`.
+2. If the install fails with a **peer** conflict, the resolver fetches each linked package's full registry packument (cached — one call per package per run) and reads every published version's `peerDependencies` block.
+3. Each member gets a candidate domain: every version between `currentRange`'s `minVersion` and the originally-requested target, sorted newest-first, minus deprecated / pre-release versions.
+4. A **newest-first backtracking search** enumerates version tuples (variable = one package, domain = its candidate versions). For each partial assignment, every peer constraint that has become knowable is checked; peers on packages inside the linked group are checked against the chosen version, peers on packages OUTSIDE the group are checked against that package's range in the current `package.json` (via `semver.minVersion`).
+5. The **first** complete tuple to satisfy every constraint is also the least-downgrade one. The engine rewrites the batch's target versions and retries the install + validator. On success, every affected row is tagged with `resolvedPeer = { originalTarget, reason, tuplesExplored }`.
+6. If the resolver can't find a satisfiable tuple, or the retried install still fails, the batch falls back to the pre-resolver behavior (rollback + `kind: 'peer'` failure row).
+
+Guard rails that keep it safe:
+
+- **Bounded search** — capped at 400 tuples explored per batch. Past that the resolver gives up silently instead of hanging the run on pathological inputs.
+- **Optional peers** (`peerDependenciesMeta[name].optional === true`) are ignored. An unsatisfied optional peer isn't a hard conflict.
+- **Deprecated versions** never appear in the domain. We'd rather fail to find a solution than auto-suggest a known-bad version.
+- **`--force` bypasses the resolver** — the user has explicitly opted into barreling through peer conflicts.
+- **`--no-resolve-peers`** keeps the old behavior when you WANT peer failures to surface so a human resolves them instead of the tool silently nudging versions off latest.
+
+Where it shows up:
+
+- **Console output**: `upgraded: react-dom → 18.3.1 (group react-pair) [peer-resolved from 19.0.0]`.
+- **`--summary md|html`**: a dedicated **Peer-range resolutions** table (package / group / requested / installed / tuples explored) above the upgraded table, plus a `peer-resolved from <v>` badge in the upgraded row's Notes column.
+- **Commit subjects**: `[peer-resolved]` tag sits between `[breaking]` and `[security:<sev>]` (stable order). The body gets a `Peer-range resolutions (kept linked group satisfiable):` footer listing each pinned member.
+- **`--json`**: `upgraded[].resolvedPeer = { originalTarget, reason, tuplesExplored }` plus `upgraded[].requestedLatest` still reflects the pre-resolver target so downstream tools can diff them.
+
 ### Transitive overrides (`--apply-overrides`)
 
 `--security-only` by itself can only fix vulnerabilities reachable from a direct dependency. For CVEs that live in transitives (very common — `lodash@4.17.20` buried six levels deep under a toolchain package), pair `--security-only` with `--apply-overrides` and the tool will write a package-manager override to pin the vulnerable transitive to its safe version.
@@ -320,6 +333,33 @@ npx dep-up-surgeon --workspaces \
   --git-commit --git-commit-mode per-success --git-branch "deps/security-$(date +%Y-%m-%d)" \
   --summary md \
   --open-pr --open-pr-draft
+```
+
+### Lockfile fix (`--fix-lockfile`)
+
+`--fix-lockfile` improves the **lockfile's** dependency graph without touching `package.json`. It's the counterpart to `--apply-overrides`: where overrides fix vulnerable transitives, `--fix-lockfile` collapses redundant ones and surfaces the stale-but-not-vulnerable tail that a direct upgrade loop can never reach.
+
+What it does:
+
+- **Dedupe**: runs the package manager's native dedupe command — `npm dedupe --no-audit` / `pnpm dedupe` / `yarn dedupe` (berry only). These commands collapse multiple copies of the same package when semver ranges allow it.
+- **Stale-transitive scan**: for the top 250 packages in the lockfile (by installed-copy count), cross-references registry `latest` and flags any package whose highest installed version is more than one minor OR a full major behind. Trivial drift (a patch or a single minor) is filtered out — only the drifted-by-6-months cases show up.
+- **Backup + rollback**: lockfile is snapshotted before dedupe. If dedupe exits non-zero OR the post-dedupe validator fails, the snapshot is restored and the manager is re-run to reconcile `node_modules`. The worst case is the same tree you started with.
+
+Guard rails:
+
+- **Yarn classic (v1)** has no `dedupe` subcommand — recorded as `skipped: "unsupported"` and the rest of the run continues normally.
+- **No lockfile on disk** → `skipped: "no-lockfile"`. Nothing to dedupe when the install has never been run.
+- Runs **after** `--apply-overrides` so the final tree includes security pins before dedupe.
+
+Where it shows up:
+
+- **Console**: one-line summary — `--fix-lockfile: npm dedupe ... succeeded (12 packages deduped/updated, 3 stale transitives flagged)`.
+- **`--summary md` / `--summary html`**: a dedicated **Lockfile fix** section with a `merged`/`updated` diff table, a collapsible **Stale transitives** details block, and the last lines of the dedupe/validator output on failure.
+- **`--json`**: `lockfileFix: { status, manager, lockfile, command, dedupeChanges[], stale[], ... }` with the full structured diff.
+
+```bash
+# Post-security-sweep cleanup: dedupe the tree and surface stale transitives in the PR body.
+npx dep-up-surgeon --security-only --apply-overrides --fix-lockfile --summary md
 ```
 
 ### Auto-opening a PR (`--open-pr`)
@@ -521,7 +561,7 @@ The compiled entry is `dist/cli.js` (see `"bin"` in `package.json`).
 
 - GitLab / Bitbucket auto-PR providers (today `--open-pr` is GitHub-only via `gh`)
 - Nested / parent-scoped override rules beyond the flat `name → version` form (`overrides: { "foo": { ">=2 <3": "3.0.0" } }` in npm, deep pnpm selectors)
-- Deeper automatic resolution using peer-range intersection across a batch
+- Resolver sharpening: SAT-backed peer-range intersection for very large linked graphs (10+ members) where the current 400-tuple backtracking budget gives up; peer-range intersection across **non-linked** packages too (today the resolver only intervenes on linked-group failures)
 - Renovate-style scheduling helpers (cron / day-of-week filters, grouping rules)
 - True parallel installs in monorepos that don't share a root lockfile (e.g. nohoist setups), going beyond today's parallel scan + serial install model
 - AI-assisted failure explanation: feed `install.lastLines` + `validation.lastLines` to an LLM and attach a one-sentence "why this broke" note to failed records

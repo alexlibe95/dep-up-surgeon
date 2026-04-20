@@ -138,6 +138,24 @@ export interface UpgradeRecord {
     truncated: boolean;
     files: string[];
   };
+  /**
+   * Optional peer-range intersection resolver breadcrumb. Populated ONLY when a linked-group
+   * bump originally failed with a peer conflict, the resolver (`src/core/peerResolver.ts`)
+   * found a satisfiable version tuple, and the retried batch install + validation PASSED.
+   *
+   * `originalTarget` is the version the engine first tried (usually registry `latest`);
+   * `to` on the parent record holds the finally-installed version. When `originalTarget ===
+   * to` the row is not technically "downgraded" — that package just went along for the ride
+   * while another group member was nudged off latest.
+   *
+   * The field is reviewer signal only; it never changes engine control flow. Summary,
+   * commit body, and JSON all render it so humans can see why a package isn't at latest.
+   */
+  resolvedPeer?: {
+    originalTarget: string;
+    reason: string;
+    tuplesExplored: number;
+  };
 }
 
 export interface ConflictEntry {
@@ -316,6 +334,66 @@ export interface FinalReport {
     /** Human-readable error when `ok === false`. */
     error?: string;
   };
+  /**
+   * Result of the `--fix-lockfile` pass (only present when the flag was passed). See
+   * `src/cli/lockfileFix.ts` for the orchestration semantics.
+   */
+  lockfileFix?: LockfileFixReport;
+}
+
+/**
+ * Per-package diff entry emitted by `diffLockfileTrees`. `before` / `after` are the sorted
+ * (oldest → newest) lists of concrete versions installed before / after the dedupe command.
+ */
+export interface LockfileDedupeChange {
+  name: string;
+  change: 'merged' | 'updated' | 'added' | 'removed';
+  before: string[];
+  after: string[];
+}
+
+/**
+ * Per-package entry emitted by the stale-transitive scan. Only packages whose HIGHEST
+ * installed version is more than one minor OR one full major behind `latest` are included.
+ */
+export interface LockfileStaleEntry {
+  name: string;
+  installed: string[];
+  latest: string;
+  majorBehind: number;
+  minorBehind: number;
+}
+
+/**
+ * Full result of the `--fix-lockfile` pass. `status: 'skipped'` means we didn't run dedupe
+ * (e.g. no lockfile, yarn classic has no dedupe command); `status: 'failed'` means dedupe
+ * or the post-dedupe validator failed and the lockfile was restored from backup; `status:
+ * 'ok'` means dedupe ran clean and the validator was happy with the result.
+ */
+export interface LockfileFixReport {
+  status: 'ok' | 'failed' | 'skipped' | 'dry-run';
+  manager: 'npm' | 'pnpm' | 'yarn';
+  lockfile: 'package-lock.json' | 'pnpm-lock.yaml' | 'yarn.lock';
+  /** Present when `status !== 'skipped'`. */
+  command?: string;
+  /** Exit code from the dedupe command (0 for ok, non-zero for failed dedupe). */
+  exitCode?: number;
+  /** Populated when `status === 'failed'` so consumers can branch on the cause. */
+  failureKind?: 'dedupe' | 'validation';
+  /** Validator command that rejected the deduped tree (when `failureKind === 'validation'`). */
+  validatorCommand?: string;
+  /** Last N lines of the dedupe or validator output — for the `--summary` diagnostic panel. */
+  lastLines?: string;
+  /** Reason the pass was skipped. Only present when `status === 'skipped'`. */
+  skipReason?: 'no-lockfile' | 'unsupported';
+  /** Per-package diff of the lockfile's concrete versions before vs after dedupe. */
+  dedupeChanges: LockfileDedupeChange[];
+  /**
+   * Transitives whose highest installed version is well behind registry `latest`. Purely
+   * informational — this pass does NOT act on them (that's what `--security-only` +
+   * `--apply-overrides` does for the vulnerable subset).
+   */
+  stale: LockfileStaleEntry[];
 }
 
 export interface PolicyReport {

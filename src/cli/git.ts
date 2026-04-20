@@ -252,6 +252,17 @@ export interface UpgradeChange {
     url?: string;
     title?: string;
   };
+  /**
+   * Peer-range intersection breadcrumb. Present only when the engine's peer resolver nudged
+   * this row off the registry `latest` to keep a linked-group install satisfiable. Emitted
+   * as a footer + a `[peer-resolved]` subject tag so reviewers can see at a glance that the
+   * version in the commit isn't the pure "bump to latest" one.
+   */
+  resolvedPeer?: {
+    originalTarget: string;
+    reason: string;
+    tuplesExplored: number;
+  };
 }
 
 /** Strip the leading caret/tilde/etc. for a clean "from → to" message. */
@@ -337,6 +348,32 @@ function breakingFooter(changes: UpgradeChange[]): string {
   return rows.length > 0 ? `\n\nBreaking changes detected:\n${rows.join('\n')}` : '';
 }
 
+/**
+ * `[peer-resolved] ` subject tag when ANY change in the batch was downgraded by the peer-range
+ * intersection resolver. Emitted AFTER `[breaking]` and BEFORE `[security:…]` so the tags always
+ * read `[breaking] [peer-resolved] [security:critical] …` in a stable order.
+ */
+function peerResolvedSubjectTag(changes: UpgradeChange[]): string {
+  return changes.some((c) => c.resolvedPeer) ? '[peer-resolved] ' : '';
+}
+
+/**
+ * Body footer that lists every package whose installed version was downgraded from the
+ * originally requested target by the peer resolver. The explanation is intentionally terse
+ * — enough to give the reviewer the "this was intentional" signal without dumping the
+ * tuple-search diagnostics.
+ */
+function peerResolvedFooter(changes: UpgradeChange[]): string {
+  const rows = changes
+    .filter((c) => c.resolvedPeer)
+    .map((c) => {
+      const rp = c.resolvedPeer!;
+      return `- ${c.name}: requested ${tidyVersion(rp.originalTarget)}, installed ${tidyVersion(c.to)}`;
+    });
+  if (rows.length === 0) return '';
+  return `\n\nPeer-range resolutions (kept linked group satisfiable):\n${rows.join('\n')}`;
+}
+
 /** Render a per-change security footer (inside the commit body). */
 function securityFooter(changes: UpgradeChange[]): string {
   const rows = changes
@@ -353,21 +390,34 @@ function securityFooter(changes: UpgradeChange[]): string {
 
 export function formatPerSuccessMessage(prefix: string, changes: UpgradeChange[]): string {
   const brkTag = breakingSubjectTag(changes);
+  const peerTag = peerResolvedSubjectTag(changes);
   const secTag = securitySubjectTag(changes);
   if (changes.length === 1) {
     const c = changes[0];
     const ws = c.workspace && c.workspace !== 'root' ? ` (${c.workspace})` : '';
-    const subject = `${prefix}${brkTag}${secTag}bump ${c.name} from ${tidyVersion(c.from)} to ${tidyVersion(c.to)}${ws}`;
-    return subject + breakingFooter(changes) + securityFooter(changes) + changelogSection(changes);
+    const subject = `${prefix}${brkTag}${peerTag}${secTag}bump ${c.name} from ${tidyVersion(c.from)} to ${tidyVersion(c.to)}${ws}`;
+    return (
+      subject +
+      breakingFooter(changes) +
+      peerResolvedFooter(changes) +
+      securityFooter(changes) +
+      changelogSection(changes)
+    );
   }
   const head = changes[0];
   const ws = head.workspace && head.workspace !== 'root' ? ` (${head.workspace})` : '';
   const lines = [
-    `${prefix}${brkTag}${secTag}bump ${changes.length} linked packages${ws}`,
+    `${prefix}${brkTag}${peerTag}${secTag}bump ${changes.length} linked packages${ws}`,
     '',
     ...changes.map((c) => `- ${c.name}: ${tidyVersion(c.from)} → ${tidyVersion(c.to)}`),
   ];
-  return lines.join('\n') + breakingFooter(changes) + securityFooter(changes) + changelogSection(changes);
+  return (
+    lines.join('\n') +
+    breakingFooter(changes) +
+    peerResolvedFooter(changes) +
+    securityFooter(changes) +
+    changelogSection(changes)
+  );
 }
 
 /**
@@ -397,16 +447,19 @@ export function formatPerTargetMessage(
     return `${prefix}no changes for ${workspace}`;
   }
   const brkTag = breakingSubjectTag(changes);
+  const peerTag = peerResolvedSubjectTag(changes);
   const secTag = securitySubjectTag(changes);
   const wsLabel = workspace === 'root' ? '' : ` in ${workspace}`;
   const lines = [
-    `${prefix}${brkTag}${secTag}${changes.length} upgrade${changes.length === 1 ? '' : 's'}${wsLabel}`,
+    `${prefix}${brkTag}${peerTag}${secTag}${changes.length} upgrade${changes.length === 1 ? '' : 's'}${wsLabel}`,
     '',
     ...changes.map(
       (c) => `- ${c.name}: ${tidyVersion(c.from)} → ${tidyVersion(c.to)}${compactChangelogMark(c)}`,
     ),
   ];
-  return lines.join('\n') + breakingFooter(changes) + securityFooter(changes);
+  return (
+    lines.join('\n') + breakingFooter(changes) + peerResolvedFooter(changes) + securityFooter(changes)
+  );
 }
 
 export function formatAllInOneMessage(prefix: string, changes: UpgradeChange[]): string {
@@ -414,6 +467,7 @@ export function formatAllInOneMessage(prefix: string, changes: UpgradeChange[]):
     return `${prefix}no upgrades`;
   }
   const brkTag = breakingSubjectTag(changes);
+  const peerTag = peerResolvedSubjectTag(changes);
   const secTag = securitySubjectTag(changes);
   const targets = new Map<string, UpgradeChange[]>();
   for (const c of changes) {
@@ -425,8 +479,8 @@ export function formatAllInOneMessage(prefix: string, changes: UpgradeChange[]):
   const targetCount = targets.size;
   const head =
     targetCount === 1
-      ? `${prefix}${brkTag}${secTag}${changes.length} upgrade${changes.length === 1 ? '' : 's'}`
-      : `${prefix}${brkTag}${secTag}${changes.length} upgrades across ${targetCount} targets`;
+      ? `${prefix}${brkTag}${peerTag}${secTag}${changes.length} upgrade${changes.length === 1 ? '' : 's'}`
+      : `${prefix}${brkTag}${peerTag}${secTag}${changes.length} upgrades across ${targetCount} targets`;
   const lines: string[] = [head, ''];
   for (const [ws, list] of targets) {
     if (targetCount > 1) {
@@ -443,5 +497,7 @@ export function formatAllInOneMessage(prefix: string, changes: UpgradeChange[]):
   while (lines.length > 0 && lines[lines.length - 1] === '') {
     lines.pop();
   }
-  return lines.join('\n') + breakingFooter(changes) + securityFooter(changes);
+  return (
+    lines.join('\n') + breakingFooter(changes) + peerResolvedFooter(changes) + securityFooter(changes)
+  );
 }

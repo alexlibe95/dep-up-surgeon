@@ -47,6 +47,8 @@ export interface StructuredReport {
   overrides?: FinalReport['overrides'];
   /** Result of the `--open-pr` step (only present when the flag was passed). */
   pullRequest?: FinalReport['pullRequest'];
+  /** Result of the `--fix-lockfile` step (only present when the flag was passed). */
+  lockfileFix?: FinalReport['lockfileFix'];
 }
 
 export function buildStructuredReport(
@@ -82,6 +84,7 @@ export function buildStructuredReport(
     ...(report.policy ? { policy: report.policy } : {}),
     ...(report.overrides ? { overrides: report.overrides } : {}),
     ...(report.pullRequest ? { pullRequest: report.pullRequest } : {}),
+    ...(report.lockfileFix ? { lockfileFix: report.lockfileFix } : {}),
   };
 }
 

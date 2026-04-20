@@ -292,6 +292,13 @@ export async function createGitFlow(
           title: adv.title,
         };
       }
+      if (r.resolvedPeer) {
+        base.resolvedPeer = {
+          originalTarget: r.resolvedPeer.originalTarget,
+          reason: r.resolvedPeer.reason,
+          tuplesExplored: r.resolvedPeer.tuplesExplored,
+        };
+      }
       return base;
     });
     // Fetch changelogs in parallel (each call is independent; the cache makes repeats free).

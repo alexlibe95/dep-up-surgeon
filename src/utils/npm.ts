@@ -68,6 +68,64 @@ export async function fetchLatestVersion(
 }
 
 /**
+ * Fetch the full `version → peerDependencies` map for a package so the peer-range
+ * intersection resolver can enumerate candidates without a separate network round-trip per
+ * version. One `pacote.packument` call serves every probe in a run thanks to `cache.peers`.
+ *
+ * Design notes:
+ *   - Returns an EMPTY map on any error (network blip, 404, malformed packument). The resolver
+ *     treats that as "no candidate info available" and bails out gracefully — never throws.
+ *   - Deprecated versions are kept in the map but flagged; the resolver filters them out.
+ *   - `peerDependenciesMeta[name].optional === true` marks a peer as optional — the resolver
+ *     ignores those when intersecting, because an unsatisfied optional peer isn't a hard
+ *     conflict (`--no-optional` / user just never installed it).
+ */
+export async function fetchVersionPeers(
+  packageName: string,
+  cache?: RegistryCache,
+): Promise<Map<string, import('./concurrency.js').VersionPeers>> {
+  const doFetch = async (): Promise<Map<string, import('./concurrency.js').VersionPeers>> => {
+    const out = new Map<string, import('./concurrency.js').VersionPeers>();
+    try {
+      const pack = await pacote.packument(packageName, { fullMetadata: true });
+      const versions = pack?.versions as
+        | Record<
+            string,
+            {
+              peerDependencies?: Record<string, string>;
+              peerDependenciesMeta?: Record<string, { optional?: boolean }>;
+              deprecated?: string;
+            }
+          >
+        | undefined;
+      if (!versions || typeof versions !== 'object') {
+        return out;
+      }
+      for (const [v, info] of Object.entries(versions)) {
+        const slice: import('./concurrency.js').VersionPeers = {
+          peerDependencies: info.peerDependencies ?? {},
+        };
+        if (info.peerDependenciesMeta) slice.peerDependenciesMeta = info.peerDependenciesMeta;
+        if (typeof info.deprecated === 'string') slice.deprecated = info.deprecated;
+        out.set(v, slice);
+      }
+      return out;
+    } catch {
+      return out;
+    }
+  };
+
+  if (cache) {
+    const hit = cache.peers.get(packageName);
+    if (hit) return hit;
+    const p = doFetch();
+    cache.peers.set(packageName, p);
+    return p;
+  }
+  return doFetch();
+}
+
+/**
  * All published version strings from the registry packument (includes prereleases). Same
  * caching semantics as `fetchLatestVersion`.
  */

@@ -1,7 +1,53 @@
 import path from 'node:path';
 import fs from 'fs-extra';
-import type { ConflictEntry, UpgradeRecord } from '../types.js';
+import type { ConflictEntry, LockfileFixReport, UpgradeRecord } from '../types.js';
 import type { StructuredReport } from './report.js';
+
+/**
+ * Self-contained stylesheet embedded into every HTML summary. Kept deliberately short + GitHub
+ * Actions / email friendly:
+ *   - Scoped to `.dep-up-surgeon-report` so it can't leak into a host page / step-summary that
+ *     also contains other tool output.
+ *   - Uses system fonts only — no web fonts or external URLs.
+ *   - Severity chips use the same palette as npm / GitHub advisory UIs so reviewers recognise
+ *     the colors at a glance (critical=red, high=orange, moderate=amber, low=grey).
+ *   - Tables fold down on narrow viewports by switching to `display:block` + horizontal scroll
+ *     rather than reflowing cells, which preserves column-alignment readability.
+ */
+const SUMMARY_CSS = `
+.dep-up-surgeon-report { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 14px; line-height: 1.5; color: #1f2328; }
+.dep-up-surgeon-report h2 { margin-top: 0; font-size: 1.5em; border-bottom: 1px solid #d1d9e0; padding-bottom: 0.3em; }
+.dep-up-surgeon-report h3 { margin-top: 1.5em; font-size: 1.15em; border-bottom: 1px solid #d1d9e0b3; padding-bottom: 0.2em; }
+.dep-up-surgeon-report h4 { margin-top: 1.25em; font-size: 1em; color: #59636e; }
+.dep-up-surgeon-report code { background: #afb8c133; padding: 0.15em 0.35em; border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.92em; }
+.dep-up-surgeon-report pre { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 0.85em; }
+.dep-up-surgeon-report pre code { background: transparent; padding: 0; }
+.dep-up-surgeon-report table { border-collapse: collapse; margin: 0.5em 0 1em; width: 100%; max-width: 100%; overflow-x: auto; display: block; }
+.dep-up-surgeon-report thead { background: #f6f8fa; }
+.dep-up-surgeon-report th, .dep-up-surgeon-report td { border: 1px solid #d1d9e0; padding: 6px 10px; text-align: left; vertical-align: top; }
+.dep-up-surgeon-report a { color: #0969da; text-decoration: none; }
+.dep-up-surgeon-report a:hover { text-decoration: underline; }
+.dep-up-surgeon-report details { margin: 0.4em 0; }
+.dep-up-surgeon-report details > summary { cursor: pointer; padding: 4px 0; }
+.dep-up-surgeon-report blockquote { border-left: 3px solid #d1d9e0; padding: 0.4em 0.8em; color: #59636e; background: #f6f8fa; margin: 0.5em 0; }
+.dep-up-surgeon-report .chip { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 0.78em; font-weight: 600; text-transform: uppercase; letter-spacing: 0.02em; line-height: 1.5; vertical-align: middle; }
+.dep-up-surgeon-report .chip-critical { background: #ffebe9; color: #a40e26; border: 1px solid #ffb4a8; }
+.dep-up-surgeon-report .chip-high { background: #fff1e5; color: #9a3412; border: 1px solid #ffb787; }
+.dep-up-surgeon-report .chip-moderate { background: #fff8c5; color: #7d4e00; border: 1px solid #e6d47a; }
+.dep-up-surgeon-report .chip-low { background: #eaeef2; color: #59636e; border: 1px solid #d1d9e0; }
+.dep-up-surgeon-report .chip-breaking { background: #ffebe9; color: #a40e26; border: 1px solid #ffb4a8; }
+.dep-up-surgeon-report .chip-peer { background: #ddf4ff; color: #0550ae; border: 1px solid #54aeff; }
+.dep-up-surgeon-report .chip-security { background: #fff8c5; color: #7d4e00; border: 1px solid #e6d47a; }
+.dep-up-surgeon-report .chip-fallback { background: #eaeef2; color: #59636e; border: 1px solid #d1d9e0; }
+.dep-up-surgeon-report .chip-forced { background: #ffd8b5; color: #9a3412; border: 1px solid #ffb787; }
+.dep-up-surgeon-report .note-bits { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+`.trim();
+
+const VALID_SEVERITIES = new Set(['low', 'moderate', 'high', 'critical']);
+function severityChip(severity: string, esc: (s: unknown) => string): string {
+  const sev = VALID_SEVERITIES.has(severity) ? severity : 'low';
+  return `<span class="chip chip-${sev}">${esc(severity)}</span>`;
+}
 
 export type SummaryFormat = 'md' | 'html';
 
@@ -162,6 +208,28 @@ export function renderSummaryMarkdown(structured: StructuredReport, toolVersion:
     lines.push('');
   }
 
+  // Peer-range intersection resolver breadcrumbs — list only the rows that were actually
+  // nudged off the user's requested target so the reviewer can see which linked-group
+  // members were compromised and why.
+  const peerResolved = upgraded.filter((r) => r.resolvedPeer);
+  if (peerResolved.length > 0) {
+    lines.push(`### Peer-range resolutions`);
+    lines.push('');
+    lines.push(
+      `_${peerResolved.length} package${peerResolved.length === 1 ? ' was' : 's were'} pinned below the requested latest because a linked-group peer constraint would otherwise have broken the install. Each row shows the originally requested version alongside the compatible version the resolver picked._`,
+    );
+    lines.push('');
+    lines.push(`| Package | Group | Requested | Installed | Tuples explored |`);
+    lines.push(`| --- | --- | --- | --- | ---: |`);
+    for (const r of peerResolved) {
+      const rp = r.resolvedPeer!;
+      lines.push(
+        `| \`${r.name}\` | \`${r.linkedGroupId ?? '?'}\` | \`${rp.originalTarget}\` | \`${r.to ?? '?'}\` | ${rp.tuplesExplored} |`,
+      );
+    }
+    lines.push('');
+  }
+
   if (upgraded.length) {
     lines.push(`### Upgraded`);
     lines.push('');
@@ -239,6 +307,59 @@ export function renderSummaryMarkdown(structured: StructuredReport, toolVersion:
     lines.push('');
     lines.push(structured.ignored.map((n) => `\`${n}\``).join(', '));
     lines.push('');
+  }
+
+  if (structured.lockfileFix) {
+    const lf = structured.lockfileFix;
+    lines.push(`### Lockfile fix`);
+    lines.push('');
+    lines.push(renderLockfileFixSummaryLine(lf));
+    lines.push('');
+    const interesting = lf.dedupeChanges.filter(
+      (c) => c.change === 'merged' || c.change === 'updated',
+    );
+    if (interesting.length > 0) {
+      lines.push(`| Package | Change | Before | After |`);
+      lines.push(`| --- | --- | --- | --- |`);
+      for (const c of interesting.slice(0, 50)) {
+        lines.push(
+          `| \`${c.name}\` | ${c.change} | ${c.before.map((v) => `\`${v}\``).join(', ') || '—'} | ${c.after.map((v) => `\`${v}\``).join(', ') || '—'} |`,
+        );
+      }
+      if (interesting.length > 50) {
+        lines.push('');
+        lines.push(`_…and ${interesting.length - 50} more not shown._`);
+      }
+      lines.push('');
+    }
+    if (lf.stale.length > 0) {
+      lines.push(`<details><summary>Stale transitives (${lf.stale.length} — \`package.json\` untouched)</summary>`);
+      lines.push('');
+      lines.push(`| Package | Installed | Latest | Major behind | Minor behind |`);
+      lines.push(`| --- | --- | --- | ---: | ---: |`);
+      for (const s of lf.stale.slice(0, 25)) {
+        lines.push(
+          `| \`${s.name}\` | ${s.installed.map((v) => `\`${v}\``).join(', ')} | \`${s.latest}\` | ${s.majorBehind} | ${s.minorBehind} |`,
+        );
+      }
+      if (lf.stale.length > 25) {
+        lines.push('');
+        lines.push(`_…and ${lf.stale.length - 25} more not shown._`);
+      }
+      lines.push('');
+      lines.push(`</details>`);
+      lines.push('');
+    }
+    if (lf.status === 'failed' && lf.lastLines) {
+      lines.push(`<details><summary>${lf.failureKind ?? 'dedupe'} output (last lines)</summary>`);
+      lines.push('');
+      lines.push('```');
+      lines.push(lf.lastLines);
+      lines.push('```');
+      lines.push('');
+      lines.push(`</details>`);
+      lines.push('');
+    }
   }
 
   if (structured.overrides && structured.overrides.attempts.length > 0) {
@@ -321,6 +442,12 @@ export function renderSummaryHtml(structured: StructuredReport, toolVersion: str
       .replace(/"/g, '&quot;');
 
   const out: string[] = [];
+  // Inline stylesheet first, then the scoping wrapper. The `<style>` tag is stripped by
+  // GitHub's sanitizer in issue / PR / step-summary contexts, in which case the HTML still
+  // renders as plain tables (graceful degradation). When the summary is saved to a file and
+  // opened in a browser — the primary `--summary html` use case — the stylesheet applies and
+  // the report gets chips + proper table styling without any external assets.
+  out.push(`<style>${SUMMARY_CSS}</style>`);
   out.push(`<section class="dep-up-surgeon-report">`);
   out.push(`<h2>dep-up-surgeon — upgrade report</h2>`);
   out.push(
@@ -359,7 +486,7 @@ export function renderSummaryHtml(structured: StructuredReport, toolVersion: str
           ? `<a href="${esc(s.url)}" rel="noreferrer noopener">link</a>`
           : '';
       out.push(
-        `<tr><td><code>${esc(r.name)}</code>${esc(workspaceTagPlain(r.workspace))}</td><td><strong>${esc(s.severity)}</strong></td><td>${advCell}</td><td><code>${esc(r.from ?? '?')}</code> → <code>${esc(r.to ?? '?')}</code></td><td>${esc(s.title ?? '')}</td></tr>`,
+        `<tr><td><code>${esc(r.name)}</code>${esc(workspaceTagPlain(r.workspace))}</td><td>${severityChip(s.severity, esc)}</td><td>${advCell}</td><td><code>${esc(r.from ?? '?')}</code> → <code>${esc(r.to ?? '?')}</code></td><td>${esc(s.title ?? '')}</td></tr>`,
       );
     }
     out.push(`</tbody></table>`);
@@ -387,12 +514,30 @@ export function renderSummaryHtml(structured: StructuredReport, toolVersion: str
     out.push(`</ul>`);
   }
 
+  const peerResolvedHtml = upgraded.filter((r) => r.resolvedPeer);
+  if (peerResolvedHtml.length > 0) {
+    out.push(`<h3>Peer-range resolutions</h3>`);
+    out.push(
+      `<p><em>${peerResolvedHtml.length} package${peerResolvedHtml.length === 1 ? ' was' : 's were'} pinned below the requested latest because a linked-group peer constraint would otherwise have broken the install.</em></p>`,
+    );
+    out.push(
+      `<table><thead><tr><th>Package</th><th>Group</th><th>Requested</th><th>Installed</th><th>Tuples explored</th></tr></thead><tbody>`,
+    );
+    for (const r of peerResolvedHtml) {
+      const rp = r.resolvedPeer!;
+      out.push(
+        `<tr><td><code>${esc(r.name)}</code></td><td><code>${esc(r.linkedGroupId ?? '?')}</code></td><td><code>${esc(rp.originalTarget)}</code></td><td><code>${esc(r.to ?? '?')}</code></td><td>${rp.tuplesExplored}</td></tr>`,
+      );
+    }
+    out.push(`</tbody></table>`);
+  }
+
   if (upgraded.length) {
     out.push(`<h3>Upgraded</h3>`);
     out.push(`<table><thead><tr><th>Package</th><th>Workspace</th><th>From</th><th>To</th><th>Notes</th></tr></thead><tbody>`);
     for (const r of upgraded) {
       out.push(
-        `<tr><td><code>${esc(r.name)}</code></td><td>${esc(r.workspace ?? 'root')}</td><td><code>${esc(r.from ?? '?')}</code></td><td><code>${esc(r.to ?? '?')}</code></td><td>${esc(formatUpgradeNote(r))}</td></tr>`,
+        `<tr><td><code>${esc(r.name)}</code></td><td>${esc(r.workspace ?? 'root')}</td><td><code>${esc(r.from ?? '?')}</code></td><td><code>${esc(r.to ?? '?')}</code></td><td>${formatUpgradeNoteHtml(r, esc)}</td></tr>`,
       );
     }
     out.push(`</tbody></table>`);
@@ -449,8 +594,84 @@ export function renderSummaryHtml(structured: StructuredReport, toolVersion: str
     out.push(`<p>${structured.ignored.map((n) => `<code>${esc(n)}</code>`).join(', ')}</p>`);
   }
 
+  if (structured.lockfileFix) {
+    const lf = structured.lockfileFix;
+    out.push(`<h3>Lockfile fix</h3>`);
+    out.push(`<p><em>${esc(renderLockfileFixSummaryLine(lf))}</em></p>`);
+    const interesting = lf.dedupeChanges.filter(
+      (c) => c.change === 'merged' || c.change === 'updated',
+    );
+    if (interesting.length > 0) {
+      out.push(
+        `<table><thead><tr><th>Package</th><th>Change</th><th>Before</th><th>After</th></tr></thead><tbody>`,
+      );
+      for (const c of interesting.slice(0, 50)) {
+        const chipKind = c.change === 'merged' ? 'chip-peer' : 'chip-low';
+        const beforeCell =
+          c.before.length > 0 ? c.before.map((v) => `<code>${esc(v)}</code>`).join(', ') : '—';
+        const afterCell =
+          c.after.length > 0 ? c.after.map((v) => `<code>${esc(v)}</code>`).join(', ') : '—';
+        out.push(
+          `<tr><td><code>${esc(c.name)}</code></td><td><span class="chip ${chipKind}">${esc(c.change)}</span></td><td>${beforeCell}</td><td>${afterCell}</td></tr>`,
+        );
+      }
+      out.push(`</tbody></table>`);
+      if (interesting.length > 50) {
+        out.push(`<p><em>…and ${interesting.length - 50} more not shown.</em></p>`);
+      }
+    }
+    if (lf.stale.length > 0) {
+      out.push(
+        `<details><summary>Stale transitives (${lf.stale.length} — <code>package.json</code> untouched)</summary>`,
+      );
+      out.push(
+        `<table><thead><tr><th>Package</th><th>Installed</th><th>Latest</th><th>Major behind</th><th>Minor behind</th></tr></thead><tbody>`,
+      );
+      for (const s of lf.stale.slice(0, 25)) {
+        out.push(
+          `<tr><td><code>${esc(s.name)}</code></td><td>${s.installed.map((v) => `<code>${esc(v)}</code>`).join(', ')}</td><td><code>${esc(s.latest)}</code></td><td>${s.majorBehind}</td><td>${s.minorBehind}</td></tr>`,
+        );
+      }
+      out.push(`</tbody></table>`);
+      if (lf.stale.length > 25) {
+        out.push(`<p><em>…and ${lf.stale.length - 25} more not shown.</em></p>`);
+      }
+      out.push(`</details>`);
+    }
+    if (lf.status === 'failed' && lf.lastLines) {
+      out.push(
+        `<details><summary>${esc(lf.failureKind ?? 'dedupe')} output (last lines)</summary><pre>${esc(lf.lastLines)}</pre></details>`,
+      );
+    }
+  }
+
   out.push(`</section>`);
   return out.join('\n');
+}
+
+/**
+ * One-line human summary of a lockfile-fix report. Shared by the Markdown and HTML
+ * renderers so the wording stays consistent.
+ */
+function renderLockfileFixSummaryLine(lf: LockfileFixReport): string {
+  if (lf.status === 'skipped') {
+    const reason =
+      lf.skipReason === 'no-lockfile'
+        ? 'no lockfile was present on disk'
+        : 'package manager has no dedupe subcommand (yarn classic)';
+    return `Skipped — ${reason}.`;
+  }
+  if (lf.status === 'dry-run') {
+    return `Dry-run — would execute \`${lf.command}\`.`;
+  }
+  if (lf.status === 'failed') {
+    const kind = lf.failureKind === 'validation' ? 'validator' : 'dedupe';
+    return `Failed — ${kind} exited non-zero; lockfile was restored to its pre-dedupe state.`;
+  }
+  const merged = lf.dedupeChanges.filter((c) => c.change === 'merged').length;
+  const updated = lf.dedupeChanges.filter((c) => c.change === 'updated').length;
+  const stale = lf.stale.length;
+  return `Ran \`${lf.command}\` — ${merged} merged, ${updated} updated, ${stale} stale transitive${stale === 1 ? '' : 's'} flagged.`;
 }
 
 function formatUpgradeNote(r: UpgradeRecord): string {
@@ -468,10 +689,52 @@ function formatUpgradeNote(r: UpgradeRecord): string {
   if (r.usedFallback && r.requestedLatest) {
     bits.push(`fallback (latest was \`${r.requestedLatest}\`)`);
   }
+  if (r.resolvedPeer) {
+    bits.push(`peer-resolved from \`${r.resolvedPeer.originalTarget}\``);
+  }
   if (r.forced) {
     bits.push('forced');
   }
   return bits.join(', ');
+}
+
+/**
+ * HTML variant of `formatUpgradeNote` — emits severity + classification chips + clickable
+ * advisory IDs instead of a flat markdown string. Used only by `renderSummaryHtml`; the
+ * Markdown renderer keeps `formatUpgradeNote` because chips don't render in plain MD.
+ */
+function formatUpgradeNoteHtml(r: UpgradeRecord, esc: (s: unknown) => string): string {
+  const parts: string[] = [];
+  if (r.changelog?.breaking?.hasBreaking) {
+    parts.push(`<span class="chip chip-breaking">breaking</span>`);
+  }
+  if (r.security) {
+    const id = r.security.ids[0];
+    const idCell = id
+      ? r.security.url
+        ? ` <a href="${esc(r.security.url)}" rel="noreferrer noopener"><code>${esc(id)}</code></a>`
+        : ` <code>${esc(id)}</code>`
+      : '';
+    parts.push(`${severityChip(r.security.severity, esc)}${idCell}`);
+  }
+  if (r.linkedGroupId) {
+    parts.push(`<span class="chip chip-low">group <code>${esc(r.linkedGroupId)}</code></span>`);
+  }
+  if (r.usedFallback && r.requestedLatest) {
+    parts.push(
+      `<span class="chip chip-fallback">fallback</span> <em>(latest was <code>${esc(r.requestedLatest)}</code>)</em>`,
+    );
+  }
+  if (r.resolvedPeer) {
+    parts.push(
+      `<span class="chip chip-peer">peer-resolved</span> <em>from <code>${esc(r.resolvedPeer.originalTarget)}</code></em>`,
+    );
+  }
+  if (r.forced) {
+    parts.push(`<span class="chip chip-forced">forced</span>`);
+  }
+  if (parts.length === 0) return '';
+  return `<span class="note-bits">${parts.join(' ')}</span>`;
 }
 
 function formatFailureNote(f: ConflictEntry): string {

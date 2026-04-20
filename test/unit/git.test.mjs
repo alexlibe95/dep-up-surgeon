@@ -432,3 +432,72 @@ test('createGitFlow: all mode commits exactly once at flushAtEnd', async () => {
   assert.strictEqual(c.commits.length, 1);
   assert.match(c.commits[0].message, /^deps: 1 upgrade/);
 });
+
+// ---------------------------------------------------------------------------
+// Peer-resolved subject tag + footer (--resolve-peers integration)
+// ---------------------------------------------------------------------------
+
+test('formatPerSuccessMessage: resolvedPeer injects [peer-resolved] tag + footer', () => {
+  const msg = formatPerSuccessMessage('deps: ', [
+    {
+      name: 'react',
+      from: '^18.0.0',
+      to: '^18.3.1',
+      workspace: 'root',
+      groupId: 'react-pair',
+      resolvedPeer: { originalTarget: '^19.0.0', reason: 'peer-range intersection', tuplesExplored: 7 },
+    },
+    {
+      name: 'react-dom',
+      from: '^18.0.0',
+      to: '^18.3.1',
+      workspace: 'root',
+      groupId: 'react-pair',
+    },
+  ]);
+  assert.match(msg, /^deps: \[peer-resolved\] bump 2 linked packages/);
+  assert.match(msg, /Peer-range resolutions \(kept linked group satisfiable\):/);
+  assert.match(msg, /- react: requested \^19\.0\.0, installed \^18\.3\.1/);
+});
+
+test('formatPerSuccessMessage: [peer-resolved] comes AFTER [breaking] and BEFORE [security:*]', () => {
+  const msg = formatPerSuccessMessage('deps: ', [
+    {
+      name: 'x',
+      from: '^1',
+      to: '^2',
+      changelog: {
+        source: 'github-release',
+        body: 'BREAKING CHANGE: rewrote the API',
+        breaking: { hasBreaking: true, matchedLines: ['BREAKING CHANGE: rewrote the API'], reasons: ['BREAKING CHANGE'] },
+      },
+      resolvedPeer: { originalTarget: '^3', reason: 'x', tuplesExplored: 1 },
+      security: { severity: 'high', ids: ['CVE-2024-1234'] },
+    },
+  ]);
+  const subject = msg.split('\n')[0];
+  assert.match(subject, /^deps: \[breaking\] \[peer-resolved\] \[security:high\] bump x from \^1 to \^2/);
+});
+
+test('formatPerTargetMessage: resolvedPeer tag + footer appear together', () => {
+  const msg = formatPerTargetMessage('deps: ', 'root', [
+    {
+      name: 'react',
+      from: '^18',
+      to: '^18.3.1',
+      resolvedPeer: { originalTarget: '^19', reason: 'peer-range intersection', tuplesExplored: 4 },
+    },
+    { name: 'react-dom', from: '^18', to: '^18.3.1' },
+  ]);
+  assert.match(msg.split('\n')[0], /^deps: \[peer-resolved\] 2 upgrades/);
+  assert.match(msg, /Peer-range resolutions \(kept linked group satisfiable\):/);
+  assert.match(msg, /- react: requested \^19, installed \^18\.3\.1/);
+});
+
+test('formatPerSuccessMessage: no resolvedPeer → no tag, no footer', () => {
+  const msg = formatPerSuccessMessage('deps: ', [
+    { name: 'axios', from: '^1.6.0', to: '^1.7.2', workspace: 'root' },
+  ]);
+  assert.ok(!/peer-resolved/.test(msg), 'unexpected peer-resolved tag');
+  assert.ok(!/Peer-range resolutions/.test(msg), 'unexpected peer-resolution footer');
+});

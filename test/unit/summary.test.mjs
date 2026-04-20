@@ -126,8 +126,11 @@ test('renderSummaryHtml: produces a <section> with both tables and html-escapes 
   // Inject something that needs escaping into a column the renderer always emits raw-escaped.
   r.failed[1].attemptedVersion = '<script>alert("x")</script>';
   const html = renderSummaryHtml(r, '9.9.9');
-  assert.ok(html.startsWith('<section'));
+  assert.ok(html.startsWith('<style>'), 'html should begin with inline <style> block');
+  assert.match(html, /<section class="dep-up-surgeon-report">/);
   assert.ok(html.endsWith('</section>'));
+  // Severity chips render with the shared css class so GH and offline renders match.
+  assert.match(html, /\.chip-critical\s*\{/);
   assert.match(html, /<h3>Upgraded<\/h3>/);
   assert.match(html, /<h3>Failed or rolled back<\/h3>/);
   // No raw script tag should leak through.
@@ -169,6 +172,56 @@ test('writeSummary: appends to GITHUB_STEP_SUMMARY when set', async () => {
   assert.match(contents, /## dep-up-surgeon — upgrade report/);
 });
 
+test('renderSummaryMarkdown: surfaces peer-range resolutions section + badge', () => {
+  const report = {
+    upgraded: [
+      {
+        name: 'react',
+        success: true,
+        from: '18.2.0',
+        to: '18.3.1',
+        linkedGroupId: 'react-pair',
+        workspace: 'root',
+        resolvedPeer: { originalTarget: '19.0.0', reason: 'peer-range intersection', tuplesExplored: 6 },
+      },
+      {
+        name: 'react-dom',
+        success: true,
+        from: '18.2.0',
+        to: '18.3.1',
+        linkedGroupId: 'react-pair',
+        workspace: 'root',
+      },
+    ],
+    skipped: [],
+    failed: [],
+  };
+  const md = renderSummaryMarkdown(report, { toolVersion: '1.0.0' });
+  assert.match(md, /### Peer-range resolutions/);
+  assert.match(md, /\| `react` \| `react-pair` \| `19\.0\.0` \| `18\.3\.1` \| 6 \|/);
+  assert.match(md, /peer-resolved from `19\.0\.0`/);
+});
+
+test('renderSummaryHtml: surfaces peer-range resolutions section', () => {
+  const report = {
+    upgraded: [
+      {
+        name: 'react',
+        success: true,
+        from: '18.2.0',
+        to: '18.3.1',
+        linkedGroupId: 'g',
+        resolvedPeer: { originalTarget: '19.0.0', reason: 'r', tuplesExplored: 2 },
+      },
+    ],
+    skipped: [],
+    failed: [],
+  };
+  const html = renderSummaryHtml(report, { toolVersion: '1.0.0' });
+  assert.match(html, /<h3>Peer-range resolutions<\/h3>/);
+  assert.match(html, /<td><code>19\.0\.0<\/code><\/td>/);
+});
+
 test('writeSummary: writes to default file when no env/explicit', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dus-summary-'));
   const written = await writeSummary(fixtureReport(), {
@@ -180,4 +233,144 @@ test('writeSummary: writes to default file when no env/explicit', async () => {
   assert.strictEqual(written, path.join(dir, 'dep-up-surgeon-summary.html'));
   const contents = await fs.readFile(written, 'utf8');
   assert.match(contents, /<section class="dep-up-surgeon-report">/);
+});
+
+test('renderSummaryHtml: severity chip + clickable advisory ID in security table', () => {
+  const report = {
+    upgraded: [
+      {
+        name: 'axios',
+        success: true,
+        from: '1.6.0',
+        to: '1.7.4',
+        workspace: 'root',
+        security: {
+          severity: 'high',
+          ids: ['GHSA-wf5p-g6vw-rhxx'],
+          url: 'https://github.com/advisories/GHSA-wf5p-g6vw-rhxx',
+          title: 'SSRF in axios',
+        },
+      },
+    ],
+    skipped: [],
+    failed: [],
+  };
+  const html = renderSummaryHtml(report, '1.0.0');
+  assert.match(html, /<span class="chip chip-high">high<\/span>/);
+  assert.match(
+    html,
+    /<a href="https:\/\/github\.com\/advisories\/GHSA-wf5p-g6vw-rhxx"[^>]*><code>GHSA-wf5p-g6vw-rhxx<\/code><\/a>/,
+  );
+});
+
+test('renderSummaryHtml: peer-resolved + breaking chips in Upgraded notes', () => {
+  const report = {
+    upgraded: [
+      {
+        name: 'react',
+        success: true,
+        from: '18.2.0',
+        to: '18.3.1',
+        linkedGroupId: 'react-pair',
+        workspace: 'root',
+        resolvedPeer: { originalTarget: '19.0.0', reason: 'peer-range', tuplesExplored: 4 },
+        changelog: {
+          body: '### Breaking changes\n- removed legacy API',
+          source: 'github-release',
+          breaking: { hasBreaking: true, matchedLines: ['removed legacy API'] },
+        },
+      },
+    ],
+    skipped: [],
+    failed: [],
+  };
+  const html = renderSummaryHtml(report, '1.0.0');
+  assert.match(html, /<span class="chip chip-peer">peer-resolved<\/span>/);
+  assert.match(html, /<span class="chip chip-breaking">breaking<\/span>/);
+});
+
+test('renderSummaryMarkdown: emits Lockfile fix section with merged rows', () => {
+  const report = {
+    upgraded: [],
+    skipped: [],
+    failed: [],
+    lockfileFix: {
+      status: 'ok',
+      manager: 'npm',
+      lockfile: 'package-lock.json',
+      command: 'npm dedupe --no-audit --loglevel error',
+      exitCode: 0,
+      dedupeChanges: [
+        { name: 'debug', change: 'merged', before: ['4.3.2', '4.3.4'], after: ['4.3.4'] },
+        { name: 'ms', change: 'updated', before: ['2.1.2'], after: ['2.1.3'] },
+      ],
+      stale: [
+        {
+          name: 'lodash',
+          installed: ['4.17.20'],
+          latest: '4.17.21',
+          majorBehind: 0,
+          minorBehind: 0,
+        },
+      ],
+    },
+  };
+  const md = renderSummaryMarkdown(report, '1.0.0');
+  assert.match(md, /### Lockfile fix/);
+  assert.match(md, /Ran `npm dedupe.*` — 1 merged, 1 updated, 1 stale transitive flagged/);
+  assert.match(md, /\| `debug` \| merged \| `4\.3\.2`, `4\.3\.4` \| `4\.3\.4` \|/);
+  assert.match(md, /\| `ms` \| updated \| `2\.1\.2` \| `2\.1\.3` \|/);
+  assert.match(md, /<details><summary>Stale transitives \(1/);
+});
+
+test('renderSummaryHtml: lockfile-fix renders chips + stale details block', () => {
+  const report = {
+    upgraded: [],
+    skipped: [],
+    failed: [],
+    lockfileFix: {
+      status: 'ok',
+      manager: 'pnpm',
+      lockfile: 'pnpm-lock.yaml',
+      command: 'pnpm dedupe',
+      exitCode: 0,
+      dedupeChanges: [
+        { name: 'debug', change: 'merged', before: ['4.3.2', '4.3.4'], after: ['4.3.4'] },
+      ],
+      stale: [
+        {
+          name: 'left-pad',
+          installed: ['1.1.0'],
+          latest: '1.3.0',
+          majorBehind: 0,
+          minorBehind: 2,
+        },
+      ],
+    },
+  };
+  const html = renderSummaryHtml(report, '1.0.0');
+  assert.match(html, /<h3>Lockfile fix<\/h3>/);
+  assert.match(html, /<span class="chip chip-peer">merged<\/span>/);
+  assert.match(html, /<details><summary>Stale transitives \(1/);
+  assert.match(html, /<code>left-pad<\/code>/);
+});
+
+test('renderSummaryMarkdown: lockfile-fix skipped reports reason', () => {
+  const md = renderSummaryMarkdown(
+    {
+      upgraded: [],
+      skipped: [],
+      failed: [],
+      lockfileFix: {
+        status: 'skipped',
+        manager: 'yarn',
+        lockfile: 'yarn.lock',
+        skipReason: 'unsupported',
+        dedupeChanges: [],
+        stale: [],
+      },
+    },
+    '1.0.0',
+  );
+  assert.match(md, /Skipped — package manager has no dedupe subcommand/);
 });

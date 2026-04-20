@@ -289,6 +289,14 @@ async function main(): Promise<void> {
       'Disable blast-radius source scanning. Useful in very large monorepos where the scan is slower than the install itself.',
     )
     .option(
+      '--resolve-peers',
+      'When a linked-group bump (e.g. `react` + `react-dom`) fails with a peer-dependency conflict, attempt to compute a compatible version tuple by intersecting each member\'s peer ranges across the registry packument. If a satisfiable tuple exists and it passes install + validate, the batch succeeds with members possibly downgraded off `latest`. Default: ON.',
+    )
+    .option(
+      '--no-resolve-peers',
+      'Disable the peer-range intersection resolver. A linked batch that fails with a peer conflict rolls back exactly like before. Useful when you WANT the failure to surface instead of having the tool silently nudge versions off latest.',
+    )
+    .option(
       '--apply-overrides',
       'After the main upgrade loop, attempt to fix transitive CVEs that no direct bump could reach by writing a package-manager override (`overrides` for npm, `pnpm.overrides` for pnpm, `resolutions` for yarn) pinning each vulnerable package to its audit-recommended safe version. Runs install + validator after each pin and rolls back the pin on failure. Requires --security-only.',
       false,
@@ -296,6 +304,11 @@ async function main(): Promise<void> {
     .option(
       '--override-force',
       'Used with --apply-overrides. Overwrite an existing override whose value conflicts with the audit-recommended version. By default we refuse and record a `conflict` reason so the user can reconcile manually.',
+      false,
+    )
+    .option(
+      '--fix-lockfile',
+      'Run the package manager\'s native dedupe pass (`npm dedupe` / `pnpm dedupe` / `yarn dedupe`) to collapse redundant transitive copies WITHOUT touching package.json, and scan for transitives more than one minor or a full major behind registry `latest`. The lockfile is backed up before dedupe and restored if the dedupe command OR the post-dedupe validator fails. Yarn classic (v1) has no dedupe subcommand and is recorded as `skipped: "unsupported"`.',
       false,
     )
     .option(
@@ -357,8 +370,10 @@ async function main(): Promise<void> {
     securityOnly?: boolean;
     minSeverity?: string;
     blastRadius?: boolean;
+    resolvePeers?: boolean;
     applyOverrides?: boolean;
     overrideForce?: boolean;
+    fixLockfile?: boolean;
     openPr?: boolean;
     openPrTitle?: string;
     openPrDraft?: boolean;
@@ -675,6 +690,9 @@ async function main(): Promise<void> {
       concurrency,
       restrictToNames,
       policy,
+      // `--no-resolve-peers` sets opts.resolvePeers to false (commander convention);
+      // anything else (undefined, true) means "default on" inside the engine.
+      resolvePeers: opts.resolvePeers !== false,
       onUpgradeApplied: gitFlow?.onUpgradeApplied,
       onTargetComplete: gitFlow
         ? async (ev) => {
@@ -856,6 +874,75 @@ async function main(): Promise<void> {
               `--apply-overrides: skipped due to error: ${e instanceof Error ? e.message : String(e)}`,
             );
           }
+        }
+      }
+    }
+
+    // --fix-lockfile: dedupe + stale-transitive scan. Runs AFTER the main upgrade loop and
+    // overrides pass so we dedupe the FINAL tree. We roll back on any failure, so in the
+    // worst case the user ends up with the same lockfile the upgrade loop produced.
+    if (opts.fixLockfile && !dryRun) {
+      try {
+        const { runLockfileFix } = await import('./cli/lockfileFix.js');
+        const fixManager: PackageManager =
+          packageManager !== 'auto' ? packageManager : report!.project?.manager ?? 'npm';
+        const yarnMajorVersion = report!.project?.yarnMajorVersion;
+        const fixRes = await runLockfileFix({
+          cwd,
+          manager: fixManager,
+          ...(yarnMajorVersion !== undefined ? { yarnMajorVersion } : {}),
+          json: jsonOutput,
+          runValidator: async () => {
+            if (validate.skip) return { ok: true };
+            try {
+              const { validateProject } = await import('./core/validator.js');
+              const pkg = await fs.readJson(path.join(cwd, 'package.json'));
+              const vr = await validateProject(cwd, pkg, {
+                ...(validate.command ? { command: validate.command } : {}),
+                manager: fixManager,
+                ...(validate.source ? { source: validate.source } : {}),
+              });
+              return {
+                ok: vr.ok,
+                ...(vr.command ? { command: vr.command } : {}),
+                ...(vr.output ? { lastLines: vr.output } : {}),
+              };
+            } catch {
+              return { ok: true };
+            }
+          },
+          runInstallAfterRollback: async () => {
+            const { runInstall } = await import('./utils/npm.js');
+            await runInstall(cwd, fixManager);
+          },
+        });
+        report!.lockfileFix = fixRes.report;
+        if (!jsonOutput) {
+          const r = fixRes.report;
+          if (r.status === 'ok') {
+            const mergedOrUpdated = r.dedupeChanges.filter(
+              (c) => c.change === 'merged' || c.change === 'updated',
+            ).length;
+            log.success(
+              `--fix-lockfile: ${r.command} succeeded (${mergedOrUpdated} package${
+                mergedOrUpdated === 1 ? '' : 's'
+              } deduped/updated, ${r.stale.length} stale transitive${r.stale.length === 1 ? '' : 's'} flagged).`,
+            );
+          } else if (r.status === 'failed') {
+            log.warn(
+              `--fix-lockfile: ${r.failureKind === 'validation' ? 'validator' : 'dedupe'} failed; lockfile was restored.`,
+            );
+          } else if (r.status === 'skipped') {
+            log.info(
+              `--fix-lockfile: skipped (${r.skipReason === 'no-lockfile' ? 'no lockfile on disk' : 'yarn classic has no dedupe subcommand'}).`,
+            );
+          }
+        }
+      } catch (e) {
+        if (!jsonOutput) {
+          log.warn(
+            `--fix-lockfile: skipped due to error: ${e instanceof Error ? e.message : String(e)}`,
+          );
         }
       }
     }

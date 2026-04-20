@@ -92,10 +92,28 @@ export interface RegistryCache {
   latest: Map<string, Promise<string>>;
   /** `pkgName -> Promise<all published version strings>` */
   versions: Map<string, Promise<string[]>>;
+  /**
+   * `pkgName -> Promise<version -> peerDependencies>`. Populated on demand by the peer-range
+   * intersection resolver. We cache the entire per-version peer map rather than per-version
+   * individually so one `pacote.packument` call serves every backtracking probe for that
+   * package in a given run.
+   */
+  peers: Map<string, Promise<Map<string, VersionPeers>>>;
+}
+
+/**
+ * Per-published-version slice of a packument entry that the peer resolver cares about.
+ * `deprecated` is the raw string (when the version was marked deprecated) so the resolver can
+ * skip it; everything else is the shape that powers the actual range-intersection search.
+ */
+export interface VersionPeers {
+  peerDependencies: Record<string, string>;
+  peerDependenciesMeta?: Record<string, { optional?: boolean }>;
+  deprecated?: string;
 }
 
 export function createRegistryCache(): RegistryCache {
-  return { latest: new Map(), versions: new Map() };
+  return { latest: new Map(), versions: new Map(), peers: new Map() };
 }
 
 /**

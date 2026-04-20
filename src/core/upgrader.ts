@@ -22,6 +22,7 @@ import {
   detectEsmCommonJsBlockage,
   fetchAllPublishedVersions,
   fetchLatestVersion,
+  fetchVersionPeers,
   runInstall,
   type InstallManager,
   type InstallOptions,
@@ -45,6 +46,14 @@ import { buildLineFallbackOrder } from '../utils/versionFallback.js';
 import { buildSingletonGroups } from './groups.js';
 import { buildDynamicLinkedGroups } from './dynamicGroups.js';
 import type { LinkedGroup } from './groups.js';
+import {
+  buildDomain,
+  describeResolution,
+  resolvePeerRanges,
+  type CandidateDomain,
+  type ResolvedTuple,
+  type ResolverInput,
+} from './peerResolver.js';
 
 const BACKUP_FILENAME = 'package.json.dep-up-surgeon.bak';
 
@@ -173,6 +182,18 @@ export interface UpgradeEngineOptions {
    * upgrade.
    */
   onUpgradeApplied?: (event: UpgradeAppliedEvent) => Promise<void>;
+  /**
+   * When `true` (the default), a linked-group batch that fails with a PEER-type install conflict
+   * triggers `src/core/peerResolver.ts` — we fetch each linked package's packument, compute the
+   * intersection of peer ranges, and retry the batch with a compatible (possibly slightly
+   * downgraded) version tuple. If the resolver can't find one, or the retried install still
+   * fails, the batch behaves exactly as before (rollback + `kind: 'peer'` failure row).
+   *
+   * Set to `false` (via `--no-resolve-peers`) to preserve the pre-resolver behavior —
+   * useful when you WANT to know that a peer conflict exists instead of having the tool
+   * silently bump things off latest.
+   */
+  resolvePeers?: boolean;
 }
 
 /**
@@ -538,7 +559,20 @@ async function attemptSingleUpgradeUnlocked(
   return { ok: true, validation: diag, install: installDiag };
 }
 
-type Bump = { scanned: ScannedPackage; targetVersion: string };
+type Bump = {
+  scanned: ScannedPackage;
+  targetVersion: string;
+  /**
+   * Set only when the peer-range intersection resolver replaced `targetVersion` with a
+   * compatible one. Preserved through a successful retry so the emitted `UpgradeRecord`
+   * can attach a `resolvedPeer` audit trail.
+   */
+  resolvedFrom?: string;
+  /** Human-readable reason string from `describeResolution` (shared across the whole tuple). */
+  resolvedReason?: string;
+  /** How many candidate tuples the resolver explored. */
+  resolvedTuplesExplored?: number;
+};
 
 /**
  * Bump several dependencies in one `package.json` write, then one install + validate.
@@ -1036,6 +1070,82 @@ async function runSinglePackageUpgrade(
 }
 
 /**
+ * Build a map of "what version range is this external (non-linked) dependency currently pinned
+ * to in the workspace package.json" — used as input to the peer resolver so it can check whether
+ * a candidate's peer on an OUT-OF-GROUP package (e.g. `next`, `typescript`) would break.
+ *
+ * We read from the SAME `package.json` the engine is about to mutate; whatever's pinned there
+ * is the closest thing we have to ground truth without running `npm ls`. `peerDependencies`
+ * and `optionalDependencies` are included because they can still ship an installed version.
+ */
+async function collectExternalInstalledRanges(
+  cwd: string,
+  excludeNames: Set<string>,
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  let pkg: PackageJson;
+  try {
+    pkg = await readPackageJson(cwd);
+  } catch {
+    return out;
+  }
+  const sections: DepSection[] = [
+    'dependencies',
+    'devDependencies',
+    'peerDependencies',
+    'optionalDependencies',
+  ];
+  for (const section of sections) {
+    const block = pkg[section];
+    if (!block) continue;
+    for (const [name, range] of Object.entries(block)) {
+      if (excludeNames.has(name)) continue;
+      if (typeof range !== 'string') continue;
+      if (!out.has(name)) out.set(name, range);
+    }
+  }
+  return out;
+}
+
+/**
+ * Try to find a peer-compatible version tuple for a linked batch that just failed with a
+ * peer conflict. Returns `undefined` when:
+ *   - The registry packument couldn't be fetched for any member (we'd be guessing).
+ *   - Any member's candidate domain is empty after filtering.
+ *   - The resolver explored its budget without finding a satisfiable tuple.
+ *
+ * Fetches + resolver calls are scoped to one batch — cheap (packuments are `RegistryCache`-
+ * shared so subsequent groups / workspace members reuse them).
+ */
+async function tryResolvePeerIntersection(
+  cwd: string,
+  bumps: Bump[],
+  opts: UpgradeEngineOptions,
+): Promise<ResolvedTuple | undefined> {
+  if (bumps.length < 2) return undefined;
+  const inputs: ResolverInput[] = bumps.map((b) => ({
+    name: b.scanned.name,
+    currentRange: b.scanned.currentRange,
+    requestedTarget: b.targetVersion,
+  }));
+
+  const domains: CandidateDomain[] = [];
+  for (const inp of inputs) {
+    const peerMap = await fetchVersionPeers(inp.name, opts.registryCache);
+    if (peerMap.size === 0) return undefined;
+    const domain = buildDomain(inp, peerMap);
+    if (domain.versions.length === 0) return undefined;
+    domains.push(domain);
+  }
+
+  const memberNames = new Set(inputs.map((i) => i.name));
+  const externalInstalled = await collectExternalInstalledRanges(cwd, memberNames);
+  const requested = new Map(inputs.map((i) => [i.name, i.requestedTarget]));
+
+  return resolvePeerRanges(domains, requested, { externalInstalled });
+}
+
+/**
  * Linked group: bump all to registry `@latest` in one shot (no per-package fallback ladder).
  * TODO: peer-graph / `expo install`-style alignment for Expo SDK
  */
@@ -1169,6 +1279,7 @@ async function runLinkedGroupUpgrade(
   let result: AttemptResult = { ok: false, kind: 'install', message: 'not started' };
   let forceAttempt = opts.force;
   let attempt = 0;
+  let peerResolverTried = false;
 
   while (attempt < maxAttempts) {
     attempt++;
@@ -1178,6 +1289,61 @@ async function runLinkedGroupUpgrade(
       break;
     }
     const classified = result.classified ?? classifyInstallOutput(result.installOutput, opts);
+
+    // Peer-range intersection resolver — only on the first peer-kind failure for this batch.
+    // We intentionally skip the resolver when `--force` is already active (user asked to barrel
+    // through peer conflicts), when the user explicitly opted out with `--no-resolve-peers`,
+    // or after we've already tried it once (avoid infinite retry loops).
+    if (
+      !peerResolverTried &&
+      result.kind === 'peer' &&
+      opts.resolvePeers !== false &&
+      !forceAttempt
+    ) {
+      peerResolverTried = true;
+      const resolved = await tryResolvePeerIntersection(cwd, bumps, opts);
+      if (resolved) {
+        let mutated = false;
+        const reason = describeResolution(
+          resolved,
+          bumps.map((b) => ({
+            name: b.scanned.name,
+            currentRange: b.scanned.currentRange,
+            requestedTarget: b.targetVersion,
+          })),
+        );
+        for (const b of bumps) {
+          const nextVer = resolved.versions.get(b.scanned.name);
+          if (!nextVer) continue;
+          if (nextVer !== b.targetVersion) {
+            b.resolvedFrom = b.targetVersion;
+            b.targetVersion = nextVer;
+            mutated = true;
+          }
+          b.resolvedReason = reason;
+          b.resolvedTuplesExplored = resolved.tuplesExplored;
+        }
+        if (mutated) {
+          if (!jsonOutput) {
+            log.info(
+              `Peer-range resolver found a compatible tuple for [${gid}]; retrying with ` +
+                bumps.map((b) => `${b.scanned.name}@${b.targetVersion}`).join(', '),
+            );
+          }
+          continue;
+        }
+        // Resolver returned the SAME tuple we already tried — no point re-running. Clear the
+        // reason breadcrumbs so success rows don't claim a resolver intervention that never
+        // happened.
+        for (const b of bumps) {
+          b.resolvedReason = undefined;
+          b.resolvedTuplesExplored = undefined;
+        }
+      } else if (!jsonOutput) {
+        log.dim(`Peer-range resolver could not find a compatible tuple for [${gid}]`);
+      }
+    }
+
     if (!interactive) {
       break;
     }
@@ -1228,19 +1394,32 @@ async function runLinkedGroupUpgrade(
         success: true,
         from: cur?.version,
         to: b.targetVersion,
-        requestedLatest: b.targetVersion,
+        // `requestedLatest` should still reflect what the user ASKED for (registry latest),
+        // even when the peer resolver nudged us to a slightly older version. That way the
+        // summary can render "requested 19.0.0, got 18.3.1 (peer-range intersection)".
+        requestedLatest: b.resolvedFrom ?? b.targetVersion,
         linkedGroupId: gid,
       };
+      if (b.resolvedFrom) {
+        row.resolvedPeer = {
+          originalTarget: b.resolvedFrom,
+          reason: b.resolvedReason ?? 'peer-range intersection',
+          tuplesExplored: b.resolvedTuplesExplored ?? 0,
+        };
+      }
       if (result.message?.includes('--force')) {
         row.forced = true;
         row.detail = result.message;
+      } else if (b.resolvedFrom) {
+        row.detail = `upgraded with linked group [${gid}] (peer-range intersection: ${b.resolvedFrom} → ${b.targetVersion})`;
       } else {
         row.detail = `upgraded with linked group [${gid}] (single install + validate)`;
       }
       addUpgrade(report, row);
       groupRows.push(row);
       if (!jsonOutput) {
-        log.success(`upgraded: ${b.scanned.name} → ${b.targetVersion} (group ${gid})`);
+        const suffix = b.resolvedFrom ? ` [peer-resolved from ${b.resolvedFrom}]` : '';
+        log.success(`upgraded: ${b.scanned.name} → ${b.targetVersion} (group ${gid})${suffix}`);
       }
     }
     await fireUpgradeApplied(opts, groupRows, cwd, gid);
