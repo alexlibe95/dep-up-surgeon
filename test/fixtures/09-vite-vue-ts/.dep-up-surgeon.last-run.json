@@ -56,7 +56,7 @@
       "success": true,
       "skipped": true,
       "from": "3.5.0",
-      "to": "3.5.32",
+      "to": "3.5.33",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-0"
@@ -104,8 +104,8 @@
     }
   ],
   "installMode": "root",
-  "finishedAt": "2026-04-20T15:41:56.444Z",
-  "toolVersion": "2.2.3",
+  "finishedAt": "2026-04-22T16:44:46.307Z",
+  "toolVersion": "2.2.4",
   "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/09-vite-vue-ts",
   "dryRun": true
 }

@@ -601,6 +601,48 @@ After each `npm install`, output is passed through a **generic conflict parser**
 
 `latest` may not be adoptable yet (e.g. **ESM-only** majors, or a **TypeScript** major that breaks your build). The default strategy tries **`@latest` first**, then walks older **release lines** when fallbacks are enabled.
 
+### Live progress (spinner + elapsed timer)
+
+Long phases — pre-flight validation, `<mgr> install`, the post-install `test` / `build` script, and rollbacks — no longer go silent. While each phase is running the CLI prints a single-line status that updates in place with an **elapsed-seconds counter**, so you can tell at a glance whether the tool is working or genuinely hung.
+
+Typical output during a run:
+
+```
+⠸ Pre-flight: running `npm test` on unchanged tree... (4s)
+✔ Pre-flight ok: `npm test` (12s)
+
+Upgrading axios: 1.6.0 → latest 1.7.2 …
+⠹ Installing axios@1.7.2 with npm... (6s)
+⠋ Validating axios@1.7.2: `npm test`... (18s)
+✔ upgraded: axios → 1.7.2
+```
+
+On failure the spinner switches to the rollback phase before the final error line so you see the recovery happen:
+
+```
+⠹ Installing react@19.0.0 with npm... (9s)
+⠸ Rolling back react: `npm test` failed (exit 1)... (23s)
+✖ skipped: react — validator (npm test) failed; this is not a dependency conflict
+```
+
+For linked-group upgrades the status line shows a compact batch label (first three members, then `…+N more` for larger groups):
+
+```
+Linked group [react-pair]: react → 19.0.0; react-dom → 19.0.0; @types/react → 19.0.0 …
+⠙ Installing batch (3 pkgs) with npm: react@19.0.0, react-dom@19.0.0, @types/react@19.0.0... (7s)
+⠧ Validating batch (3 pkgs): `npm test`... (21s)
+✔ upgraded: react → 19.0.0 (group react-pair)
+✔ upgraded: react-dom → 19.0.0 (group react-pair)
+✔ upgraded: @types/react → 19.0.0 (group react-pair)
+```
+
+Environment handling:
+
+- **TTY (local dev)** — animated braille spinner updated in place with a live elapsed timer.
+- **Non-TTY (CI logs, piped output, `tee`-ed runs)** — auto-degrades to plain `› <phase>` lines, one per phase transition, no ANSI escapes. Jenkins / GitHub Actions logs stay clean and every phase remains visible in the scrollback.
+- **`--json` / `--ci`** — completely silent. Machine output is untouched so JSON consumers never see progress noise.
+- **`--concurrency > 1`** — already requires `--json`, so the spinner stays off in parallel runs. Serial runs keep a single clean status line regardless of how many workspace targets are traversed.
+
 ## Configuration
 
 Create `.dep-up-surgeonrc` in the project root:
@@ -663,11 +705,27 @@ Use this for CI or tooling that needs structured results.
 ## Output example
 
 ```
+⠸ Pre-flight: running `npm test` on unchanged tree... (4s)
+✔ Pre-flight ok: `npm test` (12s)
+
+Upgrading lodash: 4.17.20 → latest 4.17.21 …
+⠹ Installing lodash@4.17.21 with npm... (3s)
+⠧ Validating lodash@4.17.21: `npm test`... (11s)
 ✔ upgraded: lodash → 4.17.21
+
+Upgrading axios: 1.5.0 → latest 1.6.0 …
+⠙ Installing axios@1.6.0 with npm... (4s)
+⠇ Validating axios@1.6.0: `npm test`... (9s)
 ✔ upgraded: axios → 1.6.0
-✖ skipped: legacy-lib (npm test failed)
+
+Upgrading legacy-lib: 2.0.0 → latest 3.0.0 …
+⠸ Installing legacy-lib@3.0.0 with npm... (5s)
+⠏ Rolling back legacy-lib: `npm test` failed (exit 1)... (17s)
+✖ skipped: legacy-lib — validator (npm test) failed; this is not a dependency conflict
 ⚠ peer conflict: some-package — …
 ```
+
+The `⠹` / `⠇` / `⠸` style glyphs are an animated spinner on a TTY; in CI logs and piped output each phase instead renders as a plain `› <phase>` line so the scrollback still records every step. See **[Live progress (spinner + elapsed timer)](#live-progress-spinner--elapsed-timer)** for details.
 
 ## Architecture (overview)
 

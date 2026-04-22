@@ -35,6 +35,13 @@ export interface ValidationOptions {
    * (`<manager> test`, `<manager> run build`). Defaults to `npm`.
    */
   manager?: 'npm' | 'pnpm' | 'yarn';
+  /**
+   * Fired once the validator has decided which command to run, BEFORE it actually runs.
+   * Used by callers (upgrader preflight, install/validate loop) to update a spinner with
+   * the exact command string so the user can see what's executing. Omitted when validation
+   * is skipped (no script, `--no-validate`).
+   */
+  onResolved?: (info: { command: string; source: ValidationResult['source'] }) => void;
 }
 
 // Re-export for external consumers that previously imported from validator.
@@ -64,6 +71,7 @@ export async function validateProject(
 
   if (options.command && options.command.trim()) {
     const cmd = options.command.trim();
+    options.onResolved?.({ command: cmd, source: options.source ?? 'cli' });
     const r = await execa(cmd, {
       cwd,
       reject: false,
@@ -89,6 +97,10 @@ export async function validateProject(
   const scripts = pkgJson.scripts ?? {};
   const testScript = typeof scripts.test === 'string' ? scripts.test.trim() : '';
   if (testScript) {
+    options.onResolved?.({
+      command: `${manager} ${testArgs.join(' ')}`,
+      source: 'package.json:test',
+    });
     const r = await execa(manager, testArgs, { cwd, reject: false, all: true });
     const output = [r.stdout, r.stderr].filter(Boolean).join('\n');
     return {
@@ -102,6 +114,10 @@ export async function validateProject(
 
   const buildScript = typeof scripts.build === 'string' ? scripts.build.trim() : '';
   if (buildScript) {
+    options.onResolved?.({
+      command: `${manager} ${buildArgs.join(' ')}`,
+      source: 'package.json:build',
+    });
     const r = await execa(manager, buildArgs, { cwd, reject: false, all: true });
     const output = [r.stdout, r.stderr].filter(Boolean).join('\n');
     return {

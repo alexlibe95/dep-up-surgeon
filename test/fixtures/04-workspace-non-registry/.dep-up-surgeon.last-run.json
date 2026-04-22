@@ -50,8 +50,8 @@
     }
   ],
   "installMode": "root",
-  "finishedAt": "2026-04-20T15:41:45.066Z",
-  "toolVersion": "2.2.3",
+  "finishedAt": "2026-04-22T16:44:33.463Z",
+  "toolVersion": "2.2.4",
   "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/04-workspace-non-registry",
   "dryRun": true
 }

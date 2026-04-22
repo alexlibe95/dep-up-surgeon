@@ -17,7 +17,7 @@ import type { PackageJson } from '../types.js';
 import { addFailure, addUpgrade, createEmptyReport } from './conflict.js';
 import { isRegistryRange, scanProject } from './scanner.js';
 import { validateProject, type ValidationOptions, type ValidationResult } from './validator.js';
-import { log } from '../utils/logger.js';
+import { createSpinner, log, type Spinner } from '../utils/logger.js';
 import {
   detectEsmCommonJsBlockage,
   fetchAllPublishedVersions,
@@ -502,12 +502,19 @@ async function attemptSingleUpgradeUnlocked(
   targetVersion: string,
   opts: UpgradeEngineOptions,
 ): Promise<AttemptResult> {
-  const { force } = opts;
+  const { force, jsonOutput } = opts;
   const manager = (opts.projectInfo?.manager ?? 'npm') as InstallManager;
   const installCwd = opts.installCwd ?? cwd;
   const installOpts = installFilterOptions(opts);
   const previousRange = scanned.currentRange;
   const install$ = opts.installer ?? runInstall;
+
+  // Progress spinner: surfaces which phase is running (install → validate → optional
+  // rollback) and how long it's been going. Silenced in JSON mode so machine output stays
+  // clean; auto-degrades to plain phase lines in non-TTY environments (CI logs).
+  const spinner: Spinner | undefined = jsonOutput
+    ? undefined
+    : createSpinner(`Installing ${scanned.name}@${targetVersion} with ${manager}...`);
 
   let pkg = await readPackageJson(cwd);
   pkg = setRange(pkg, scanned.section, scanned.name, targetVersion);
@@ -520,8 +527,12 @@ async function attemptSingleUpgradeUnlocked(
 
   if (!install.ok) {
     const esm = detectEsmCommonJsBlockage(install.output);
+    spinner?.update(
+      `Rolling back ${scanned.name}: install failed (exit ${install.exitCode ?? '?'})...`,
+    );
     await writeDepRange(cwd, scanned.section, scanned.name, previousRange);
     await install$(installCwd, manager, installOpts);
+    spinner?.stop();
     return {
       ok: false,
       kind: 'install',
@@ -536,8 +547,10 @@ async function attemptSingleUpgradeUnlocked(
   }
 
   if (peerHit && !force) {
+    spinner?.update(`Rolling back ${scanned.name}: peer conflict reported by ${manager}...`);
     await writeDepRange(cwd, scanned.section, scanned.name, previousRange);
     await install$(installCwd, manager, installOpts);
+    spinner?.stop();
     return {
       ok: false,
       kind: 'peer',
@@ -551,15 +564,23 @@ async function attemptSingleUpgradeUnlocked(
   // Validator runs against the install root (where the actual node_modules live), but it reads
   // its `scripts` from the **install root's** package.json, not the per-child one — workspaces
   // typically declare test/build scripts at the root anyway.
+  spinner?.update(`Validating ${scanned.name}@${targetVersion}: resolving validator...`);
   const validatorPkg = await readPackageJson(installCwd);
   const validation = await validateProject(installCwd, validatorPkg, {
     ...(opts.validate ?? {}),
     manager,
+    onResolved: ({ command }) => {
+      spinner?.update(`Validating ${scanned.name}@${targetVersion}: \`${command}\`...`);
+    },
   });
   const diag = validation.skipped ? undefined : toValidationDiagnostic(validation);
   if (!validation.ok && !force) {
+    spinner?.update(
+      `Rolling back ${scanned.name}: \`${validation.command}\` failed (exit ${validation.exitCode ?? '?'})...`,
+    );
     await writeDepRange(cwd, scanned.section, scanned.name, previousRange);
     await install$(installCwd, manager, installOpts);
+    spinner?.stop();
     return {
       ok: false,
       kind: 'validation-script',
@@ -570,6 +591,7 @@ async function attemptSingleUpgradeUnlocked(
   }
 
   if (!validation.ok && force) {
+    spinner?.stop();
     return {
       ok: true,
       message: `Kept upgrade despite ${validation.command} failure (--force)`,
@@ -578,6 +600,7 @@ async function attemptSingleUpgradeUnlocked(
     };
   }
 
+  spinner?.stop();
   return { ok: true, validation: diag, install: installDiag };
 }
 
@@ -613,7 +636,7 @@ async function attemptBatchUpgradeUnlocked(
   bumps: Bump[],
   opts: UpgradeEngineOptions,
 ): Promise<AttemptResult> {
-  const { force } = opts;
+  const { force, jsonOutput } = opts;
   const manager = (opts.projectInfo?.manager ?? 'npm') as InstallManager;
   const installCwd = opts.installCwd ?? cwd;
   const installOpts = installFilterOptions(opts);
@@ -626,6 +649,17 @@ async function attemptBatchUpgradeUnlocked(
   for (const { scanned } of bumps) {
     previous.set(scanned.name, { section: scanned.section, range: scanned.currentRange });
   }
+
+  // Compact batch label — first three packages, then "…+N more" if the group is larger. Avoids
+  // blowing up the spinner line on big linked groups (e.g. 20-package Nx bundles).
+  const batchLabel = (() => {
+    const names = bumps.map((b) => `${b.scanned.name}@${b.targetVersion}`);
+    if (names.length <= 3) return names.join(', ');
+    return `${names.slice(0, 3).join(', ')} …+${names.length - 3} more`;
+  })();
+  const spinner: Spinner | undefined = jsonOutput
+    ? undefined
+    : createSpinner(`Installing batch (${bumps.length} pkgs) with ${manager}: ${batchLabel}...`);
 
   let pkg = await readPackageJson(cwd);
   for (const { scanned, targetVersion } of bumps) {
@@ -651,7 +685,11 @@ async function attemptBatchUpgradeUnlocked(
 
   if (!install.ok) {
     const esm = detectEsmCommonJsBlockage(install.output);
+    spinner?.update(
+      `Rolling back batch: install failed (exit ${install.exitCode ?? '?'})...`,
+    );
     await rollbackAll();
+    spinner?.stop();
     return {
       ok: false,
       kind: 'install',
@@ -666,7 +704,9 @@ async function attemptBatchUpgradeUnlocked(
   }
 
   if (peerHit && !force) {
+    spinner?.update(`Rolling back batch: peer conflict reported by ${manager}...`);
     await rollbackAll();
+    spinner?.stop();
     return {
       ok: false,
       kind: 'peer',
@@ -677,14 +717,22 @@ async function attemptBatchUpgradeUnlocked(
     };
   }
 
+  spinner?.update(`Validating batch (${bumps.length} pkgs): resolving validator...`);
   const validatorPkg = await readPackageJson(installCwd);
   const validation = await validateProject(installCwd, validatorPkg, {
     ...(opts.validate ?? {}),
     manager,
+    onResolved: ({ command }) => {
+      spinner?.update(`Validating batch (${bumps.length} pkgs): \`${command}\`...`);
+    },
   });
   const diag = validation.skipped ? undefined : toValidationDiagnostic(validation);
   if (!validation.ok && !force) {
+    spinner?.update(
+      `Rolling back batch: \`${validation.command}\` failed (exit ${validation.exitCode ?? '?'})...`,
+    );
     await rollbackAll();
+    spinner?.stop();
     return {
       ok: false,
       kind: 'validation-script',
@@ -695,6 +743,7 @@ async function attemptBatchUpgradeUnlocked(
   }
 
   if (!validation.ok && force) {
+    spinner?.stop();
     return {
       ok: true,
       message: `Kept upgrade despite ${validation.command} failure (--force)`,
@@ -703,6 +752,7 @@ async function attemptBatchUpgradeUnlocked(
     };
   }
 
+  spinner?.stop();
   return { ok: true, validation: diag, install: installDiag };
 }
 
@@ -1758,10 +1808,25 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
     // Pre-flight runs against the install root (where node_modules + the validator live), not
     // necessarily the per-target package.json that's about to be mutated.
     const installRootPkg = await readPackageJson(installCwd);
+    const preflightSpinner = jsonOutput
+      ? undefined
+      : createSpinner('Pre-flight: verifying current tree is healthy before any upgrade...');
     const pre = await preflightValidate(installCwd, installRootPkg, {
       ...(engineOpts.validate ?? {}),
       manager: projectInfo.manager,
+      onResolved: ({ command }) => {
+        preflightSpinner?.update(`Pre-flight: running \`${command}\` on unchanged tree...`);
+      },
     });
+    if (pre.skipped) {
+      preflightSpinner?.stop('Pre-flight: no validator available (skipped)');
+    } else if (pre.ok) {
+      preflightSpinner?.succeed(`Pre-flight ok: \`${pre.command}\``);
+    } else {
+      preflightSpinner?.fail(
+        `Pre-flight failed: \`${pre.command}\` exited ${pre.exitCode ?? '?'}`,
+      );
+    }
     if (!pre.skipped) {
       report.preflight = {
         ok: pre.ok,
@@ -1773,9 +1838,6 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
       };
       if (!pre.ok) {
         if (!jsonOutput) {
-          log.error(
-            `Pre-flight validator failed: \`${pre.command}\` exited ${pre.exitCode ?? '?'} on the unchanged tree.`,
-          );
           log.warn(
             'Every per-group rollback would look identical because the validator is already broken before any upgrade.',
           );
@@ -2025,10 +2087,25 @@ export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalRep
 
   if (!dryRun) {
     const installRootPkg = await readPackageJson(rootCwd);
+    const preflightSpinner = jsonOutput
+      ? undefined
+      : createSpinner('Pre-flight: verifying current tree is healthy before any upgrade...');
     const pre = await preflightValidate(rootCwd, installRootPkg, {
       ...(opts.validate ?? {}),
       manager: projectInfo.manager,
+      onResolved: ({ command }) => {
+        preflightSpinner?.update(`Pre-flight: running \`${command}\` on unchanged tree...`);
+      },
     });
+    if (pre.skipped) {
+      preflightSpinner?.stop('Pre-flight: no validator available (skipped)');
+    } else if (pre.ok) {
+      preflightSpinner?.succeed(`Pre-flight ok: \`${pre.command}\``);
+    } else {
+      preflightSpinner?.fail(
+        `Pre-flight failed: \`${pre.command}\` exited ${pre.exitCode ?? '?'}`,
+      );
+    }
     if (!pre.skipped) {
       aggregate.preflight = {
         ok: pre.ok,
@@ -2040,9 +2117,6 @@ export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalRep
       };
       if (!pre.ok && !force) {
         if (!jsonOutput) {
-          log.error(
-            `Pre-flight validator failed: \`${pre.command}\` exited ${pre.exitCode ?? '?'} on the unchanged tree.`,
-          );
           if (pre.lastLines) {
             log.dim(indentBlock(pre.lastLines, '    '));
           }

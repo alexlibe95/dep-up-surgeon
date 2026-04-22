@@ -60,8 +60,8 @@
     }
   ],
   "installMode": "root",
-  "finishedAt": "2026-04-20T15:41:42.735Z",
-  "toolVersion": "2.2.3",
+  "finishedAt": "2026-04-22T16:44:30.494Z",
+  "toolVersion": "2.2.4",
   "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/02-react-dom-types",
   "dryRun": true
 }

@@ -175,8 +175,8 @@
     }
   ],
   "installMode": "root",
-  "finishedAt": "2026-04-20T15:42:03.379Z",
-  "toolVersion": "2.2.3",
+  "finishedAt": "2026-04-22T16:44:54.359Z",
+  "toolVersion": "2.2.4",
   "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/11-nest-sample-cats",
   "dryRun": true
 }
