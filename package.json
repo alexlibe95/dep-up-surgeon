@@ -1,6 +1,6 @@
 {
   "name": "dep-up-surgeon",
-  "version": "2.2.7",
+  "version": "2.2.8",
   "description": "Upgrade npm dependencies one-by-one with validation, rollback, and conflict reporting.",
   "main": "dist/cli.js",
   "bin": {

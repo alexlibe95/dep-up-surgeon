@@ -307,8 +307,8 @@
     }
   ],
   "installMode": "root",
-  "finishedAt": "2026-04-24T21:54:11.668Z",
-  "toolVersion": "2.2.6",
+  "finishedAt": "2026-04-24T22:08:11.116Z",
+  "toolVersion": "2.2.7",
   "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/12-express-style",
   "dryRun": true
 }

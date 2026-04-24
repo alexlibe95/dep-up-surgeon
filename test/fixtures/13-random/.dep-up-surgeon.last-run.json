@@ -345,8 +345,8 @@
     }
   ],
   "installMode": "root",
-  "finishedAt": "2026-04-24T21:54:19.794Z",
-  "toolVersion": "2.2.6",
+  "finishedAt": "2026-04-24T22:08:21.426Z",
+  "toolVersion": "2.2.7",
   "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/13-random",
   "dryRun": true
 }

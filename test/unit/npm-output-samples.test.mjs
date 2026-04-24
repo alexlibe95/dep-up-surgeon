@@ -12,9 +12,12 @@ const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
 const { parseConflictsFromNpmOutput, parseEresolveFallback } = await import(
   path.join(root, 'dist/core/conflictParser.js')
 );
-const { classifiedHasPeerLikeFailure, extractClassifiedConflicts, mergeParsedConflicts } = await import(
-  path.join(root, 'dist/core/conflictAnalyzer.js')
-);
+const {
+  classifiedHasPeerLikeFailure,
+  extractClassifiedConflicts,
+  mergeParsedConflicts,
+  shouldRollbackAfterSuccessfulInstall,
+} = await import(path.join(root, 'dist/core/conflictAnalyzer.js'));
 
 test('parse npm ERR! Could not resolve tail: pkg@range (no space before @)', () => {
   const line =
@@ -184,4 +187,34 @@ test('merge dedupes identical peer edges (line + global extract)', () => {
         c.dependency === 'eslint' && c.depender === 'eslint-plugin-react@7.37.5' && c.requiredRange === '^3',
     ).length === 1,
   );
+});
+
+// npm exit 0 + only override warnings: keep the install (do not post-install roll back)
+test('shouldRollbackAfterSuccessfulInstall: false for npm ERESOLVE override warnings', () => {
+  const out = [
+    'npm warn ERESOLVE overriding peer dependency',
+    'npm warn While resolving: eslint-plugin-react@7.37.5',
+    'npm warn peer eslint@"^3" from eslint-plugin-react@7.37.5',
+  ].join('\n');
+  const c = extractClassifiedConflicts(out);
+  assert.ok(c.length > 0);
+  assert.strictEqual(shouldRollbackAfterSuccessfulInstall(out, c, false, 'npm'), false);
+});
+
+test('shouldRollbackAfterSuccessfulInstall: true when npm hard ERESOLVE even if override text appears', () => {
+  const out = [
+    'npm warn ERESOLVE overriding peer dependency',
+    'npm error code ERESOLVE',
+    'npm error ERESOLVE unable to resolve dependency tree',
+  ].join('\n');
+  const c = extractClassifiedConflicts(out);
+  assert.ok(c.length > 0);
+  assert.strictEqual(shouldRollbackAfterSuccessfulInstall(out, c, false, 'npm'), true);
+});
+
+test('shouldRollbackAfterSuccessfulInstall: no override keyword in log → still roll back', () => {
+  const out = 'npm warn peer eslint@"9" from eslint-plugin@1.0.0';
+  const c = extractClassifiedConflicts(out);
+  assert.ok(c.length > 0, 'expected peer tuple');
+  assert.strictEqual(shouldRollbackAfterSuccessfulInstall(out, c, false, 'npm'), true);
 });

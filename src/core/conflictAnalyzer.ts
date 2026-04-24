@@ -147,14 +147,49 @@ export function extractClassifiedConflicts(
 }
 
 /**
- * After a **successful** `npm install`, roll back if structured conflicts were detected (unless --force).
- * Uses parsed output instead of broad regex-only heuristics.
+ * npm often completes `npm install` with **exit 0** while logging `ERESOLVE overriding
+ * peer dependency` — the resolved tree is installed, peers were overridden, not
+ * a failed resolution. In that case keeping the upgrade is the expected outcome; rolling
+ * back every dependent bump forces users to "fix by hand" for eslint-config-next + ESLint 10
+ * and similar. We still roll back on `--force` false when there is a *hard* failure line
+ * (`npm error code` / `npm ERR!`) or an irrecoverable ERESOLVE error block in the log.
+ */
+function npmOverrodePeersButInstallSucceeded(
+  fullOutput: string,
+  _classified: ClassifiedConflict[],
+): boolean {
+  const t = fullOutput || '';
+  if (!/overriding peer dependency/i.test(t)) {
+    return false;
+  }
+  // Unrecoverable tree (usually accompany exit ≠ 0; be strict if text appears anyway)
+  if (/\bnpm error code ERESOLVE\b/i.test(t) && /\bunable to resolve dependency tree/i.test(t)) {
+    return false;
+  }
+  // Real npm-failure lines; do not keep the install if npm emitted these
+  if (/(?:^|\n)npm error code /m.test(t) || /(?:^|\n)npm ERR! /m.test(t)) {
+    return false;
+  }
+  return true;
+}
+
+type PackageManager = 'npm' | 'yarn' | 'pnpm';
+
+/**
+ * After a **successful** `npm install`, roll back if structured conflicts were detected (unless --force),
+ * or when the install is truly suspect. npm-only: if the only issue is the usual `ERESOLVE overriding`
+ * warning block and exit 0, we **do not** roll back.
  */
 export function shouldRollbackAfterSuccessfulInstall(
+  fullOutput: string,
   classified: ClassifiedConflict[],
   force: boolean,
+  manager: PackageManager = 'npm',
 ): boolean {
   if (force || classified.length === 0) {
+    return false;
+  }
+  if (manager === 'npm' && npmOverrodePeersButInstallSucceeded(fullOutput, classified)) {
     return false;
   }
   return true;

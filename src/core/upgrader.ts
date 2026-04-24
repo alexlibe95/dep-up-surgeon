@@ -554,7 +554,12 @@ async function attemptSingleUpgradeUnlocked(
   const install = await install$(installCwd, manager, installOpts);
   const installDiag = toInstallDiagnostic(install);
   const classified = classifyInstallOutput(install.output, opts);
-  const peerHit = shouldRollbackAfterSuccessfulInstall(classified, force);
+  const peerHit = shouldRollbackAfterSuccessfulInstall(
+    install.output ?? '',
+    classified,
+    force,
+    manager,
+  );
 
   if (!install.ok) {
     const esm = detectEsmCommonJsBlockage(install.output);
@@ -710,7 +715,12 @@ async function attemptBatchUpgradeUnlocked(
   const install = await install$(installCwd, manager, installOpts);
   const installDiag = toInstallDiagnostic(install);
   const classified = classifyInstallOutput(install.output, opts);
-  const peerHit = shouldRollbackAfterSuccessfulInstall(classified, force);
+  const peerHit = shouldRollbackAfterSuccessfulInstall(
+    install.output ?? '',
+    classified,
+    force,
+    manager,
+  );
 
   const rollbackAll = async (): Promise<void> => {
     for (const { scanned } of bumps) {

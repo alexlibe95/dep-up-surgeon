@@ -37,8 +37,8 @@
     }
   ],
   "installMode": "root",
-  "finishedAt": "2026-04-24T21:54:00.588Z",
-  "toolVersion": "2.2.6",
+  "finishedAt": "2026-04-24T22:08:00.200Z",
+  "toolVersion": "2.2.7",
   "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/10-astro-minimal",
   "dryRun": true
 }

@@ -51,7 +51,8 @@ export interface Spinner {
 }
 
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-const SPINNER_INTERVAL_MS = 80;
+/** Slower than one common default so scrollback/recordings are not one frame per 80ms. */
+const SPINNER_INTERVAL_MS = 220;
 
 function defaultEnabled(): boolean {
   return Boolean(process.stdout.isTTY);
