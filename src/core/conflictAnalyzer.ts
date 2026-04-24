@@ -1,5 +1,9 @@
 import type { Conflict } from '../types.js';
-import { parseConflictsFromNpmOutput, parseEresolveFallback } from './conflictParser.js';
+import {
+  parseConflictsFromNpmOutput,
+  parseEresolveFallback,
+  dedupeConflicts,
+} from './conflictParser.js';
 
 export type ConflictCategory =
   | 'peerDependencyMismatch'
@@ -40,6 +44,26 @@ export function analyzeConflicts(conflicts: Conflict[]): ClassifiedConflict[] {
     ...c,
     category: classifyConflict(c),
   }));
+}
+
+/**
+ * Deduplicate classified rows while preserving `category` and other fields (same key as
+ * {@link dedupeConflicts}).
+ */
+export function dedupeClassifiedConflicts(
+  list: ClassifiedConflict[],
+): ClassifiedConflict[] {
+  const out: ClassifiedConflict[] = [];
+  const seen = new Set<string>();
+  for (const c of list) {
+    const key = `${c.depender}|${c.dependency}|${c.requiredRange}|${c.installedVersion ?? ''}|${c.attemptedVersion ?? ''}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(c);
+  }
+  return out;
 }
 
 /**
@@ -104,7 +128,11 @@ export function mergeParsedConflicts(output: string, rootPackageName?: string): 
     );
   }
   const keys = new Set(a.map((x) => x.rawMessage));
-  return [...a, ...b.filter((x) => !keys.has(x.rawMessage))];
+  const merged = [
+    ...a,
+    ...b.filter((x) => !keys.has(x.rawMessage)),
+  ];
+  return dedupeConflicts(merged);
 }
 
 export interface ExtractConflictsOptions {

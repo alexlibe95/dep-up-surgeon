@@ -7,12 +7,34 @@ import type { Conflict } from '../types.js';
 
 export type { Conflict } from '../types.js';
 
+function conflictDedupeKey(c: Pick<Conflict, 'depender' | 'dependency' | 'requiredRange' | 'installedVersion' | 'attemptedVersion'>): string {
+  return `${c.depender}|${c.dependency}|${c.requiredRange}|${c.installedVersion ?? ''}|${c.attemptedVersion ?? ''}`;
+}
+
 function pushUnique(out: Conflict[], c: Conflict): void {
-  const key = `${c.depender}|${c.dependency}|${c.requiredRange}|${c.installedVersion ?? ''}|${c.attemptedVersion ?? ''}`;
-  if (out.some((x) => `${x.depender}|${x.dependency}|${x.requiredRange}|${x.installedVersion ?? ''}|${x.attemptedVersion ?? ''}` === key)) {
+  const key = conflictDedupeKey(c);
+  if (out.some((x) => conflictDedupeKey(x) === key)) {
     return;
   }
   out.push(c);
+}
+
+/**
+ * Deduplicate parsed conflict rows (e.g. same edge from line + whole-log fallbacks, or
+ * repeated npm lines).
+ */
+export function dedupeConflicts(list: Conflict[]): Conflict[] {
+  const out: Conflict[] = [];
+  const seen = new Set<string>();
+  for (const c of list) {
+    const key = conflictDedupeKey(c);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(c);
+  }
+  return out;
 }
 
 /** npm 9/10+ “peer (Optional) <pkg>@"<range>" from <dep>@<ver>” (warn, error, or ERESOLVE). */

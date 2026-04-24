@@ -64,8 +64,8 @@
     }
   ],
   "installMode": "root",
-  "finishedAt": "2026-04-24T21:43:35.878Z",
-  "toolVersion": "2.2.5",
+  "finishedAt": "2026-04-24T21:53:44.126Z",
+  "toolVersion": "2.2.6",
   "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/03-custom-linked-groups",
   "dryRun": true
 }

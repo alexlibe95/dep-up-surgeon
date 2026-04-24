@@ -38,6 +38,7 @@ import {
 } from '../utils/concurrency.js';
 import {
   classifiedHasPeerLikeFailure,
+  dedupeClassifiedConflicts,
   extractClassifiedConflicts,
   shouldRollbackAfterSuccessfulInstall,
   type ClassifiedConflict,
@@ -273,14 +274,25 @@ async function writeDepRange(
   await writePackageJson(cwd, next);
 }
 
+function conflictKey(c: { depender: string; dependency: string; requiredRange: string; installedVersion?: string; attemptedVersion?: string }): string {
+  return `${c.depender}|${c.dependency}|${c.requiredRange}|${c.installedVersion ?? ''}|${c.attemptedVersion ?? ''}`;
+}
+
 function pushParsedConflicts(report: FinalReport, classified: ClassifiedConflict[]): void {
-  if (classified.length === 0) {
+  const list = dedupeClassifiedConflicts(classified);
+  if (list.length === 0) {
     return;
   }
   if (!report.parsedConflicts) {
     report.parsedConflicts = [];
   }
-  for (const c of classified) {
+  const existing = new Set(report.parsedConflicts.map((x) => conflictKey(x)));
+  for (const c of list) {
+    const k = conflictKey(c);
+    if (existing.has(k)) {
+      continue;
+    }
+    existing.add(k);
     report.parsedConflicts.push({
       depender: c.depender,
       dependency: c.dependency,
@@ -326,6 +338,24 @@ interface AttemptResult {
   validation?: ValidationDiagnostic;
   /** Install command/exit/last-lines for the install that triggered (or preceded) this result. */
   install?: InstallDiagnostic;
+}
+
+/**
+ * When a later step fails, surface that earlier successful bumps were kept and a hint for
+ * peer-rollback (install exited 0) so the user can --force to keep proposed ranges.
+ */
+function appendInstallFailureContext(report: FinalReport, result: AttemptResult): string {
+  const hadPriorSuccess = report.upgraded.some((u) => u.success && !u.skipped);
+  const keepHint = hadPriorSuccess
+    ? 'Upgrades that completed earlier in this run are still in package.json; this step was reverted.'
+    : '';
+  const forceHint =
+    result.kind === 'peer' && result.install?.ok === true
+      ? 'Re-run with --force to keep the new version ranges despite peer warnings (the package manager still exited 0).'
+      : '';
+  return [result.message, keepHint, forceHint]
+    .filter((s) => s && s.trim() !== '')
+    .join(' ');
 }
 
 function toValidationDiagnostic(v: ValidationResult): ValidationDiagnostic {
@@ -1300,19 +1330,20 @@ async function runSinglePackageUpgrade(
     }
     const classified = result.classified ?? classifyInstallOutput(result.installOutput, opts);
     pushParsedConflicts(report, classified);
+    const fullFailureMessage = appendInstallFailureContext(report, result);
     addFailure(report, {
       name: scanned.name,
       reason: failureReason(kind),
       previousVersion: scanned.currentRange,
       attemptedVersion: lastAttemptedVersion,
-      message: result.message,
+      message: fullFailureMessage,
       conflicts: toConflicts(classified),
       validation: result.validation,
       install: result.install,
     });
     if (!jsonOutput) {
       if (kind === 'peer') {
-        log.peer(`${scanned.name} — ${result.message ?? 'peer conflict'}`);
+        log.peer(`${scanned.name} — ${fullFailureMessage || 'peer conflict'}`);
         if (result.install?.lastLines) {
           log.dim(indentBlock(result.install.lastLines, '    '));
         }
@@ -1691,12 +1722,13 @@ async function runLinkedGroupUpgrade(
     const kind = result.kind ?? 'install';
     const prev = bumps.map((b) => `${b.scanned.name}@${b.scanned.currentRange}`).join(', ');
     const att = bumps.map((b) => `${b.scanned.name}@${b.targetVersion}`).join(', ');
+    const fullGroupFailureMessage = appendInstallFailureContext(report, result);
     addFailure(report, {
       name: `[group:${gid}]`,
       reason: failureReason(kind),
       previousVersion: prev,
       attemptedVersion: att,
-      message: result.message,
+      message: fullGroupFailureMessage,
       linkedGroupId: gid,
       conflicts: toConflicts(result.classified ?? classifyInstallOutput(result.installOutput, opts)),
       validation: result.validation,
@@ -1704,7 +1736,7 @@ async function runLinkedGroupUpgrade(
     });
     if (!jsonOutput) {
       if (kind === 'peer') {
-        log.peer(`group [${gid}] — ${result.message ?? 'peer conflict'}`);
+        log.peer(`group [${gid}] — ${fullGroupFailureMessage || 'peer conflict'}`);
         if (result.install?.lastLines) {
           log.dim(indentBlock(result.install.lastLines, '    '));
         }

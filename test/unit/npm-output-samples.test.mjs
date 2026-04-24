@@ -173,3 +173,15 @@ test('merge: suppress unknown-depender “Conflicting peer” when peer-from exi
   );
   assert.strictEqual(spurious, undefined);
 });
+
+test('merge dedupes identical peer edges (line + global extract)', () => {
+  const line = 'npm warn peer eslint@"^3" from eslint-plugin-react@7.37.5';
+  const block = [line, line, line].join('\n');
+  const merged = mergeParsedConflicts(block);
+  assert.ok(
+    merged.filter(
+      (c) =>
+        c.dependency === 'eslint' && c.depender === 'eslint-plugin-react@7.37.5' && c.requiredRange === '^3',
+    ).length === 1,
+  );
+});

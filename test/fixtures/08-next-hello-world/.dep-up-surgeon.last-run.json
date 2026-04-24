@@ -112,8 +112,8 @@
     }
   ],
   "installMode": "root",
-  "finishedAt": "2026-04-24T21:43:45.370Z",
-  "toolVersion": "2.2.5",
+  "finishedAt": "2026-04-24T21:53:54.380Z",
+  "toolVersion": "2.2.6",
   "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/08-next-hello-world",
   "dryRun": true
 }
