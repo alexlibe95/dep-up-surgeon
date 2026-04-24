@@ -76,15 +76,33 @@ export function groupConflictsByCategory(
 }
 
 /**
- * Merge line-based parses with ERESOLVE fallback (dedupe by raw line).
+ * Merge line-based parses with whole-output `peer from` extraction + ERESOLVE catch-all.
+ * When the global `peer <pkg>@"<range>" from <dep>` scan finds real edges, line-level
+ * matches that only say `depender: unknown` for the same **dependency** (e.g. npm’s
+ * “Conflicting peer dependency: <pkg>@<hypothetical>”) are dropped — they duplicate
+ * the structured tuple and wrong-way label the `need` field.
  */
 export function mergeParsedConflicts(output: string, rootPackageName?: string): Conflict[] {
   const skip =
     rootPackageName && rootPackageName.trim() !== ''
       ? new Set([rootPackageName.trim()])
       : undefined;
-  const a = parseConflictsFromNpmOutput(output, { skipDependencyNames: skip });
+  let a = parseConflictsFromNpmOutput(output, { skipDependencyNames: skip });
   const b = parseEresolveFallback(output);
+  const bWithDepender = b.filter(
+    (c) => c.dependency !== 'unknown' && c.depender !== 'unknown',
+  );
+  if (bWithDepender.length > 0) {
+    const covered = new Set(bWithDepender.map((c) => c.dependency));
+    a = a.filter(
+      (c) =>
+        !(
+          c.depender === 'unknown' &&
+          c.dependency !== 'unknown' &&
+          covered.has(c.dependency)
+        ),
+    );
+  }
   const keys = new Set(a.map((x) => x.rawMessage));
   return [...a, ...b.filter((x) => !keys.has(x.rawMessage))];
 }
@@ -112,4 +130,32 @@ export function shouldRollbackAfterSuccessfulInstall(
     return false;
   }
   return true;
+}
+
+/**
+ * True when the parsed install output looks like a **peer-resolution** failure — i.e. the
+ * install bailed because the dependency tree couldn't be satisfied (npm `ERESOLVE`, yarn
+ * `Couldn't find any versions`, pnpm `ERR_PNPM_PEER_DEP_ISSUES`) rather than an infra
+ * failure (registry 500, disk full, network timeout).
+ *
+ * The main upgrade engine uses this to promote a non-zero install exit from the generic
+ * `kind: 'install'` (which the peer resolver ignores) to `kind: 'peer'` (which the resolver
+ * will actually try to fix). Without this, an `npm install` that exits 1 with a tree of
+ * perfectly-parseable peer edges was being treated as "unknown install failure" and the
+ * resolver never fired — even though it's the exact case it was built for.
+ *
+ * Conservative on purpose: only the three categories that genuinely mean "the dependency
+ * graph itself is the problem". `incompatibleEngine` is excluded (the resolver can't fix a
+ * Node version mismatch). An empty list returns false — no classification, no promotion.
+ */
+export function classifiedHasPeerLikeFailure(
+  classified: ClassifiedConflict[],
+): boolean {
+  if (classified.length === 0) return false;
+  return classified.some(
+    (c) =>
+      c.category === 'peerDependencyMismatch' ||
+      c.category === 'unresolvedTree' ||
+      c.category === 'missingDependency',
+  );
 }

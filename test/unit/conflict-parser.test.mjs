@@ -16,7 +16,8 @@ const { extractClassifiedConflicts } = await import(
 );
 
 test('parseConflictsFromNpmOutput skips root package name when configured', () => {
-  const line = 'While resolving: crypto-market-dashboard@0.0.0';
+  const line =
+    'npm ERR! requires a peer of crypto-market-dashboard@0.0.0 but none is installed';
   const skip = new Set(['crypto-market-dashboard']);
   const a = parseConflictsFromNpmOutput(line, { skipDependencyNames: skip });
   assert.strictEqual(a.length, 0);
@@ -32,10 +33,11 @@ test('parseConflictsFromNpmOutput still parses real package lines', () => {
 
 test('extractClassifiedConflicts passes rootPackageName through', () => {
   const out = [
-    'npm ERR! While resolving: my-app@0.0.0',
+    'npm ERR! requires a peer of my-app@0.0.0 but none is installed',
     'npm ERR! Conflicting peer dependency: foo@1.0.0',
   ].join('\n');
   const c = extractClassifiedConflicts(out, { rootPackageName: 'my-app' });
   const deps = c.map((x) => x.dependency);
   assert.ok(!deps.includes('my-app'));
+  assert.ok(deps.includes('foo'));
 });

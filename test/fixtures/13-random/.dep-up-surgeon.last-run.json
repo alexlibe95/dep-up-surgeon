@@ -46,7 +46,7 @@
       "success": true,
       "skipped": true,
       "from": "0.292.0",
-      "to": "1.8.0",
+      "to": "1.11.0",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-0"
@@ -126,7 +126,7 @@
       "success": true,
       "skipped": true,
       "from": "5.0.0",
-      "to": "8.0.9",
+      "to": "8.0.10",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-1"
@@ -345,8 +345,8 @@
     }
   ],
   "installMode": "root",
-  "finishedAt": "2026-04-22T16:45:07.604Z",
-  "toolVersion": "2.2.4",
+  "finishedAt": "2026-04-24T21:44:09.951Z",
+  "toolVersion": "2.2.5",
   "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/13-random",
   "dryRun": true
 }

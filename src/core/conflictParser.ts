@@ -15,10 +15,26 @@ function pushUnique(out: Conflict[], c: Conflict): void {
   out.push(c);
 }
 
+/** npm 9/10+ “peer (Optional) <pkg>@"<range>" from <dep>@<ver>” (warn, error, or ERESOLVE). */
+const PEER_QUOTED_RANGE_FROM: RegExp =
+  /\b(?:peer|peerOptional)\s+((?:@[^/\s]+\/)?[^\s@]+)@"([^"]+)"\s+from\s+((?:@[^/\s]+\/)?[^\s@]+)@([^\s]+)/i;
+
 const LINE_PATTERNS: Array<{
   re: RegExp;
   map: (m: RegExpMatchArray) => Omit<Conflict, 'rawMessage'> | null;
 }> = [
+  // First: npm 10+ / warn “peer <pkg>@"<range>" from <dep>@<ver>” (must win over
+  // “Conflicting peer dependency: <pkg>@<ver>” and “While resolving:”, which are
+  // low-signal or context-only and would otherwise steal the line in multi-pattern
+  // order).
+  {
+    re: PEER_QUOTED_RANGE_FROM,
+    map: (m) => ({
+      depender: `${m[3]!}@${m[4]!}`,
+      dependency: m[1]!,
+      requiredRange: m[2]!,
+    }),
+  },
   // npm peer missing
   {
     re: /requires a peer of\s+([^\s@]+(?:\/[^\s@]+)?@([^\s]+))\s+but none is installed/i,
@@ -111,15 +127,6 @@ const LINE_PATTERNS: Array<{
     },
   },
   {
-    re: /While resolving:\s+([^\s@]+(?:\/[^\s@]+)?)@([^\s]+)/i,
-    map: (m) => ({
-      depender: 'unknown',
-      dependency: m[1]!.trim(),
-      requiredRange: m[2] ?? '',
-      attemptedVersion: m[2],
-    }),
-  },
-  {
     re: /Fix the upstream dependency conflict, or retry\s+with\s+--force[^\n]*\n[^\n]*\s+peer\s+([^\s]+)\s+from\s+([^\s@]+(?:\/[^\s@]+)?@([^\s]+))/i,
     map: (m) => ({
       depender: m[1]!,
@@ -164,8 +171,8 @@ export function parsePackageSpec(spec: string): { name: string; version?: string
 
 export interface ParseConflictsOptions {
   /**
-   * Skip conflicts whose dependency field matches (e.g. root `package.json` `name`).
-   * npm often prints `While resolving: <app>@0.0.0` which is not a registry package conflict.
+   * Skip conflicts whose `dependency` field matches (e.g. root `package.json` `name`) when
+   * npm’s generic patterns attach the root app name to a line.
    */
   skipDependencyNames?: Set<string>;
 }
@@ -221,10 +228,37 @@ export function parseConflictsFromNpmOutput(output: string, options?: ParseConfl
 
 /**
  * Fallback when no structured lines matched but npm clearly failed resolution.
+ *
+ * We first try to extract the npm 10+ indented `peer <pkg>@"<range>" from <dep>@<ver>` blocks
+ * (the same pattern the per-line parser scans for) — this is worth doing at the whole-output
+ * level too, because some wrappers (pnpm, yarn-via-corepack) reformat npm's output and the
+ * per-line scanner can miss them. Only when nothing structured matches do we emit the
+ * catch-all `unknown ← unknown` marker so downstream consumers still see "something peer-ish
+ * went wrong" instead of an empty list.
  */
 export function parseEresolveFallback(output: string): Conflict[] {
   const t = output || '';
-  if (!/ERESOLVE|unable to resolve dependency tree/i.test(t)) {
+  const out: Conflict[] = [];
+  const globalPeer = new RegExp(PEER_QUOTED_RANGE_FROM.source, 'gi');
+  let match: RegExpExecArray | null;
+  while ((match = globalPeer.exec(t)) !== null) {
+    const dependency = match[1]!;
+    const range = match[2]!;
+    const dependerName = match[3]!;
+    const dependerVer = match[4]!;
+    pushUnique(out, {
+      depender: `${dependerName}@${dependerVer}`,
+      dependency,
+      requiredRange: range,
+      rawMessage: match[0]!,
+    });
+  }
+  if (out.length > 0) {
+    return out;
+  }
+  if (
+    !/ERESOLVE|unable to resolve dependency tree|overriding peer dependency/i.test(t)
+  ) {
     return [];
   }
   return [
@@ -232,7 +266,7 @@ export function parseEresolveFallback(output: string): Conflict[] {
       depender: 'unknown',
       dependency: 'unknown',
       requiredRange: '*',
-      rawMessage: t.split(/\r?\n/).find((l) => /ERESOLVE|unable to resolve/i.test(l)) ?? 'ERESOLVE',
+      rawMessage: t.split(/\r?\n/).find((l) => /ERESOLVE|unable to resolve|overriding peer/i.test(l)) ?? 'ERESOLVE',
     },
   ];
 }

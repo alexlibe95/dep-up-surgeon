@@ -37,6 +37,7 @@ import {
   type RegistryCache,
 } from '../utils/concurrency.js';
 import {
+  classifiedHasPeerLikeFailure,
   extractClassifiedConflicts,
   shouldRollbackAfterSuccessfulInstall,
   type ClassifiedConflict,
@@ -527,6 +528,13 @@ async function attemptSingleUpgradeUnlocked(
 
   if (!install.ok) {
     const esm = detectEsmCommonJsBlockage(install.output);
+    // Promote ERESOLVE-style failures to `kind: 'peer'` so the resolver (ad-hoc for singles,
+    // intersection for batches) gets a chance. npm 10 exits non-zero on ERESOLVE — without
+    // this promotion the result was classified as a generic install failure and the resolver
+    // was never invoked, even though the classified output already proves it's a peer problem.
+    // ESM/CommonJS mismatches are deliberately NOT promoted — the resolver can't pick an
+    // older version of Node.js for you.
+    const peerLike = !esm && classifiedHasPeerLikeFailure(classified);
     spinner?.update(
       `Rolling back ${scanned.name}: install failed (exit ${install.exitCode ?? '?'})...`,
     );
@@ -535,10 +543,12 @@ async function attemptSingleUpgradeUnlocked(
     spinner?.stop();
     return {
       ok: false,
-      kind: 'install',
+      kind: peerLike ? 'peer' : 'install',
       message: esm
         ? `${install.command} failed (exit ${install.exitCode}): ESM/CommonJS mismatch (e.g. ERR_REQUIRE_ESM). Newer releases may be ESM-only while this project is CommonJS — pin the package, migrate to ESM, or ignore it.`
-        : `${install.command} failed (exit ${install.exitCode})`,
+        : peerLike
+          ? `${install.command} failed (exit ${install.exitCode}): peer dependency conflict — the resolver will try to find a compatible tuple`
+          : `${install.command} failed (exit ${install.exitCode})`,
       abortFallbacks: esm,
       installOutput: install.output,
       classified,
@@ -685,6 +695,12 @@ async function attemptBatchUpgradeUnlocked(
 
   if (!install.ok) {
     const esm = detectEsmCommonJsBlockage(install.output);
+    // Same ERESOLVE → `kind: 'peer'` promotion as the single-upgrade path. Critical for
+    // linked-group bumps because npm 10 `ERESOLVE` is the *normal* failure mode for multi-
+    // package Angular / Nx / Nuxt bumps where one member's peer range lags a release behind
+    // its siblings — the intersection resolver was designed for exactly that case but only
+    // fires on `kind: 'peer'`.
+    const peerLike = !esm && classifiedHasPeerLikeFailure(classified);
     spinner?.update(
       `Rolling back batch: install failed (exit ${install.exitCode ?? '?'})...`,
     );
@@ -692,10 +708,12 @@ async function attemptBatchUpgradeUnlocked(
     spinner?.stop();
     return {
       ok: false,
-      kind: 'install',
+      kind: peerLike ? 'peer' : 'install',
       message: esm
         ? `${install.command} failed (exit ${install.exitCode}): ESM/CommonJS mismatch (e.g. ERR_REQUIRE_ESM). Newer releases may be ESM-only while this project is CommonJS — pin the package, migrate to ESM, or ignore it.`
-        : `${install.command} failed (exit ${install.exitCode})`,
+        : peerLike
+          ? `${install.command} failed (exit ${install.exitCode}): peer dependency conflict — the resolver will try to find a compatible tuple`
+          : `${install.command} failed (exit ${install.exitCode})`,
       abortFallbacks: esm,
       installOutput: install.output,
       classified,
