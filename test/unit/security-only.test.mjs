@@ -321,7 +321,11 @@ test('runUpgradeFlow: validator passing on recommended version keeps the upgrade
   const validateCmd = `node -e "process.exit(0)"`;
 
   const cache = createRegistryCache();
-  cache.latest.set('axios', Promise.resolve('1.6.0'));
+  // Latest is intentionally NEWER than the advisory fix — without preferredTargets the
+  // engine would climb to 1.7.0. With preferredTargets it should land on 1.6.0 first.
+  cache.latest.set('axios', Promise.resolve('1.7.0'));
+  // Packument for fallbacks if preferred somehow fails (not expected in this test).
+  cache.versions.set('axios', Promise.resolve(['0.21.0', '1.6.0', '1.7.0']));
 
   const report = await runUpgradeFlow({
     cwd: dir,
@@ -330,22 +334,24 @@ test('runUpgradeFlow: validator passing on recommended version keeps the upgrade
     force: false,
     jsonOutput: true,
     ignore: new Set(),
-    fallbackStrategy: 'highest-stable',
-    linkGroups: 'off',
+    fallbackStrategy: 'none',
+    linkGroups: 'none',
     linkedGroupsConfig: [],
     validate: { command: validateCmd, source: 'cli' },
     restrictToNames: new Set(['axios']),
+    preferredTargets: new Map([['axios', '1.6.0']]),
     registryCache: cache,
     installer,
     resolvePeers: false,
   });
 
   const after = JSON.parse(await fs.readFile(pkgPath, 'utf8'));
-  assert.match(
+  assert.strictEqual(
     after.dependencies.axios,
-    /1\.6\.0/,
-    `axios must be bumped to 1.6.0 when validator passes; got ${after.dependencies.axios}`,
+    '^1.6.0',
+    `axios must keep caret style and preferred security version; got ${after.dependencies.axios}`,
   );
   const axiosRow = (report.upgraded ?? []).find((u) => u.name === 'axios');
   assert.ok(axiosRow && axiosRow.success, `expected axios success row; got ${JSON.stringify(axiosRow)}`);
+  assert.strictEqual(axiosRow.to, '^1.6.0');
 });

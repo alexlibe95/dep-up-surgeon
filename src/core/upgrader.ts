@@ -57,6 +57,13 @@ import {
   type ResolverInput,
 } from './peerResolver.js';
 import { tryResolveAdHocPeerConflict } from './peerResolverAdHoc.js';
+import { formatUpgradeRange } from '../utils/rangeStyle.js';
+import {
+  loadLockfileVersionTree,
+  resolveInstalledVersion,
+  type LockfileVersionTree,
+} from '../utils/installedVersion.js';
+import { dedupeScannedByName } from './scannedDedup.js';
 
 const BACKUP_FILENAME = 'package.json.dep-up-surgeon.bak';
 
@@ -210,6 +217,27 @@ export interface UpgradeEngineOptions {
    * Never exposed on the CLI — this is a programmatic hook exclusively.
    */
   installer?: typeof runInstall;
+  /**
+   * Optional per-package preferred target versions (e.g. audit `recommendedVersion` under
+   * `--security-only`). When set, that version is tried before climbing toward `@latest`.
+   */
+  preferredTargets?: Map<string, string>;
+  /**
+   * When `true`, upgrade `peerDependencies` entries. Default `false` — peers are a consumer
+   * contract and auto-bumping them is usually wrong for libraries.
+   */
+  includePeers?: boolean;
+  /**
+   * When `true`, write bare exact versions (`1.2.3`) instead of preserving `^` / `~` from the
+   * previous range. Default `false` (preserve style).
+   */
+  pinExact?: boolean;
+  /**
+   * Pre-parsed lockfile version tree (package → installed versions). Used to decide "already
+   * latest" based on what is actually installed rather than the declared range floor.
+   * When omitted, the engine loads it once from `installCwd`.
+   */
+  lockfileVersions?: LockfileVersionTree;
 }
 
 /**
@@ -261,6 +289,17 @@ function setRange(
   sectionMap[name] = range;
   next[section] = sectionMap;
   return next;
+}
+
+/** Write `targetVersion` into package.json, preserving ^/~ unless `pinExact` is set. */
+function setUpgradeVersion(
+  pkg: PackageJson,
+  scanned: ScannedPackage,
+  targetVersion: string,
+  pinExact: boolean | undefined,
+): PackageJson {
+  const written = pinExact ? targetVersion : formatUpgradeRange(scanned.currentRange, targetVersion);
+  return setRange(pkg, scanned.section, scanned.name, written);
 }
 
 async function writeDepRange(
@@ -548,7 +587,7 @@ async function attemptSingleUpgradeUnlocked(
     : createSpinner(`Installing ${scanned.name}@${targetVersion} with ${manager}...`);
 
   let pkg = await readPackageJson(cwd);
-  pkg = setRange(pkg, scanned.section, scanned.name, targetVersion);
+  pkg = setUpgradeVersion(pkg, scanned, targetVersion, opts.pinExact);
   await writePackageJson(cwd, pkg);
 
   const install = await install$(installCwd, manager, installOpts);
@@ -708,7 +747,7 @@ async function attemptBatchUpgradeUnlocked(
 
   let pkg = await readPackageJson(cwd);
   for (const { scanned, targetVersion } of bumps) {
-    pkg = setRange(pkg, scanned.section, scanned.name, targetVersion);
+    pkg = setUpgradeVersion(pkg, scanned, targetVersion, opts.pinExact);
   }
   await writePackageJson(cwd, pkg);
 
@@ -844,6 +883,19 @@ async function upgradeWithReleaseLineFallbacks(
     }
   }
 
+  // `--security-only` (and similar): try the audit-recommended fix BEFORE climbing to
+  // `@latest`. Still keep the rest of the ladder so a bad recommended pin can fall through.
+  const preferred = opts.preferredTargets?.get(scanned.name);
+  if (preferred && semver.valid(preferred)) {
+    const curClean = semver.coerce(currentSemver)?.version;
+    // Prefer recommended even when it equals current (noop would be skipped earlier) or is
+    // a patch above current. Skip inserting if it's a downgrade relative to installed —
+    // security mode still wants the fix, so allow preferred when it differs from current.
+    if (!curClean || !semver.eq(preferred, curClean)) {
+      candidates = [preferred, ...candidates.filter((v) => v !== preferred)];
+    }
+  }
+
   // Apply policy before the fallback walker so we never install a version the user
   // explicitly blocked. Keeping the candidates in their original order preserves the
   // "try latest first, then walk down" behavior the user expects; we just drop entries.
@@ -917,8 +969,20 @@ async function upgradeWithReleaseLineFallbacks(
 
     last = await attemptSingleUpgrade(cwd, scanned, target, opts);
     if (last.ok) {
-      const usedFallback = target !== registryLatest;
-      return { result: last, chosenVersion: target, usedFallback, lastAttemptedVersion: target };
+      // With a preferred security pin: success at preferred is the happy path (not a
+      // "fallback"). Success at any other version (e.g. latest after preferred failed) is.
+      // Without preferred: anything other than registry latest is a release-line fallback.
+      const preferredHit = opts.preferredTargets?.get(scanned.name);
+      const usedFallback =
+        preferredHit && semver.valid(preferredHit)
+          ? target !== preferredHit
+          : target !== registryLatest;
+      return {
+        result: last,
+        chosenVersion: target,
+        usedFallback,
+        lastAttemptedVersion: target,
+      };
     }
     if (last.abortFallbacks) {
       if (!jsonOutput) {
@@ -1076,6 +1140,20 @@ async function runSinglePackageUpgrade(
 ): Promise<void> {
   const { dryRun, interactive, jsonOutput } = opts;
 
+  if (scanned.section === 'peerDependencies' && !opts.includePeers) {
+    addUpgrade(report, {
+      name: scanned.name,
+      success: true,
+      skipped: true,
+      reason: 'skipped',
+      detail: 'peerDependency (pass --include-peers to upgrade)',
+    });
+    if (!jsonOutput) {
+      log.dim(`Skipped ${scanned.name} (peerDependency — pass --include-peers to upgrade)`);
+    }
+    return;
+  }
+
   if (isWorkspaceInternal(scanned.name, opts)) {
     addUpgrade(report, {
       name: scanned.name,
@@ -1121,8 +1199,12 @@ async function runSinglePackageUpgrade(
     return;
   }
 
-  const cur = semver.coerce(scanned.currentRange);
-  if (!cur) {
+  const fromVersion = resolveInstalledVersion({
+    name: scanned.name,
+    declaredRange: scanned.currentRange,
+    lockfileVersions: opts.lockfileVersions,
+  });
+  if (!fromVersion) {
     addUpgrade(report, {
       name: scanned.name,
       success: true,
@@ -1133,12 +1215,12 @@ async function runSinglePackageUpgrade(
     return;
   }
 
-  if (semver.eq(cur.version, latest)) {
+  if (semver.eq(fromVersion, latest)) {
     addUpgrade(report, {
       name: scanned.name,
       success: true,
       skipped: true,
-      from: cur.version,
+      from: scanned.currentRange,
       to: latest,
       reason: 'skipped',
       detail: 'already latest',
@@ -1149,18 +1231,54 @@ async function runSinglePackageUpgrade(
     return;
   }
 
-  if (dryRun) {
+  if (semver.gt(fromVersion, latest)) {
     addUpgrade(report, {
       name: scanned.name,
       success: true,
       skipped: true,
-      from: cur.version,
+      from: scanned.currentRange,
       to: latest,
       reason: 'skipped',
-      detail: 'dry-run',
+      detail: 'ahead of latest',
     });
     if (!jsonOutput) {
-      log.info(`[dry-run] ${scanned.name}: ${cur.version} → ${latest}`);
+      log.dim(`${scanned.name} ahead of latest (${fromVersion} > ${latest}) — skipping`);
+    }
+    return;
+  }
+
+  // Security preferred pin that equals installed — nothing to do for the minimal fix.
+  const preferred = opts.preferredTargets?.get(scanned.name);
+  if (preferred && semver.valid(preferred) && semver.eq(preferred, fromVersion)) {
+    addUpgrade(report, {
+      name: scanned.name,
+      success: true,
+      skipped: true,
+      from: scanned.currentRange,
+      to: preferred,
+      reason: 'skipped',
+      detail: 'already at recommended security version',
+    });
+    if (!jsonOutput) {
+      log.dim(`${scanned.name} already at recommended security version (${preferred})`);
+    }
+    return;
+  }
+
+  if (dryRun) {
+    const plannedTo = preferred && semver.valid(preferred) ? preferred : latest;
+    addUpgrade(report, {
+      name: scanned.name,
+      success: true,
+      skipped: true,
+      from: scanned.currentRange,
+      to: plannedTo,
+      reason: 'skipped',
+      detail: preferred && semver.valid(preferred) ? 'dry-run (preferred security target)' : 'dry-run',
+      requestedLatest: latest,
+    });
+    if (!jsonOutput) {
+      log.info(`[dry-run] ${scanned.name}: ${fromVersion} → ${plannedTo}`);
     }
     return;
   }
@@ -1170,7 +1288,11 @@ async function runSinglePackageUpgrade(
       opts.fallbackStrategy === 'major-lines' || opts.fallbackStrategy === 'minor-lines'
         ? ' (may try older release lines if latest fails)'
         : '';
-    log.info(`Upgrading ${scanned.name}: ${cur.version} → latest ${latest}${fb} …`);
+    const prefLabel =
+      preferred && semver.valid(preferred) && preferred !== latest
+        ? ` (preferred ${preferred}, latest ${latest})`
+        : ` → latest ${latest}`;
+    log.info(`Upgrading ${scanned.name}: ${fromVersion}${prefLabel}${fb} …`);
   }
 
   let {
@@ -1178,7 +1300,7 @@ async function runSinglePackageUpgrade(
     chosenVersion,
     usedFallback,
     lastAttemptedVersion,
-  } = await upgradeWithReleaseLineFallbacks(cwd, scanned, cur.version, latest, opts);
+  } = await upgradeWithReleaseLineFallbacks(cwd, scanned, fromVersion, latest, opts);
 
   // Ad-hoc peer-range resolver for **non-linked** single-package bumps. The resolver in
   // `peerResolver.ts` traditionally only fires for linked groups — a single bump that
@@ -1256,17 +1378,21 @@ async function runSinglePackageUpgrade(
         chosenVersion,
         usedFallback,
         lastAttemptedVersion,
-      } = await upgradeWithReleaseLineFallbacks(cwd, scanned, cur.version, latest, opts));
+      } = await upgradeWithReleaseLineFallbacks(cwd, scanned, fromVersion, latest, opts));
     }
   }
 
   if (result.ok) {
-    const to = chosenVersion ?? latest;
+    const chosen = chosenVersion ?? latest;
+    const writtenTo = opts.pinExact
+      ? chosen
+      : formatUpgradeRange(scanned.currentRange, chosen);
     const row: UpgradeRecord = {
       name: scanned.name,
       success: true,
-      from: cur.version,
-      to,
+      // Preserve the original declared range so `undo` can restore it exactly (including ^/~).
+      from: scanned.currentRange,
+      to: writtenTo,
       requestedLatest: latest,
       usedFallback,
     };
@@ -1313,10 +1439,10 @@ async function runSinglePackageUpgrade(
     if (!jsonOutput) {
       if (usedFallback) {
         log.success(
-          `upgraded: ${scanned.name} → ${to} (latest ${latest} failed; fallback succeeded)`,
+          `upgraded: ${scanned.name} → ${writtenTo} (latest ${latest} failed; fallback succeeded)`,
         );
       } else {
-        log.success(`upgraded: ${scanned.name} → ${to}`);
+        log.success(`upgraded: ${scanned.name} → ${writtenTo}`);
       }
     }
     await fireUpgradeApplied(opts, [row], cwd, undefined);
@@ -1329,7 +1455,7 @@ async function runSinglePackageUpgrade(
         name: scanned.name,
         success: true,
         skipped: true,
-        from: cur.version,
+        from: scanned.currentRange,
         reason: 'policy',
         detail: result.message,
       });
@@ -1451,8 +1577,81 @@ async function tryResolvePeerIntersection(
 }
 
 /**
- * Linked group: bump all to registry `@latest` in one shot (no per-package fallback ladder).
- * TODO: peer-graph / `expo install`-style alignment for Expo SDK
+ * After a linked-group all-to-latest attempt fails, walk every member back along their
+ * major (or minor) release lines in lockstep — attempt N uses each package's N-th
+ * fallback candidate. Caps at 5 coordinated tries to avoid install storms.
+ *
+ * Mutates `bumps[].targetVersion` in place on success path candidates. Returns the last
+ * attempt result when any attempt succeeds; otherwise `undefined` (caller keeps prior failure).
+ */
+async function tryCoordinatedGroupFallback(
+  cwd: string,
+  bumps: Bump[],
+  opts: UpgradeEngineOptions,
+  gid: string,
+  jsonOutput: boolean,
+): Promise<AttemptResult | undefined> {
+  const mode = opts.fallbackStrategy === 'minor-lines' ? 'minor' : 'major';
+  const ladders: string[][] = [];
+  for (const b of bumps) {
+    const fromVersion =
+      resolveInstalledVersion({
+        name: b.scanned.name,
+        declaredRange: b.scanned.currentRange,
+        lockfileVersions: opts.lockfileVersions,
+      }) ?? semver.coerce(b.scanned.currentRange)?.version;
+    if (!fromVersion) {
+      ladders.push([b.targetVersion]);
+      continue;
+    }
+    try {
+      const all = await fetchAllPublishedVersions(b.scanned.name, opts.registryCache);
+      const latest =
+        (await fetchLatestVersion(b.scanned.name, opts.registryCache).catch(() => b.targetVersion)) ??
+        b.targetVersion;
+      const order = buildLineFallbackOrder(fromVersion, latest, all, mode);
+      // Drop the first entry when it's the version we already tried.
+      const rest = order.filter((v) => v !== b.targetVersion);
+      ladders.push(rest.length > 0 ? rest : []);
+    } catch {
+      ladders.push([]);
+    }
+  }
+
+  const maxSteps = Math.min(5, Math.max(0, ...ladders.map((l) => l.length)));
+  if (maxSteps === 0) return undefined;
+
+  const originalTargets = bumps.map((b) => b.targetVersion);
+  let last: AttemptResult | undefined;
+  for (let step = 0; step < maxSteps; step++) {
+    let anyChanged = false;
+    for (let i = 0; i < bumps.length; i++) {
+      const next = ladders[i]?.[step];
+      if (next && bumps[i]) {
+        bumps[i]!.targetVersion = next;
+        anyChanged = true;
+      }
+    }
+    if (!anyChanged) break;
+    if (!jsonOutput) {
+      log.warn(
+        `Linked group [${gid}]: coordinated ${mode}-line fallback #${step + 1}: ` +
+          bumps.map((b) => `${b.scanned.name}@${b.targetVersion}`).join(', '),
+      );
+    }
+    last = await attemptBatchUpgrade(cwd, bumps, opts);
+    if (last.ok) return last;
+  }
+  // Restore original targets so subsequent interactive retries start from latest again.
+  for (let i = 0; i < bumps.length; i++) {
+    bumps[i]!.targetVersion = originalTargets[i]!;
+  }
+  return last;
+}
+
+/**
+ * Linked group: bump all to registry `@latest` in one shot, then peer-resolve, then a
+ * bounded coordinated major/minor-line fallback. Expo SDK alignment remains future work.
  */
 async function runLinkedGroupUpgrade(
   cwd: string,
@@ -1469,6 +1668,20 @@ async function runLinkedGroupUpgrade(
   const skippedNonRegistry: ScannedPackage[] = [];
 
   for (const scanned of members) {
+    if (scanned.section === 'peerDependencies' && !opts.includePeers) {
+      addUpgrade(report, {
+        name: scanned.name,
+        success: true,
+        skipped: true,
+        reason: 'skipped',
+        detail: 'peerDependency (pass --include-peers to upgrade)',
+        linkedGroupId: gid,
+      });
+      if (!jsonOutput) {
+        log.dim(`Skipped ${scanned.name} in group [${gid}] (peerDependency)`);
+      }
+      continue;
+    }
     if (isWorkspaceInternal(scanned.name, opts)) {
       addUpgrade(report, {
         name: scanned.name,
@@ -1517,8 +1730,12 @@ async function runLinkedGroupUpgrade(
       continue;
     }
 
-    const cur = semver.coerce(scanned.currentRange);
-    if (!cur) {
+    const fromVersion = resolveInstalledVersion({
+      name: scanned.name,
+      declaredRange: scanned.currentRange,
+      lockfileVersions: opts.lockfileVersions,
+    });
+    if (!fromVersion) {
       addUpgrade(report, {
         name: scanned.name,
         success: true,
@@ -1530,24 +1747,33 @@ async function runLinkedGroupUpgrade(
       continue;
     }
 
-    if (semver.eq(cur.version, latest)) {
+    if (semver.eq(fromVersion, latest) || semver.gt(fromVersion, latest)) {
       addUpgrade(report, {
         name: scanned.name,
         success: true,
         skipped: true,
-        from: cur.version,
+        from: scanned.currentRange,
         to: latest,
         reason: 'skipped',
-        detail: 'already latest',
+        detail: semver.gt(fromVersion, latest) ? 'ahead of latest' : 'already latest',
         linkedGroupId: gid,
       });
       if (!jsonOutput) {
-        log.dim(`${scanned.name} already at latest (${latest})`);
+        log.dim(
+          semver.gt(fromVersion, latest)
+            ? `${scanned.name} ahead of latest (${fromVersion} > ${latest})`
+            : `${scanned.name} already at latest (${latest})`,
+        );
       }
       continue;
     }
 
-    bumps.push({ scanned, targetVersion: latest });
+    const preferred = opts.preferredTargets?.get(scanned.name);
+    const targetVersion =
+      preferred && semver.valid(preferred) && semver.gt(preferred, fromVersion)
+        ? preferred
+        : latest;
+    bumps.push({ scanned, targetVersion });
   }
 
   if (bumps.length === 0) {
@@ -1556,19 +1782,25 @@ async function runLinkedGroupUpgrade(
 
   if (dryRun) {
     for (const b of bumps) {
-      const cur = semver.coerce(b.scanned.currentRange);
+      const fromInstalled = resolveInstalledVersion({
+        name: b.scanned.name,
+        declaredRange: b.scanned.currentRange,
+        lockfileVersions: opts.lockfileVersions,
+      });
       addUpgrade(report, {
         name: b.scanned.name,
         success: true,
         skipped: true,
-        from: cur?.version,
+        from: b.scanned.currentRange,
         to: b.targetVersion,
         reason: 'skipped',
         detail: 'dry-run (linked group)',
         linkedGroupId: gid,
       });
       if (!jsonOutput) {
-        log.info(`[dry-run] [${gid}] ${b.scanned.name}: ${cur?.version ?? '?'} → ${b.targetVersion}`);
+        log.info(
+          `[dry-run] [${gid}] ${b.scanned.name}: ${fromInstalled ?? b.scanned.currentRange} → ${b.targetVersion}`,
+        );
       }
     }
     return;
@@ -1649,6 +1881,21 @@ async function runLinkedGroupUpgrade(
       }
     }
 
+    // Coordinated release-line fallback: after latest (+ peer resolver) fail, step every
+    // member back one major line together (bounded). Mirrors the single-package
+    // major-lines ladder without exploding into a cartesian product.
+    if (
+      !result.ok &&
+      !forceAttempt &&
+      (opts.fallbackStrategy === 'major-lines' || opts.fallbackStrategy === 'minor-lines')
+    ) {
+      const coordinated = await tryCoordinatedGroupFallback(cwd, bumps, opts, gid, jsonOutput);
+      if (coordinated) {
+        result = coordinated;
+        if (result.ok) break;
+      }
+    }
+
     if (!interactive) {
       break;
     }
@@ -1693,12 +1940,14 @@ async function runLinkedGroupUpgrade(
   if (result.ok) {
     const groupRows: UpgradeRecord[] = [];
     for (const b of bumps) {
-      const cur = semver.coerce(b.scanned.currentRange);
+      const writtenTo = opts.pinExact
+        ? b.targetVersion
+        : formatUpgradeRange(b.scanned.currentRange, b.targetVersion);
       const row: UpgradeRecord = {
         name: b.scanned.name,
         success: true,
-        from: cur?.version,
-        to: b.targetVersion,
+        from: b.scanned.currentRange,
+        to: writtenTo,
         // `requestedLatest` should still reflect what the user ASKED for (registry latest),
         // even when the peer resolver nudged us to a slightly older version. That way the
         // summary can render "requested 19.0.0, got 18.3.1 (peer-range intersection)".
@@ -1724,7 +1973,7 @@ async function runLinkedGroupUpgrade(
       groupRows.push(row);
       if (!jsonOutput) {
         const suffix = b.resolvedFrom ? ` [peer-resolved from ${b.resolvedFrom}]` : '';
-        log.success(`upgraded: ${b.scanned.name} → ${b.targetVersion} (group ${gid})${suffix}`);
+        log.success(`upgraded: ${b.scanned.name} → ${writtenTo} (group ${gid})${suffix}`);
       }
     }
     await fireUpgradeApplied(opts, groupRows, cwd, gid);
@@ -1777,9 +2026,7 @@ async function runLinkedGroupUpgrade(
  * `cwd` to the child dir and `installCwd` to the workspace root. The orchestrator
  * (`runUpgradeFlow`) handles target selection, pre-flight, and aggregation.
  *
- * TODO: parallel upgrades with dependency graph ordering
- * TODO: git commit after each successful upgrade
- * TODO: expo install–style version alignment for Expo SDK
+ * Expo SDK alignment (`expo install`-style) remains future work.
  */
 export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<FinalReport> {
   const { cwd, dryRun, jsonOutput, ignore, force } = opts;
@@ -1820,7 +2067,11 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
     log.dim(`Detected package manager: ${mgrLabel} via ${projectInfo.managerSource}${wsLabel}`);
   }
 
-  const packages = await scanProject(cwd);
+  const packagesRaw = await scanProject(cwd);
+  const packages = dedupeScannedByName(packagesRaw);
+
+  const lockfileVersions =
+    opts.lockfileVersions ?? (await loadLockfileVersionTree(installCwd, projectInfo.manager));
 
   const restrictToNames = opts.restrictToNames;
   const policyFreezeWildcards = (opts.policy?.freeze ?? []).filter((f) => f.pattern.includes('*'));
@@ -1862,6 +2113,7 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
     rootPackageName: typeof pkgJson.name === 'string' ? pkgJson.name : undefined,
     projectInfo,
     installCwd,
+    lockfileVersions,
   };
 
   if (!dryRun && !opts.skipPreflight) {
@@ -1934,7 +2186,7 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
   report.groupPlan = groups.map((g) => ({ id: g.id, packages: [...g.names] }));
 
   for (const group of groups) {
-    const fresh = await scanProject(cwd);
+    const fresh = dedupeScannedByName(await scanProject(cwd));
     const byName = new Map(fresh.map((p) => [p.name, p]));
     const members = group.names.map((n) => byName.get(n)).filter(Boolean) as ScannedPackage[];
     const active = members.filter((m) => !ignore.has(m.name));

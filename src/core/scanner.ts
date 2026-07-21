@@ -4,7 +4,8 @@ import semver from 'semver';
 import type { DepSection, ScannedPackage } from '../types.js';
 import type { PackageJson } from '../types.js';
 
-const NON_REGISTRY = /^(workspace:|link:|file:|git\+|git:|http:|https:)/i;
+const NON_REGISTRY =
+  /^(workspace:|link:|file:|git\+|git:|http:|https:|catalog:|portal:|patch:|npm:)/i;
 
 /**
  * Returns true if the version range points at the npm registry (semver-like).

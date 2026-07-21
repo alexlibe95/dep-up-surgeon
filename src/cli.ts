@@ -173,6 +173,12 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (process.argv[2] === 'outdated') {
+    const { runOutdatedCommand } = await import('./cli/outdatedCommand.js');
+    await runOutdatedCommand(process.argv, version);
+    return;
+  }
+
   program
     .name('dep-up-surgeon')
     .description(
@@ -210,6 +216,16 @@ async function main(): Promise<void> {
     .option(
       '--include-workspace-deps',
       'Treat workspace-internal dependencies (names matching a local workspace package) like any other dep. By default they are skipped because their version comes from the local workspace, not the registry.',
+      false,
+    )
+    .option(
+      '--include-peers',
+      'Also upgrade peerDependencies entries. Default: skip peers (they are a consumer contract; auto-bumping them is usually wrong for libraries).',
+      false,
+    )
+    .option(
+      '--pin-exact',
+      'Write bare exact versions (1.2.3) into package.json instead of preserving the previous ^ / ~ range style.',
       false,
     )
     .option(
@@ -385,6 +401,8 @@ async function main(): Promise<void> {
     validate?: string | boolean;
     packageManager?: string;
     includeWorkspaceDeps?: boolean;
+    includePeers?: boolean;
+    pinExact?: boolean;
     workspaces?: boolean;
     workspacesOnly?: boolean;
     workspace?: string;
@@ -538,6 +556,8 @@ async function main(): Promise<void> {
   const packageManager: 'auto' | 'npm' | 'pnpm' | 'yarn' =
     pmRaw === 'npm' || pmRaw === 'pnpm' || pmRaw === 'yarn' ? pmRaw : 'auto';
   const includeWorkspaceDeps = Boolean(opts.includeWorkspaceDeps);
+  const includePeers = Boolean(opts.includePeers);
+  const pinExact = Boolean(opts.pinExact);
 
   const installModeRaw = String(opts.installMode ?? 'root').toLowerCase();
   if (installModeRaw !== 'root' && installModeRaw !== 'filtered') {
@@ -598,6 +618,7 @@ async function main(): Promise<void> {
   // ---- --security-only: run audit up front (before gitFlow so per-success commits see it) ----
   let auditResult: AuditResult | undefined;
   let restrictToNames: Set<string> | undefined;
+  let preferredTargets: Map<string, string> | undefined;
   let securityAdvisoryMap:
     | Map<string, { severity: 'low' | 'moderate' | 'high' | 'critical'; ids: string[]; url?: string; title?: string }>
     | undefined;
@@ -633,6 +654,12 @@ async function main(): Promise<void> {
     }
     const filtered = filterAdvisoriesBySeverity(auditResult.advisories, minSev);
     restrictToNames = new Set(filtered.map((a) => a.name));
+    preferredTargets = new Map();
+    for (const a of filtered) {
+      if (a.recommendedVersion && typeof a.recommendedVersion === 'string') {
+        preferredTargets.set(a.name, a.recommendedVersion);
+      }
+    }
     securityAdvisoryMap = new Map(
       filtered.map((a) => [
         a.name,
@@ -726,6 +753,8 @@ async function main(): Promise<void> {
       validate,
       packageManager,
       includeWorkspaceDeps,
+      includePeers,
+      pinExact,
       workspaceMode,
       installMode,
       concurrency,
@@ -733,6 +762,7 @@ async function main(): Promise<void> {
       // else (undefined, true, or the flag absent) means "auto-detect from project info".
       ...(opts.parallelInstalls === false ? { forceSerialInstalls: true } : {}),
       restrictToNames,
+      preferredTargets,
       policy,
       // `--no-resolve-peers` sets opts.resolvePeers to false (commander convention);
       // anything else (undefined, true) means "default on" inside the engine.
@@ -772,7 +802,10 @@ async function main(): Promise<void> {
       }
       for (const r of report!.upgraded) {
         if (r.reason === 'policy' && r.detail) {
-          applied.push({ name: r.name, rule: 'maxVersion', detail: r.detail });
+          const rule = /majors blocked|allowMajorAfter/i.test(r.detail)
+            ? ('allowMajorAfter' as const)
+            : ('maxVersion' as const);
+          applied.push({ name: r.name, rule, detail: r.detail });
         }
       }
       const pr: NonNullable<typeof report.policy> = {

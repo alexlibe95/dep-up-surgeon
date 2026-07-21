@@ -3,6 +3,7 @@ import type { ScannedPackage } from '../types.js';
 import type { CustomLinkedGroup, LinkedGroup } from './groups.js';
 import { buildDependencyGraph, findConnectedComponents } from './graph.js';
 import { isRegistryRange } from './scanner.js';
+import { dedupeScannedByName } from './scannedDedup.js';
 import { log } from '../utils/logger.js';
 import { createManifestCache } from '../utils/registryCache.js';
 
@@ -47,7 +48,7 @@ export async function buildDynamicLinkedGroups(
   }
 
   const pool = allNames.filter((n) => !assigned.has(n));
-  const byName = new Map(scanned.map((p) => [p.name, p]));
+  const byName = new Map(dedupeScannedByName(scanned).map((p) => [p.name, p]));
 
   const registryInPool: string[] = [];
   const nonRegistry: string[] = [];

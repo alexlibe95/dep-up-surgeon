@@ -427,7 +427,7 @@ async function peerDepsCheck(
       message: 'Skipped via `--skip-peer-scan`.',
     };
   }
-  const command = peerScanCommandFor(info.manager);
+  const command = peerScanCommandFor(info.manager, info.yarnMajorVersion);
   if (!command) {
     return {
       id: 'peer-deps',
@@ -467,7 +467,10 @@ async function peerDepsCheck(
   }
 }
 
-function peerScanCommandFor(manager: PackageManager): { bin: string; args: string[] } | undefined {
+function peerScanCommandFor(
+  manager: PackageManager,
+  yarnMajorVersion?: number,
+): { bin: string; args: string[] } | undefined {
   switch (manager) {
     case 'npm':
       return { bin: 'npm', args: ['ls', '--all', '--parseable'] };
@@ -478,8 +481,11 @@ function peerScanCommandFor(manager: PackageManager): { bin: string; args: strin
       // both registry hits and lockfile mutations.
       return { bin: 'pnpm', args: ['install', '--frozen-lockfile', '--offline', '--prefer-offline'] };
     case 'yarn':
-      // yarn v1: `yarn check` does the job. Berry has no `yarn check`; fall back to `yarn
-      // install --immutable --check-cache` which surfaces peer warnings without mutating.
+      // yarn classic (v1): `yarn check`. Berry (v2+) has no `yarn check`; use an immutable
+      // install that surfaces peer warnings without mutating the lockfile.
+      if (yarnMajorVersion !== undefined && yarnMajorVersion >= 2) {
+        return { bin: 'yarn', args: ['install', '--immutable', '--mode=skip-build'] };
+      }
       return { bin: 'yarn', args: ['check'] };
     default:
       return undefined;
