@@ -3,7 +3,19 @@ import fs from 'fs-extra';
 import { execa } from 'execa';
 import type { PackageJson } from '../types.js';
 
-export type PackageManager = 'npm' | 'pnpm' | 'yarn';
+export type PackageManager = 'npm' | 'pnpm' | 'yarn' | 'bun';
+
+export const PACKAGE_MANAGERS: readonly PackageManager[] = ['npm', 'pnpm', 'yarn', 'bun'];
+
+export function isPackageManager(value: string): value is PackageManager {
+  return (PACKAGE_MANAGERS as readonly string[]).includes(value);
+}
+
+/** CLI `--package-manager` helper: unknown values fall back to `auto`. */
+export function parsePackageManagerOption(raw: string | undefined): PackageManager | 'auto' {
+  const v = String(raw ?? 'auto').toLowerCase();
+  return isPackageManager(v) ? v : 'auto';
+}
 
 export type PackageManagerSource =
   | 'cli'
@@ -24,7 +36,7 @@ export interface ProjectInfo {
   managerVersion?: string;
   managerSource: PackageManagerSource;
   /** Lockfile detected at the project root (if any) */
-  lockfile?: 'package-lock.json' | 'pnpm-lock.yaml' | 'yarn.lock';
+  lockfile?: 'package-lock.json' | 'pnpm-lock.yaml' | 'yarn.lock' | 'bun.lock' | 'bun.lockb';
   /** True when `package.json` declares `workspaces` (or pnpm-workspace.yaml is present). */
   hasWorkspaces: boolean;
   /** Raw workspace globs as configured (npm/yarn `workspaces`, pnpm-workspace `packages`). */
@@ -81,7 +93,7 @@ function parsePackageManagerField(field: unknown):
     return undefined;
   }
   // packageManager: "<name>@<version>"
-  const m = field.match(/^(npm|pnpm|yarn)(?:@([^+]+))?/i);
+  const m = field.match(/^(npm|pnpm|yarn|bun)(?:@([^+]+))?/i);
   if (!m) {
     return undefined;
   }
@@ -97,6 +109,12 @@ function detectFromLockfile(cwd: string): {
   }
   if (fs.existsSync(path.join(cwd, 'yarn.lock'))) {
     return { manager: 'yarn', lockfile: 'yarn.lock' };
+  }
+  if (fs.existsSync(path.join(cwd, 'bun.lock'))) {
+    return { manager: 'bun', lockfile: 'bun.lock' };
+  }
+  if (fs.existsSync(path.join(cwd, 'bun.lockb'))) {
+    return { manager: 'bun', lockfile: 'bun.lockb' };
   }
   if (fs.existsSync(path.join(cwd, 'package-lock.json'))) {
     return { manager: 'npm', lockfile: 'package-lock.json' };
@@ -444,8 +462,18 @@ function detectIsolatedLockfiles(
   }
 
   // Generic path: every workspace member has its own lockfile of the matching kind.
-  const expected = manager === 'pnpm' ? 'pnpm-lock.yaml' : manager === 'yarn' ? 'yarn.lock' : 'package-lock.json';
-  const allPresent = members.every((m) => fs.existsSync(path.join(m.dir, expected)));
+  const expected =
+    manager === 'pnpm'
+      ? 'pnpm-lock.yaml'
+      : manager === 'yarn'
+        ? 'yarn.lock'
+        : manager === 'bun'
+          ? 'bun.lock'
+          : 'package-lock.json';
+  const allPresent = members.every((m) => {
+    if (fs.existsSync(path.join(m.dir, expected))) return true;
+    return manager === 'bun' && fs.existsSync(path.join(m.dir, 'bun.lockb'));
+  });
   if (allPresent) {
     return { isolated: true, source: 'per-workspace-lockfiles' };
   }

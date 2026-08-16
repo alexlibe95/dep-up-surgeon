@@ -4,7 +4,7 @@
  */
 import path from 'node:path';
 import chalk from 'chalk';
-import { detectProjectInfo } from '../core/workspaces.js';
+import { detectProjectInfo, type PackageManager } from '../core/workspaces.js';
 import { isRegistryRange, scanProject } from '../core/scanner.js';
 import { dedupeScannedByName } from '../core/scannedDedup.js';
 import { fetchLatestVersion } from '../utils/npm.js';
@@ -12,6 +12,7 @@ import {
   loadLockfileVersionTree,
   resolveInstalledVersion,
 } from '../utils/installedVersion.js';
+import { catalogStyleRange, loadCatalogIndex } from '../utils/catalog.js';
 import { createRegistryCache, mapWithConcurrency } from '../utils/concurrency.js';
 import semver from 'semver';
 
@@ -41,7 +42,7 @@ export interface OutdatedReport {
 
 export interface RunOutdatedOptions {
   cwd: string;
-  packageManager?: 'auto' | 'npm' | 'pnpm' | 'yarn';
+  packageManager?: 'auto' | PackageManager;
   includePeers?: boolean;
   json?: boolean;
 }
@@ -56,12 +57,14 @@ export async function runOutdated(opts: RunOutdatedOptions): Promise<OutdatedRep
     return isRegistryRange(p.currentRange);
   });
   const lockfileVersions = await loadLockfileVersionTree(opts.cwd, info.manager);
+  const catalog = await loadCatalogIndex(opts.cwd);
   const cache = createRegistryCache();
 
   const rows = await mapWithConcurrency(scanned, 8, async (p) => {
+    const declared = catalogStyleRange(catalog, p.name, p.currentRange);
     const installed = resolveInstalledVersion({
       name: p.name,
-      declaredRange: p.currentRange,
+      declaredRange: declared,
       lockfileVersions,
     });
     let latest: string | undefined;

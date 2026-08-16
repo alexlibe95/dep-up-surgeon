@@ -10,6 +10,7 @@
  */
 import path from 'node:path';
 import { Command } from 'commander';
+import { parsePackageManagerOption } from '../core/workspaces.js';
 import { log } from '../utils/logger.js';
 import { renderUndoHuman, runUndo, undoSucceeded } from './undo.js';
 
@@ -55,7 +56,7 @@ export async function runUndoCommand(argv: string[], version: string): Promise<v
     )
     .option(
       '--package-manager <mgr>',
-      'Override the manager recorded in the run report (auto / npm / pnpm / yarn).',
+      'Override the manager recorded in the run report (auto / npm / pnpm / yarn / bun).',
       'auto',
     )
     .option('--cwd <path>', 'Run the undo against this directory instead of the current one.');
@@ -76,6 +77,7 @@ export async function runUndoCommand(argv: string[], version: string): Promise<v
   const cwd = opts.cwd ? path.resolve(process.cwd(), opts.cwd) : process.cwd();
   const skipValidator = opts.validate === false;
   const validatorCommand = typeof opts.validate === 'string' ? opts.validate : undefined;
+  const parsedPm = parsePackageManagerOption(opts.packageManager);
 
   try {
     // Build a validator closure that mirrors the main flow's behavior: if the user passed a
@@ -87,10 +89,7 @@ export async function runUndoCommand(argv: string[], version: string): Promise<v
         const { validateProject } = await import('../core/validator.js');
         const fs = await import('fs-extra');
         const pkg = await fs.default.readJson(path.join(cwd, 'package.json'));
-        const manager =
-          opts.packageManager && opts.packageManager !== 'auto'
-            ? (opts.packageManager as 'npm' | 'pnpm' | 'yarn')
-            : 'npm';
+        const manager = parsedPm === 'auto' ? 'npm' : parsedPm;
         const vr = await validateProject(cwd, pkg, {
           ...(validatorCommand ? { command: validatorCommand, source: 'cli' as const } : {}),
           manager,
@@ -111,9 +110,7 @@ export async function runUndoCommand(argv: string[], version: string): Promise<v
     const result = await runUndo({
       cwd,
       ...(opts.file ? { file: opts.file } : {}),
-      ...(opts.packageManager && opts.packageManager !== 'auto'
-        ? { manager: opts.packageManager as 'npm' | 'pnpm' | 'yarn' }
-        : {}),
+      ...(parsedPm !== 'auto' ? { manager: parsedPm } : {}),
       ...(opts.dryRun ? { planOnly: true } : {}),
       ...(opts.skipInstall ? { skipInstall: true } : {}),
       ...(skipValidator ? { skipValidator: true } : {}),

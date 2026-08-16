@@ -214,17 +214,21 @@ export async function createGitFlow(
   // workspace labels ('root' or member name). Used by per-target (flushed each target) and
   // 'all' (flushed once at the end).
   const buffered = new Map<string, UpgradeChange[]>();
+  const bufferedExtraFiles = new Map<string, Set<string>>();
   const commits: GitCommitRecord[] = [];
 
   const stageFilesForTarget = (
     targetCwd: string,
     installCwd: string,
     manager: PackageManager,
+    extraFiles?: string[],
   ): string[] => {
-    return [
+    const files = [
       path.join(targetCwd, 'package.json'),
       path.join(installCwd, lockfileBasenameFor(manager)),
     ];
+    if (extraFiles) files.push(...extraFiles);
+    return files;
   };
 
   const recordCommit = async (
@@ -308,7 +312,7 @@ export async function createGitFlow(
 
     if (mode === 'per-success') {
       const message = formatPerSuccessMessage(prefix, changes);
-      const files = stageFilesForTarget(ev.targetCwd, ev.installCwd, ev.manager);
+      const files = stageFilesForTarget(ev.targetCwd, ev.installCwd, ev.manager, ev.extraFiles);
       await recordCommit(ev.installCwd, files, message, ws, ev.groupId);
       return;
     }
@@ -348,6 +352,11 @@ export async function createGitFlow(
       files.add(path.join(tcwd, 'package.json'));
     }
     files.add(path.join(installCwd, lockfileBasenameFor(manager)));
+    const extras = bufferedExtraFiles.get(workspace);
+    bufferedExtraFiles.delete(workspace);
+    if (extras) {
+      for (const f of extras) files.add(f);
+    }
     await recordCommit(installCwd, [...files], message, workspace, undefined);
   };
 
@@ -373,6 +382,10 @@ export async function createGitFlow(
     const files = new Set<string>();
     for (const c of cwds) files.add(path.join(c, 'package.json'));
     files.add(path.join(installCwd, lockfileBasenameFor(manager)));
+    for (const extraSet of bufferedExtraFiles.values()) {
+      for (const f of extraSet) files.add(f);
+    }
+    bufferedExtraFiles.clear();
     await recordCommit(installCwd, [...files], message, undefined, undefined);
   };
 
@@ -385,6 +398,11 @@ export async function createGitFlow(
       const set = bufferedCwds.get(ws) ?? new Set<string>();
       set.add(ev.targetCwd);
       bufferedCwds.set(ws, set);
+      if (ev.extraFiles && ev.extraFiles.length > 0) {
+        const extras = bufferedExtraFiles.get(ws) ?? new Set<string>();
+        for (const f of ev.extraFiles) extras.add(f);
+        bufferedExtraFiles.set(ws, extras);
+      }
     }
     await onUpgradeApplied(ev);
   };

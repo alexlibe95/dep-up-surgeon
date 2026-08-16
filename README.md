@@ -1,11 +1,12 @@
 # dep-up-surgeon
 
+[![CI](https://github.com/alexlibe95/dep-up-surgeon/actions/workflows/ci.yml/badge.svg)](https://github.com/alexlibe95/dep-up-surgeon/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/dep-up-surgeon.svg)](https://www.npmjs.com/package/dep-up-surgeon)
 [![npm downloads](https://img.shields.io/npm/dm/dep-up-surgeon.svg)](https://www.npmjs.com/package/dep-up-surgeon)
 [![npm license](https://img.shields.io/npm/l/dep-up-surgeon.svg)](https://www.npmjs.com/package/dep-up-surgeon)
 [![npm unpacked size](https://img.shields.io/npm/unpacked-size/dep-up-surgeon.svg)](https://www.npmjs.com/package/dep-up-surgeon)
 [![Node.js engines](https://img.shields.io/node/v/dep-up-surgeon.svg)](https://github.com/alexlibe95/dep-up-surgeon/blob/main/package.json)
-[![TypeScript](https://img.shields.io/badge/TypeScript-6.x-3178c6?logo=typescript&logoColor=white)](https://github.com/alexlibe95/dep-up-surgeon)
+[![TypeScript](https://img.shields.io/badge/TypeScript-7.x-3178c6?logo=typescript&logoColor=white)](https://github.com/alexlibe95/dep-up-surgeon)
 [![GitHub stars](https://img.shields.io/github/stars/alexlibe95/dep-up-surgeon?style=social)](https://github.com/alexlibe95/dep-up-surgeon)
 [![GitHub forks](https://img.shields.io/github/forks/alexlibe95/dep-up-surgeon?style=social)](https://github.com/alexlibe95/dep-up-surgeon)
 [![GitHub issues](https://img.shields.io/github/issues/alexlibe95/dep-up-surgeon.svg)](https://github.com/alexlibe95/dep-up-surgeon/issues)
@@ -41,6 +42,9 @@ From your project root (where `package.json` lives):
 
 ```bash
 dep-up-surgeon [options]
+dep-up-surgeon doctor [options]
+dep-up-surgeon undo [options]
+dep-up-surgeon outdated [options]
 ```
 
 ### Options
@@ -50,26 +54,29 @@ dep-up-surgeon [options]
 | `--dry-run` | Resolve latest versions and print the plan; does not change `package.json` or run installs. |
 | `--interactive` | On failure, prompts for next steps (see **Interactive mode**). After the run, optionally bulk-add failed names to `.dep-up-surgeonrc`. |
 | `--force` | Keep a version bump even when validation fails; also skips **rollback** when structured conflicts are detected in npm output after a successful exit code (use with care). |
-| `--ignore <pkgs>` | Comma-separated package names to skip (merged with `.dep-up-surgeonrc`). |
+| `--ignore <pkgs>` | Comma-separated **package names** to skip in **every** workspace (merged with `.dep-up-surgeonrc`). This is global by name — unlike `--retry-failed`, which freezes per workspace. |
 | `--json` | Machine-readable report on stdout (see **JSON report**). |
 | `--fallback-strategy <mode>` | `major-lines` (**default**), `minor-lines`, or `none`. After `@latest` fails, **`major-lines`** tries the best stable version per **major** (e.g. `9.x` → `8.x` → `7.x` …). **`minor-lines`** steps one **`major.minor` line** at a time. If npm output looks like **ESM vs CommonJS** (`ERR_REQUIRE_ESM`), further fallbacks for that package **stop**. `none` only attempts `@latest`. |
 | `--link-groups <mode>` | `auto` (**default**) or `none`. **`auto`** builds **linked batches** from the registry graph and optional **`linkedGroups`**. **`none`** upgrades one dependency per step. |
 | `--validate <cmd>` | Override the validator command run after every install. Defaults to `<manager> test` if a `test` script exists, else `<manager> run build` (yarn classic uses `yarn build`), else nothing. Useful in monorepos where the default build is heavy or fragile (e.g. `--validate "tsc -p tsconfig.json --noEmit"`). |
 | `--no-validate` | Skip validation entirely. Upgrades are kept regardless of test/build outcome. Different from `--force`: `--force` runs the validator and only keeps the bump when it fails, `--no-validate` doesn’t run a validator at all. |
-| `--package-manager <mgr>` | `auto` (**default**), `npm`, `pnpm`, or `yarn`. `auto` reads the `packageManager` field, then falls back to lockfile detection (`pnpm-lock.yaml` → pnpm, `yarn.lock` → yarn, `package-lock.json` → npm), then `pnpm-workspace.yaml`, then `npm`. The chosen manager drives both the **install** command (`<mgr> install`) and the **default validator** (`<mgr> test` / `<mgr> run build`). |
+| `--package-manager <mgr>` | `auto` (**default**), `npm`, `pnpm`, `yarn`, or `bun`. `auto` reads the `packageManager` field, then falls back to lockfile detection (`pnpm-lock.yaml` → pnpm, `yarn.lock` → yarn, `bun.lock` / `bun.lockb` → bun, `package-lock.json` → npm), then `pnpm-workspace.yaml`, then `npm`. The chosen manager drives both the **install** command (`<mgr> install`) and the **default validator** (`<mgr> test` / `<mgr> run build`; bun uses `bun run test` / `bun run build`). |
+| `--cwd <path>` | Run against this directory instead of `process.cwd()`. Default is still the current working directory, so scripts that `cd` first keep working. Same flag as `doctor` / `undo` / `outdated`. |
 | `--include-workspace-deps` | By default, dependencies whose name matches a local **workspace package** (resolved via `workspaces` in `package.json` or `pnpm-workspace.yaml`) are skipped — their version comes from the local workspace, not the registry. Pass this flag to upgrade them anyway (e.g. when local workspace packages also publish to the registry). |
+| `--include-peers` | Also upgrade `peerDependencies` entries. Default: skip peers (they are a consumer contract; auto-bumping them is usually wrong for libraries). |
+| `--pin-exact` | Write bare exact versions (`1.2.3`) into `package.json` instead of preserving the previous `^` / `~` range style. |
 | `--workspaces` | Traverse the **root** `package.json` **and every workspace member** (one engine pass per `package.json`). Install + validation always run from the workspace root so the lockfile and validator see the whole monorepo. |
 | `--workspaces-only` | Like `--workspaces` but **skips** the root `package.json`. Only workspace members are traversed. |
 | `--workspace <names>` | Comma-separated workspace member **names** (the `name` field from each child `package.json`) to traverse. Pass `root` to also include the root. Example: `--workspace "@org/core,@org/web,root"`. Unknown names produce a friendly error listing the known members. |
-| `--install-mode <mode>` | Workspace install strategy. **`root`** (default) always runs `<mgr> install` from the workspace root after every mutation — the safest option, supported by every package manager. **`filtered`** rewrites per-child installs to their workspace-scoped form: **npm 7+** uses `npm install --workspace <name>`, **pnpm** uses `pnpm install --filter <name>`, **yarn berry (v2+) with `@yarnpkg/plugin-workspace-tools`** uses `yarn workspaces focus <name>`, and **yarn classic / berry without the plugin** falls back to a full root install with a one-time warning explaining the upgrade path. The capability is auto-detected at startup (yarn version + plugin probe) and reported as `project.yarnMajorVersion` + `project.yarnSupportsFocus` in `--json`. Only meaningful with `--workspaces` / `--workspaces-only` / `--workspace <names>`. |
+| `--install-mode <mode>` | Workspace install strategy. **`root`** (default) always runs `<mgr> install` from the workspace root after every mutation — the safest option, supported by every package manager. **`filtered`** rewrites per-child installs to their workspace-scoped form: **npm 7+** uses `npm install --workspace <name>`, **pnpm** / **bun** use `<mgr> install --filter <name>`, **yarn berry (v2+) with `@yarnpkg/plugin-workspace-tools`** uses `yarn workspaces focus <name>`, and **yarn classic / berry without the plugin** falls back to a full root install with a one-time warning explaining the upgrade path. The capability is auto-detected at startup (yarn version + plugin probe) and reported as `project.yarnMajorVersion` + `project.yarnSupportsFocus` in `--json`. Only meaningful with `--workspaces` / `--workspaces-only` / `--workspace <names>`. |
 | `--concurrency <n>` | Maximum number of workspace targets to traverse in parallel (1–16; default `1`). Higher values overlap registry **scan + plan** phases across targets while a shared mutex keeps **install + validation strictly serialized** — the workspace lockfile is shared, so concurrent installs would corrupt it. The default in-process registry cache also deduplicates `pacote.manifest` / `pacote.packument` calls across targets, so even at concurrency `1` you get a speedup when the same dep appears in many workspaces. **Requires `--json`** so per-target log lines don't interleave; non-JSON mode silently downgrades to `1` with a warning. In an **isolated-lockfile** monorepo (pnpm `shared-workspace-lockfile=false`, or every workspace member shipping its own lockfile) installs + validation are ALSO run in parallel — see **Parallel installs** below. |
 | `--no-parallel-installs` | Force installs + validation to stay serialized even when an isolated-lockfile monorepo is detected. Useful when debugging a flaky install step (parallel installs mask the ordering) or when a per-workspace postinstall script touches shared state outside its workspace. |
-| `--retry-failed` | Read `.dep-up-surgeon.last-run.json` from the previous run and only re-attempt entries that failed for **non-terminal** reasons (`install`, `validation-conflicts`, `versions`, `unknown`). Successful upgrades + terminal failures (`peer`, `validation-script`) from the last run are added to the ignore list automatically. See **Persisted last-run report** below. |
+| `--retry-failed` | Resume the previous run from `.dep-up-surgeon.last-run.json`: freeze last-run successes and terminal failures (`peer`, `validation-script`) **per workspace**, and re-attempt only non-terminal residue (`install`, `validation-conflicts`, `versions`, `unknown`). User `--ignore` / rc lists stay global. See **Retry-failed mode** below. |
 | `--no-persist-report` | Do **not** write `.dep-up-surgeon.last-run.json` after the run. By default the structured report is written next to the workspace root for `--retry-failed` and CI consumers. |
 | `--summary <format>` | Write a human-friendly summary of the run as `md` (default) or `html`. Destination is `$GITHUB_STEP_SUMMARY` if set (appended), otherwise `--summary-file <path>`, otherwise `./dep-up-surgeon-summary.<ext>`. |
 | `--summary-file <path>` | Override the destination for `--summary`. Wins over `$GITHUB_STEP_SUMMARY`. |
 | `--ci` | Convenience flag for CI / bot use. Disables `--interactive`, auto-enables `--summary md` (great with `$GITHUB_STEP_SUMMARY`), and **exits `0` even when individual upgrades fail** (only pre-flight failures and fatal errors exit `1`) so per-package conflicts surface in the PR description instead of failing the job. |
-| `--git-commit` | Commit successful upgrades to git as the run progresses. Refuses to start on a dirty working tree (override with `--git-allow-dirty`). Only stages `package.json` + the lockfile — never `git add -A`, so unrelated WIP, generated files, and prepare/postinstall side effects are never accidentally swept into a commit. Skipped silently in `--dry-run`. |
+| `--git-commit` | Commit successful upgrades to git as the run progresses. Refuses to start on a dirty working tree (override with `--git-allow-dirty`). Only stages `package.json` + the lockfile (+ `pnpm-workspace.yaml` when a `catalog:` entry moved) — never `git add -A`, so unrelated WIP, generated files, and prepare/postinstall side effects are never accidentally swept into a commit. Skipped silently in `--dry-run`. |
 | `--git-commit-mode <mode>` | How to group commits: **`per-success`** (default, one commit per upgrade — best for review and `git revert`-friendly), **`per-target`** (one commit per workspace target with all its successes squashed), or **`all`** (one commit at the end with everything). Linked-group upgrades (e.g. `react` + `react-dom`) always land in a single commit regardless of mode. |
 | `--git-commit-prefix <prefix>` | String prepended to every commit message (default `"deps: "`). Use `"chore(deps): "` for [Conventional Commits](https://www.conventionalcommits.org/) or set it to your team's preferred convention. |
 | `--git-branch <name>` | Create + checkout this branch before any commits. If the branch already exists, switches to it. Pairs nicely with `--ci` for PR-bot workflows (e.g. `--git-branch "deps/auto-$(date +%Y-%m-%d)"`). |
@@ -104,7 +111,7 @@ The pre-flight outcome is also surfaced under `preflight` / `preflightAborted` i
 
 ### Persisted last-run report
 
-After every CLI run the structured report is written to `.dep-up-surgeon.last-run.json` next to the workspace root (set `--no-persist-report` to opt out). The file mirrors the `--json` output and adds a small header (`finishedAt`, `toolVersion`, `cwd`, `dryRun`) so CI dashboards / bots can pick it up without re-running the tool. Add it to your `.gitignore` if you don't want it tracked.
+After every CLI run the structured report is written to `.dep-up-surgeon.last-run.json` next to the workspace root (set `--no-persist-report` to opt out). The file mirrors the `--json` output and adds a small header (`finishedAt`, `toolVersion`, `cwd`, `dryRun`) so CI dashboards / bots can pick it up without re-running the tool. Each `upgraded` / `failed` row carries a `workspace` field when more than one target was traversed — `--retry-failed` uses that label so a freeze in one member does not skip the same package name in another. Add the file to your `.gitignore` if you don't want it tracked.
 
 ### Retry-failed mode (`--retry-failed`)
 
@@ -113,8 +120,9 @@ Pass `--retry-failed` to **resume** the previous run instead of starting from sc
 - `dep-up-surgeon` reads `.dep-up-surgeon.last-run.json` and **freezes** every package that either:
   - **succeeded** in the last run (no need to redo work), **or**
   - failed for a **terminal** reason: `peer` (real peer-dep conflict; bumping the same package alone almost always fails the same way) or `validation-script` (the project's own test/build script crashed; re-running won't help without a code change).
+- Freezes are **per workspace**, keyed as `workspace::name` (for example `@org/web::lodash`). A success or terminal failure in `@org/web` does **not** skip the same package in `@org/api`. Bare `--ignore` / `.dep-up-surgeonrc` ignore entries remain global (the name is skipped in every workspace). Rows from root-only runs or older reports without a `workspace` field still freeze the bare name everywhere (same as before).
 - It then **re-attempts** only the residue: failures classified as `install`, `validation-conflicts`, `versions`, or `unknown`. These are the cases where another dependency move during the new run can plausibly unblock them.
-- Linked-group failures (`name === '[group:<id>]'`) are expanded to **every member of the group** via the persisted `groups` field, so freezing a peer-failed group correctly freezes every package in it.
+- Linked-group failures (`name === '[group:<id>]'`) are expanded to **every member of the group** via the persisted `groups` field, scoped to the workspace that owned the group, so freezing a peer-failed group correctly freezes every package in it without leaking to other members.
 - If `.dep-up-surgeon.last-run.json` is missing the CLI exits `1` with a friendly message; pass `--retry-failed` only after at least one prior run.
 
 Typical workflow:
@@ -124,6 +132,17 @@ dep-up-surgeon --workspaces           # first pass: lots of moves, some failures
 # fix the script that caused a `validation-script` failure (or accept it)
 dep-up-surgeon --retry-failed         # second pass: only retries install/conflict residue
 ```
+
+Monorepo example — last run with `--workspaces`:
+
+| Package | Workspace | Last-run result | `--retry-failed` |
+|---------|-----------|-----------------|------------------|
+| `lodash` | `@org/web` | succeeded | frozen (skipped) |
+| `lodash` | `@org/api` | `install` failure | retried |
+| `react` | `@org/web` | `peer` failure | frozen (skipped) |
+| `react` | `@org/api` | not in last run | planned normally |
+
+`--ignore lodash` would still skip `lodash` in **both** workspaces. `--retry-failed` after the table above only skips the `@org/web` rows.
 
 ### Summary writer (`--summary <md|html>`)
 
@@ -254,8 +273,15 @@ maxVersion:
 allowMajorAfter:
   - pattern: eslint
     date: "2026-06-01"           # patch/minor OK now, majors blocked until the date
-requireReviewers: 2              # metadata: surfaced in --summary / --json for your bot to consume
-autoMerge: false                 # metadata: ditto
+requireReviewers:                # metadata: surfaced in --summary / --json for your bot to consume
+  major: 2
+  minor: 1
+  patch: 0
+autoMerge:                       # metadata: ditto
+  patch: true
+  minor: false
+  include:
+    - "eslint-plugin-*"
 ```
 
 **How rules interact**
@@ -440,6 +466,16 @@ npx dep-up-surgeon undo --file ./ci-logs/2026-04-18-upgrade.last-run.json
 npx dep-up-surgeon undo --no-validate
 ```
 
+| Option | Description |
+|--------|-------------|
+| `--file <path>` | Replay a specific last-run report instead of `.dep-up-surgeon.last-run.json`. |
+| `--json` | Emit the structured `UndoResult` on stdout. |
+| `--dry-run` | Print the reverse plan without touching disk. |
+| `--no-validate` / `--validate <cmd>` | Skip or override the post-reverse validator. |
+| `--skip-install` | Skip the post-reverse `<manager> install` (lockfile will otherwise diverge). |
+| `--package-manager <mgr>` | Override the manager recorded in the run report. |
+| `--cwd <path>` | Run against a different directory. |
+
 Exit codes: `0` = reverse pass succeeded (or was a no-op); `1` = install or validator failed during the reverse pass (the JSON report still explains which rows moved); `2` = the run report was missing / invalid. Pair with `--json` for CI pipelines — the full `UndoResult` is emitted on stdout.
 
 ### Lockfile fix (`--fix-lockfile`)
@@ -455,6 +491,7 @@ What it does:
 Guard rails:
 
 - **Yarn classic (v1)** has no `dedupe` subcommand — recorded as `skipped: "unsupported"` and the rest of the run continues normally.
+- **Bun** likewise has no `dedupe` subcommand — recorded as `skipped: "unsupported"`.
 - **No lockfile on disk** → `skipped: "no-lockfile"`. Nothing to dedupe when the install has never been run.
 - Runs **after** `--apply-overrides` so the final tree includes security pins before dedupe.
 
@@ -502,7 +539,7 @@ Options are focused (no entanglement with the 70+ upgrade-flow flags):
 | `--skip-audit` | Skip the audit dry-run. Use for air-gapped CI / offline dev. |
 | `--skip-peer-scan` | Skip the peer-dep scan (slow on huge trees). |
 | `--skip-stale-scan` | Skip the registry-backed stale-transitive scan. |
-| `--package-manager <mgr>` | Override detected manager: `auto`, `npm`, `pnpm`, `yarn`. |
+| `--package-manager <mgr>` | Override detected manager: `auto`, `npm`, `pnpm`, `yarn`, `bun`. |
 | `--cwd <path>` | Run against a different directory. |
 
 ```bash
@@ -512,6 +549,23 @@ npx dep-up-surgeon doctor --strict --json
 # Local "should I trust the upgrade loop?" check
 npx dep-up-surgeon doctor
 ```
+
+### Outdated report (`dep-up-surgeon outdated`)
+
+`outdated` is a **read-only** scan of direct dependencies vs registry `@latest`. Installed versions come from the lockfile when available (so `^1.0.0` that already resolved to `1.9.0` is not flagged if `1.9.0` is latest). Exits `1` when anything is outdated, `0` otherwise — useful as a CI soft gate before an upgrade run.
+
+```bash
+npx dep-up-surgeon outdated
+npx dep-up-surgeon outdated --json
+npx dep-up-surgeon outdated --include-peers
+```
+
+| Option | Description |
+|--------|-------------|
+| `--json` | Emit the structured `OutdatedReport` on stdout. |
+| `--include-peers` | Include `peerDependencies` (skipped by default). |
+| `--package-manager <mgr>` | Override detected manager: `auto`, `npm`, `pnpm`, `yarn`, `bun`. |
+| `--cwd <path>` | Run against a different directory. |
 
 ### Auto-opening a PR (`--open-pr`)
 
@@ -536,13 +590,14 @@ npx dep-up-surgeon --workspaces --summary md \
 
 `dep-up-surgeon` is **workspace-aware**:
 
-- **Detection.** On startup the tool resolves the **package manager** (`npm` / `pnpm` / `yarn`) by reading, in order: the `--package-manager` flag, the `packageManager` field in `package.json`, the lockfile (`pnpm-lock.yaml` → pnpm, `yarn.lock` → yarn, `package-lock.json` → npm), the presence of `pnpm-workspace.yaml`, and finally falls back to `npm`. **Workspace globs** are read from `workspaces` (npm/yarn — both array and `{ packages: [...] }` forms are supported) **or** `pnpm-workspace.yaml` (`packages:` list).
+- **Detection.** On startup the tool resolves the **package manager** (`npm` / `pnpm` / `yarn` / `bun`) by reading, in order: the `--package-manager` flag, the `packageManager` field in `package.json`, the lockfile (`pnpm-lock.yaml` → pnpm, `yarn.lock` → yarn, `bun.lock` / `bun.lockb` → bun, `package-lock.json` → npm), the presence of `pnpm-workspace.yaml`, and finally falls back to `npm`. **Workspace globs** are read from `workspaces` (npm/yarn/bun — both array and `{ packages: [...] }` forms are supported) **or** `pnpm-workspace.yaml` (`packages:` list).
 - **Install + validator follow the manager.** `<mgr> install` runs after each bump and the default validator becomes `<mgr> test` → `<mgr> run build` (yarn classic uses `yarn build`). Override with `--validate "<cmd>"` if you need something different (e.g. `pnpm -r build`).
 - **Workspace-internal deps are skipped automatically.** If a dependency name matches a local workspace package, the tool does not try to resolve it from the npm registry — it appears in the report as `skipped` with `detail: "workspace-internal dep …"`. Pass `--include-workspace-deps` to override (useful when those packages are **also** published).
-- **Workspace child traversal (`--workspaces` / `--workspaces-only` / `--workspace <names>`).** By default only the **root** `package.json` is mutated. With `--workspaces`, the tool **also** scans every member's `package.json` (one engine pass per file), but **install + validation always run from the workspace root** so the lockfile resolves correctly and the validator sees the entire monorepo. Pre-flight runs **once** at the workspace root regardless of how many targets are traversed. Every `upgraded` / `failed` row in the report is tagged with a `workspace` field (`"root"` or the member's package `name`) so you can tell at a glance which `package.json` produced each change.
+- **Workspace child traversal (`--workspaces` / `--workspaces-only` / `--workspace <names>`).** By default only the **root** `package.json` is mutated. With `--workspaces`, the tool **also** scans every member's `package.json` (one engine pass per file), but **install + validation always run from the workspace root** so the lockfile resolves correctly and the validator sees the entire monorepo. Pre-flight runs **once** at the workspace root regardless of how many targets are traversed. Every `upgraded` / `failed` row in the report is tagged with a `workspace` field (`"root"` or the member's package `name`) so you can tell at a glance which `package.json` produced each change. `--retry-failed` uses that field to freeze successes and terminal failures **in that workspace only** — the same package name in another member is still a candidate.
 - **Install mode (`--install-mode root|filtered`).** Default is `root`: every per-child mutation triggers a full `<mgr> install` from the workspace root — slow on large monorepos but supported by every package manager and impossible to misconfigure. Pass `--install-mode filtered` to rewrite per-child installs to their workspace-scoped form so only the affected member is resolved/linked:
   - **npm 7+** → `npm install --workspace <name>`
   - **pnpm** → `pnpm install --filter <name>`
+  - **bun** → `bun install --filter <name>`
   - **yarn berry (v2+) with [`@yarnpkg/plugin-workspace-tools`](https://yarnpkg.com/cli/workspaces/focus)** → `yarn workspaces focus <name>` (install the plugin once with `yarn plugin import workspace-tools`)
   - **yarn classic (v1.x)** → falls back to a full root install with a one-time warning suggesting an upgrade to yarn berry
   - **yarn berry without the plugin** → falls back to a full root install with a one-time warning telling you the exact `yarn plugin import` command to fix it
@@ -568,7 +623,7 @@ The detected manager + members are surfaced under `project` in `--json` output:
 
 ### What gets scanned
 
-Direct entries in **`dependencies`**, **`devDependencies`**, **`peerDependencies`**, and **`optionalDependencies`** are considered. Non-registry ranges (`workspace:`, `link:`, `file:`, `git:` …) are skipped for upgrades.
+Direct entries in **`dependencies`**, **`devDependencies`**, **`peerDependencies`**, and **`optionalDependencies`** are **scanned**. Non-registry ranges (`workspace:`, `link:`, `file:`, `git:` …) are skipped for upgrades. **Dist-tags** (`latest`, `next`, custom tags) are treated as registry ranges and pinned to a concrete version on upgrade. **`catalog:` / `catalog:<name>`** (pnpm workspace catalogs and Bun `workspaces.catalog`) are upgraded by rewriting the catalog entry in `pnpm-workspace.yaml` or root `package.json`; the `catalog:` pointer in each `package.json` is left intact. **`peerDependencies` are not bumped unless you pass `--include-peers`** — they are a consumer contract, so auto-upgrading them is usually wrong for libraries. They still participate in linked-group clustering (see below).
 
 ### How linked groups are chosen (`--link-groups auto`)
 
@@ -590,7 +645,7 @@ There are **no framework-specific lists**. Groups are derived from your **direct
 
 ### Interactive mode (`--interactive`)
 
-- **Single package** failures: prompt to continue, pin (ignore) that package, or retry once.
+- **Single package** failures: prompt to continue, pin (ignore) that package, or retry once. Pinning writes a **bare package name** to `.dep-up-surgeonrc`, so the next run skips it in every workspace.
 - **Linked group** failures: prompt to **skip the group**, **retry** (same targets; several attempts allowed), **force** (same as `--force` for that batch), or **freeze** (add all packages in the group to `.dep-up-surgeonrc` ignore). Attempts are capped higher when interactive so you can recover without rerunning the whole CLI.
 
 ### Conflict detection
@@ -664,7 +719,7 @@ Create `.dep-up-surgeonrc` in the project root:
 }
 ```
 
-Ignored packages are never upgraded. The CLI `--ignore` list is merged with this file.
+Ignored packages are never upgraded, in **every** workspace. The CLI `--ignore` list is merged with this file. `--retry-failed` auto-ignores are separate: they are keyed per workspace (`workspace::name`) from the last-run report and are not written here.
 
 **`linkedGroups`** defines **forced** batches **before** the dynamic graph runs (exact npm package names).
 
@@ -681,7 +736,7 @@ Stdout is a single JSON object including:
 - **`preflightAborted: true`** if the run aborted before any upgrade.
 - For each **failed** entry caused by the validator, a `validation` block with `{ command, exitCode, lastLines, source }` so you can tell at a glance whether the failure was a project-side script crash or an actual dependency conflict.
 - For **every** failed entry, an `install` block with `{ command, exitCode, lastLines, ok }` capturing the install step that triggered the failure. `ok: true` means the installer process exited 0 but a post-install conflict scan triggered the rollback (peer warnings, "Conflicting peer dependency", etc.); `ok: false` means the installer itself crashed. `lastLines` is the **last ~40 lines** of combined stdout/stderr — usually enough to include the actual `npm ERR!` / pnpm / yarn footer.
-- **`targets`**: list of `{ label, cwd, packageJson }` entries describing which `package.json` files were processed. With `--workspaces` / `--workspace <names>` this contains multiple entries (`label` = `"root"` or the workspace member's package `name`); without those flags it is a single root entry. Each `upgraded` / `failed` row also carries a matching `workspace` field. When more than one target is traversed, `groups[].id` values are namespaced as `"<workspace>::<group-id>"` so they stay unique across the aggregated report.
+- **`targets`**: list of `{ label, cwd, packageJson }` entries describing which `package.json` files were processed. With `--workspaces` / `--workspace <names>` this contains multiple entries (`label` = `"root"` or the workspace member's package `name`); without those flags it is a single root entry. Each `upgraded` / `failed` row also carries a matching `workspace` field. `--retry-failed` keys its auto-ignore list off that field (`workspace::name`) so a freeze does not leak across members. When more than one target is traversed, `groups[].id` values are namespaced as `"<workspace>::<group-id>"` so they stay unique across the aggregated report.
 - The `failed[].reason` field uses `validation-script` for build/test script crashes and `validation-conflicts` for npm-reported peer issues; `peer` and `install` retain their meanings.
 - **`project`**: `{ manager, managerVersion?, managerSource, lockfile?, hasWorkspaces, workspaceGlobs[], workspaceMembers[], yarnMajorVersion?, yarnSupportsFocus? }` — see **Workspaces & package managers** above. The two `yarn*` fields are only present when the active manager is yarn AND the project has workspaces (they drive the `--install-mode filtered` decision).
 - **`installMode`**: `"root"` or `"filtered"` — the workspace install strategy actually used for this run.
@@ -738,18 +793,18 @@ The `⠹` / `⠇` / `⠸` style glyphs are an animated spinner on a TTY; in CI l
 | `core/graph.ts` | Build the upgrade graph from `package.json` + published **peerDependencies** only (+ `@types/*` pairing); connected components → batches. |
 | `core/dynamicGroups.ts` / `core/groups.ts` | Custom `linkedGroups` from `.dep-up-surgeonrc` merged with graph-driven `LinkedGroup[]`. |
 | `core/conflictParser.ts` / `conflictAnalyzer.ts` | Parse and classify npm/pnpm/yarn log lines; decide whether a “successful” install should be rolled back. |
-| `core/resolver.ts` / `utils/versionFallback.ts` | Semver helpers + per-major / per-minor fallback walking when `@latest` doesn't stick. |
+| `core/peerResolver.ts` / `utils/versionFallback.ts` | Peer-range intersection (linked groups + ad-hoc blockers) + per-major / per-minor fallback walking when `@latest` doesn't stick. |
 | `core/validator.ts` | Pre-flight + per-attempt validator runner. Surfaces `ValidationDiagnostic` (`command`, `exitCode`, `lastLines`, `source`) on every failure. |
-| `core/retryEngine.ts` | Generic retry helper. |
 | `cli/interactive.ts` | `prompts`-based choices for failed packages and failed linked groups. |
 | `cli/report.ts` | Structured `--json` report builder + on-screen summary printer. |
 | `cli/summary.ts` | `--summary md\|html` writer; appends to `$GITHUB_STEP_SUMMARY` when present. |
-| `cli/lastRun.ts` | Persist `.dep-up-surgeon.last-run.json` after every run + read it back for `--retry-failed` (terminal-vs-retryable failure classification). |
+| `cli/lastRun.ts` | Persist `.dep-up-surgeon.last-run.json` after every run + read it back for `--retry-failed` (terminal-vs-retryable failure classification; per-workspace `workspace::name` ignore keys). |
+| `utils/ignoreMatch.ts` | Shared ignore-key helpers: `workspace::name` retry keys + per-target materialization so a freeze in one member cannot leak. |
 | `cli/git.ts` | Low-level git wrappers (`isGitRepo`, `gitAdd`, `gitCommit`, branch helpers) + commit message formatters for the three commit modes. |
 | `cli/gitFlow.ts` | `--git-commit` controller: pre-flight checks (clean tree, branch checkout), buffers per-target / per-run changes, dispatches commits via the engine's `onUpgradeApplied` / `onTargetComplete` hooks under the install lock. |
 | `utils/npm.ts` | `installCommand` (npm/pnpm/yarn variants incl. `yarn workspaces focus`), `runInstall`, registry helpers (`fetchLatestVersion`, `fetchAllPublishedVersions`), peer-conflict + ESM-vs-CJS heuristics. |
 | `utils/registryCache.ts` / `utils/concurrency.ts` | In-process manifest/packument cache + bounded parallel fetch / per-target worker pool + async mutex used to serialize installs and git operations. |
-| `config/loadConfig.ts` | Read + validate `.dep-up-surgeonrc` (`ignore`, `linkedGroups`, `validate`). |
+| `config/loadConfig.ts` | Read + validate `.dep-up-surgeonrc` (`ignore`, `linkedGroups`, `validate`, `overrides`). |
 
 ## Testing
 
@@ -759,11 +814,13 @@ npm test
 
 Runs **unit tests** (conflict parsing, npm output samples, workspace + yarn-capability detection, install command builder, concurrency primitives, summary writer, persisted last-run + retry classification, git helpers + flow controller — all offline) **and fixture integration tests** (`test/fixtures/*/package.json` exercised with `dep-up-surgeon --dry-run --json`). The fixture suite requires **network** access to the npm registry. See `test/fixtures/README.md`. Run only the offline suite with `npm run test:unit`.
 
+Push and pull requests run the same `npm test` command on **Node 22 and 24** (see `.github/workflows/ci.yml`).
+
 ## Development
 
 This package is **ESM-only** (`"type": "module"`): source lives under `src/`, compiles to `dist/*.js` with **TypeScript `module: NodeNext`**, and relative imports use **`.js` extensions** in source so Node resolves them correctly.
 
-Requires **Node `^20.17.0` or `>=22.9.0`** (aligned with `pacote`).
+Requires **Node `^22.22.2`, `^24.15.0`, or `>=26.0.0`** (aligned with `pacote`).
 
 ```bash
 npm install
@@ -776,7 +833,6 @@ The compiled entry is `dist/cli.js` (see `"bin"` in `package.json`).
 
 - GitLab / Bitbucket auto-PR providers (today `--open-pr` is GitHub-only via `gh`)
 - Renovate-style scheduling helpers (cron / day-of-week filters, grouping rules)
-- True parallel installs in monorepos that don't share a root lockfile (e.g. nohoist setups), going beyond today's parallel scan + serial install model
 - AI-assisted failure explanation: feed `install.lastLines` + `validation.lastLines` to an LLM and attach a one-sentence "why this broke" note to failed records
 - Integration catalog: webhooks into Slack / Discord / Linear / Jira so the bot can ping a channel when a security bump lands, not just a GitHub PR
 

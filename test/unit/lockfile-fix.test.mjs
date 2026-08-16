@@ -112,6 +112,22 @@ test('parseLockfileInstalledVersions: yarn classic header + version lines', () =
   });
 });
 
+test('parseLockfileInstalledVersions: bun.lock JSONC packages list', () => {
+  const raw = `{
+    // bun lockfile
+    "lockfileVersion": 1,
+    "packages": {
+      "lodash": ["lodash@4.17.21", "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz", "sha512", {}],
+      "@scope/pkg": ["@scope/pkg@1.2.3", "https://example.com/t.tgz", "sha", {}]
+    }
+  }`;
+  const got = mapToSortedObject(parseLockfileInstalledVersions(raw, 'bun'));
+  assert.deepStrictEqual(got, {
+    lodash: ['4.17.21'],
+    '@scope/pkg': ['1.2.3'],
+  });
+});
+
 test('parseLockfileInstalledVersions: malformed input returns empty map without throwing', () => {
   const got = parseLockfileInstalledVersions('{not valid json', 'npm');
   assert.strictEqual(got.size, 0);
@@ -155,6 +171,7 @@ test('dedupeCommandFor: per-manager + yarn-classic returns undefined', () => {
   });
   assert.strictEqual(dedupeCommandFor('yarn', { yarnMajorVersion: 1 }), undefined);
   assert.strictEqual(dedupeCommandFor('yarn'), undefined, 'default (no version) = classic');
+  assert.strictEqual(dedupeCommandFor('bun'), undefined);
 });
 
 test('runLockfileFix: skips with no-lockfile reason when lockfile missing', async () => {
@@ -179,6 +196,26 @@ test('runLockfileFix: skips with unsupported reason on yarn classic', async () =
   });
   assert.strictEqual(r.report.status, 'skipped');
   assert.strictEqual(r.report.skipReason, 'unsupported');
+});
+
+test('runLockfileFix: skips with unsupported reason on bun.lock', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dus-lockfix-'));
+  await fs.writeFile(path.join(dir, 'package.json'), '{}');
+  await fs.writeFile(path.join(dir, 'bun.lock'), '{ "lockfileVersion": 1, "packages": {} }\n');
+  const r = await runLockfileFix({ cwd: dir, manager: 'bun', json: true });
+  assert.strictEqual(r.report.status, 'skipped');
+  assert.strictEqual(r.report.skipReason, 'unsupported');
+  assert.strictEqual(r.report.lockfile, 'bun.lock');
+});
+
+test('runLockfileFix: skips with unsupported reason on bun.lockb', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dus-lockfix-'));
+  await fs.writeFile(path.join(dir, 'package.json'), '{}');
+  await fs.writeFile(path.join(dir, 'bun.lockb'), Buffer.from([0]));
+  const r = await runLockfileFix({ cwd: dir, manager: 'bun', json: true });
+  assert.strictEqual(r.report.status, 'skipped');
+  assert.strictEqual(r.report.skipReason, 'unsupported');
+  assert.strictEqual(r.report.lockfile, 'bun.lockb');
 });
 
 test('runLockfileFix: dry-run returns the command but never exec', async () => {

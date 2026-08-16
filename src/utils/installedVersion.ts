@@ -49,6 +49,8 @@ function lockfileBasenameFor(manager: PackageManager): string {
       return 'pnpm-lock.yaml';
     case 'yarn':
       return 'yarn.lock';
+    case 'bun':
+      return 'bun.lock';
     default:
       return 'package-lock.json';
   }

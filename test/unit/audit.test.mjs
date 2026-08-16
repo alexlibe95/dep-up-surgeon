@@ -200,9 +200,27 @@ test('runAudit: swallows exec throwable', async () => {
   assert.match(result.error, /ENOENT/);
 });
 
-test('runAudit: unknown manager returns error', async () => {
+test('runAudit: bun uses audit --json and the npm-like parser', async () => {
+  let invokedBin = '';
+  let invokedArgs = [];
   const result = await runAudit({
     manager: 'bun',
+    cwd: '/tmp',
+    exec: async (bin, args) => {
+      invokedBin = bin;
+      invokedArgs = args;
+      return { stdout: NPM_SAMPLE, exitCode: 1 };
+    },
+  });
+  assert.strictEqual(invokedBin, 'bun');
+  assert.deepStrictEqual(invokedArgs, ['audit', '--json']);
+  assert.strictEqual(result.error, undefined, `unexpected error: ${result.error}`);
+  assert.ok(result.advisories.some((a) => a.name === 'axios'));
+});
+
+test('runAudit: unknown manager returns error', async () => {
+  const result = await runAudit({
+    manager: /** @type {any} */ ('unknown'),
     cwd: '/tmp',
     exec: async () => ({ stdout: '', exitCode: 0 }),
   });

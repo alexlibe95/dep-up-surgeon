@@ -1,5 +1,6 @@
 import { execa } from 'execa';
 import type { PackageJson } from '../types.js';
+import type { PackageManager } from './workspaces.js';
 import { DEFAULT_OUTPUT_TAIL_LINES, tailLines } from '../utils/output.js';
 
 export interface ValidationResult {
@@ -34,7 +35,7 @@ export interface ValidationOptions {
    * Package manager whose script-runner should be used for the default validator
    * (`<manager> test`, `<manager> run build`). Defaults to `npm`.
    */
-  manager?: 'npm' | 'pnpm' | 'yarn';
+  manager?: PackageManager;
   /**
    * Fired once the validator has decided which command to run, BEFORE it actually runs.
    * Used by callers (upgrader preflight, install/validate loop) to update a spinner with
@@ -89,9 +90,9 @@ export async function validateProject(
   }
 
   const manager = options.manager ?? 'npm';
-  // yarn classic uses `yarn test`/`yarn build` (no `run`); npm/pnpm both accept `run` for build,
-  // but `<mgr> test` is the canonical short form for the test script.
-  const testArgs = ['test'];
+  // yarn classic uses `yarn test`/`yarn build` (no `run`).
+  // bun's `bun test` is the bun test runner, NOT package.json scripts — use `bun run test`.
+  const testArgs = manager === 'bun' ? ['run', 'test'] : ['test'];
   const buildArgs = manager === 'yarn' ? ['build'] : ['run', 'build'];
 
   const scripts = pkgJson.scripts ?? {};

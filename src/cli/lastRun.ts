@@ -2,6 +2,7 @@ import path from 'node:path';
 import fs from 'fs-extra';
 import type { FinalReport } from '../types.js';
 import type { StructuredReport } from './report.js';
+import { retryIgnoreKey, splitNamespacedId } from '../utils/ignoreMatch.js';
 
 /**
  * Filename written next to the workspace root after every CLI run (unless `--no-persist-report`).
@@ -75,12 +76,21 @@ export async function loadLastRunReport(cwd: string): Promise<PersistedLastRun |
 export const TERMINAL_RETRY_REASONS = new Set(['peer', 'validation-script']);
 
 export interface RetryComputation {
-  /** Names that should be **added** to the ignore set on the retry run. */
+  /**
+   * Keys that should be **added** to the ignore set on the retry run.
+   * Workspace-tagged rows use `workspace::name`; rows from root-only / older reports stay
+   * bare package names (which still freeze the name in every workspace).
+   */
   added: Set<string>;
   /** Stats for human/JSON logs. */
   succeededLastRun: number;
   terminalFailuresLastRun: number;
   retryableLastRun: string[];
+}
+
+interface GroupIndexEntry {
+  packages: string[];
+  workspace?: string;
 }
 
 /**
@@ -92,8 +102,14 @@ export interface RetryComputation {
  * point re-doing work) and terminal failures (peer / validation-script) are skipped (re-running
  * won't help without a code change).
  *
+ * Keys are **per workspace** (`workspace::name`) when the last-run row recorded a workspace
+ * label. A success or terminal failure in `@org/web` therefore does not freeze the same
+ * package name in `@org/api`. Bare `--ignore` / rc entries are unaffected — they remain
+ * global. Rows without `workspace` (root-only runs, older reports) still emit a bare name.
+ *
  * Group failures (`name === '[group:<id>]'`) are expanded to the group's member packages via
- * the persisted `groups` field, so freezing a group correctly freezes every package in it.
+ * the persisted `groups` field, so freezing a group correctly freezes every package in it
+ * — scoped to the workspace that owned the group when that can be recovered.
  */
 export function computeRetryFailedIgnores(last: PersistedLastRun): RetryComputation {
   const added = new Set<string>();
@@ -103,31 +119,30 @@ export function computeRetryFailedIgnores(last: PersistedLastRun): RetryComputat
 
   for (const row of last.upgraded) {
     if (row.success && !row.skipped && row.name) {
-      added.add(row.name);
+      added.add(retryIgnoreKey(row.workspace, row.name));
       succeededLastRun++;
     }
   }
 
-  const groupsByLabel = new Map<string, string[]>();
-  for (const g of last.groups ?? []) {
-    groupsByLabel.set(g.id, g.packages);
-    // group ids may be namespaced as `<workspace>::<id>` when traversing multiple targets;
-    // also map the bare id so `[group:<id>]` keys still resolve.
-    const colon = g.id.indexOf('::');
-    if (colon >= 0) {
-      groupsByLabel.set(g.id.slice(colon + 2), g.packages);
-    }
-  }
+  const { byId, byBareId } = indexPersistedGroups(last.groups ?? []);
 
   for (const f of last.failed ?? []) {
-    const groupMembers = extractGroupMembers(f.name, groupsByLabel);
+    const groupRef = extractGroupRef(f.name);
     if (TERMINAL_RETRY_REASONS.has(f.reason)) {
-      if (groupMembers) {
-        for (const m of groupMembers) {
-          added.add(m);
+      if (groupRef) {
+        const resolved = resolveGroupMembers(groupRef, f.workspace, f.linkedGroupId, byId, byBareId);
+        if (resolved.length > 0) {
+          for (const entry of resolved) {
+            const ws = f.workspace ?? entry.workspace;
+            for (const m of entry.packages) {
+              added.add(retryIgnoreKey(ws, m));
+            }
+          }
+        } else if (f.name) {
+          added.add(retryIgnoreKey(f.workspace, f.name));
         }
       } else if (f.name) {
-        added.add(f.name);
+        added.add(retryIgnoreKey(f.workspace, f.name));
       }
       terminalFailuresLastRun++;
     } else {
@@ -139,13 +154,49 @@ export function computeRetryFailedIgnores(last: PersistedLastRun): RetryComputat
   return { added, succeededLastRun, terminalFailuresLastRun, retryableLastRun };
 }
 
-function extractGroupMembers(
-  name: string,
-  groupsByLabel: Map<string, string[]>,
-): string[] | undefined {
-  const m = /^\[group:(.+)\]$/.exec(name);
-  if (!m) {
-    return undefined;
+function indexPersistedGroups(
+  groups: Array<{ id: string; packages: string[] }>,
+): { byId: Map<string, GroupIndexEntry>; byBareId: Map<string, GroupIndexEntry[]> } {
+  const byId = new Map<string, GroupIndexEntry>();
+  const byBareId = new Map<string, GroupIndexEntry[]>();
+  for (const g of groups) {
+    const { workspace, bare } = splitNamespacedId(g.id);
+    const entry: GroupIndexEntry = { packages: g.packages, workspace };
+    byId.set(g.id, entry);
+    const list = byBareId.get(bare) ?? [];
+    list.push(entry);
+    byBareId.set(bare, list);
   }
-  return groupsByLabel.get(m[1]!);
+  return { byId, byBareId };
+}
+
+function extractGroupRef(name: string): string | undefined {
+  const m = /^\[group:(.+)\]$/.exec(name);
+  return m?.[1];
+}
+
+function resolveGroupMembers(
+  groupRef: string,
+  failureWorkspace: string | undefined,
+  linkedGroupId: string | undefined,
+  byId: Map<string, GroupIndexEntry>,
+  byBareId: Map<string, GroupIndexEntry[]>,
+): GroupIndexEntry[] {
+  if (failureWorkspace) {
+    const namespaced = byId.get(`${failureWorkspace}::${groupRef}`);
+    if (namespaced) {
+      return [namespaced];
+    }
+  }
+  if (linkedGroupId) {
+    const byLinked = byId.get(linkedGroupId);
+    if (byLinked) {
+      return [byLinked];
+    }
+  }
+  const exact = byId.get(groupRef);
+  if (exact) {
+    return [exact];
+  }
+  return byBareId.get(groupRef) ?? [];
 }

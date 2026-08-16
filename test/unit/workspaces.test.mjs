@@ -10,7 +10,9 @@ import fs from 'node:fs/promises';
 import fssync from 'node:fs';
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const { detectProjectInfo } = await import(path.join(root, 'dist/core/workspaces.js'));
+const { detectProjectInfo, parsePackageManagerOption, isPackageManager } = await import(
+  path.join(root, 'dist/core/workspaces.js')
+);
 
 async function makeTmp(prefix) {
   return await fs.mkdtemp(path.join(os.tmpdir(), `dus-ws-${prefix}-`));
@@ -76,6 +78,54 @@ test('detectProjectInfo: cli override beats packageManager + lockfile', async ()
   const info = await detectProjectInfo(dir, 'yarn');
   assert.strictEqual(info.manager, 'yarn');
   assert.strictEqual(info.managerSource, 'cli');
+});
+
+test('detectProjectInfo: bun.lock selects bun', async () => {
+  const dir = await makeTmp('lock-bun');
+  await writeJson(path.join(dir, 'package.json'), { name: 'lock-bun' });
+  await fs.writeFile(path.join(dir, 'bun.lock'), '{ "lockfileVersion": 1, "packages": {} }\n');
+
+  const info = await detectProjectInfo(dir);
+  assert.strictEqual(info.manager, 'bun');
+  assert.strictEqual(info.managerSource, 'lockfile');
+  assert.strictEqual(info.lockfile, 'bun.lock');
+});
+
+test('detectProjectInfo: parses packageManager field for bun', async () => {
+  const dir = await makeTmp('pm-bun');
+  await writeJson(path.join(dir, 'package.json'), {
+    name: 'pm-bun',
+    packageManager: 'bun@1.2.0',
+  });
+
+  const info = await detectProjectInfo(dir);
+  assert.strictEqual(info.manager, 'bun');
+  assert.strictEqual(info.managerVersion, '1.2.0');
+  assert.strictEqual(info.managerSource, 'package.json:packageManager');
+});
+
+test('detectProjectInfo: bun.lockb selects bun when bun.lock is absent', async () => {
+  const dir = await makeTmp('lock-bunb');
+  await writeJson(path.join(dir, 'package.json'), { name: 'lock-bunb' });
+  await fs.writeFile(path.join(dir, 'bun.lockb'), Buffer.from([0, 1, 2, 3]));
+
+  const info = await detectProjectInfo(dir);
+  assert.strictEqual(info.manager, 'bun');
+  assert.strictEqual(info.managerSource, 'lockfile');
+  assert.strictEqual(info.lockfile, 'bun.lockb');
+});
+
+test('parsePackageManagerOption: known managers vs auto fallback', () => {
+  assert.strictEqual(parsePackageManagerOption(undefined), 'auto');
+  assert.strictEqual(parsePackageManagerOption('auto'), 'auto');
+  assert.strictEqual(parsePackageManagerOption('npm'), 'npm');
+  assert.strictEqual(parsePackageManagerOption('pnpm'), 'pnpm');
+  assert.strictEqual(parsePackageManagerOption('yarn'), 'yarn');
+  assert.strictEqual(parsePackageManagerOption('bun'), 'bun');
+  assert.strictEqual(parsePackageManagerOption('BUN'), 'bun');
+  assert.strictEqual(parsePackageManagerOption('deno'), 'auto');
+  assert.strictEqual(isPackageManager('bun'), true);
+  assert.strictEqual(isPackageManager('deno'), false);
 });
 
 test('detectProjectInfo: expands npm-style workspaces and lists member names', async () => {

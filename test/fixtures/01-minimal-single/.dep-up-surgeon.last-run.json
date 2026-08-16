@@ -5,10 +5,11 @@
       "name": "lodash",
       "success": true,
       "skipped": true,
-      "from": "4.17.21",
+      "from": "^4.17.21",
       "to": "4.18.1",
       "reason": "skipped",
-      "detail": "dry-run"
+      "detail": "dry-run",
+      "requestedLatest": "4.18.1"
     }
   ],
   "failed": [],
@@ -37,8 +38,8 @@
     }
   ],
   "installMode": "root",
-  "finishedAt": "2026-04-24T22:07:50.296Z",
-  "toolVersion": "2.2.7",
+  "finishedAt": "2026-08-16T11:45:40.877Z",
+  "toolVersion": "2.3.0",
   "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/01-minimal-single",
   "dryRun": true
 }

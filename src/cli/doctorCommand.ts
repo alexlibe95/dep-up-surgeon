@@ -13,6 +13,7 @@ import path from 'node:path';
 import { Command } from 'commander';
 import { runDoctor } from './doctor.js';
 import { doctorExitCode, renderDoctorHuman } from './doctorRenderer.js';
+import { parsePackageManagerOption } from '../core/workspaces.js';
 import { log } from '../utils/logger.js';
 
 export async function runDoctorCommand(argv: string[], version: string): Promise<void> {
@@ -38,7 +39,7 @@ export async function runDoctorCommand(argv: string[], version: string): Promise
     .option('--skip-stale-scan', 'Skip the registry-backed stale-transitive scan.', false)
     .option(
       '--package-manager <mgr>',
-      'Override detected package manager: auto (default), npm, pnpm, yarn.',
+      'Override detected package manager: auto (default), npm, pnpm, yarn, or bun.',
       'auto',
     )
     .option('--cwd <path>', 'Run the diagnostic against this directory instead of the current one.');
@@ -74,8 +75,8 @@ export async function runDoctorCommand(argv: string[], version: string): Promise
       ...(opts.skipAudit ? { skipAudit: true } : {}),
       ...(opts.skipPeerScan ? { skipPeerScan: true } : {}),
       ...(opts.skipStaleScan ? { skipStaleScan: true } : {}),
-      ...(opts.packageManager && opts.packageManager !== 'auto'
-        ? { manager: opts.packageManager as 'npm' | 'pnpm' | 'yarn' }
+      ...(parsePackageManagerOption(opts.packageManager) !== 'auto'
+        ? { manager: parsePackageManagerOption(opts.packageManager) as 'npm' | 'pnpm' | 'yarn' | 'bun' }
         : {}),
     });
 

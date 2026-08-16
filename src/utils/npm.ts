@@ -1,6 +1,7 @@
 import { execa } from 'execa';
 import pacote from 'pacote';
 import type { RegistryCache } from './concurrency.js';
+import type { PackageManager } from '../core/workspaces.js';
 
 /**
  * Regex / heuristics for npm stderr+stdout (install, ci, etc.).
@@ -156,7 +157,7 @@ export async function fetchAllPublishedVersions(
   return Object.keys(v);
 }
 
-export type InstallManager = 'npm' | 'pnpm' | 'yarn';
+export type InstallManager = PackageManager;
 
 export interface InstallResult {
   ok: boolean;
@@ -217,6 +218,10 @@ export function installCommand(
         };
       }
       return { bin: 'yarn', args: ['install'], filtered: false };
+    case 'bun':
+      return filter
+        ? { bin: 'bun', args: ['install', '--filter', filter], filtered: true }
+        : { bin: 'bun', args: ['install'], filtered: false };
     case 'npm':
     default:
       return filter

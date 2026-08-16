@@ -487,6 +487,8 @@ function peerScanCommandFor(
         return { bin: 'yarn', args: ['install', '--immutable', '--mode=skip-build'] };
       }
       return { bin: 'yarn', args: ['check'] };
+    case 'bun':
+      return { bin: 'bun', args: ['install', '--frozen-lockfile'] };
     default:
       return undefined;
   }

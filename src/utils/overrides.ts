@@ -55,6 +55,7 @@ export function overrideFieldFor(manager: PackageManager): OverrideField {
     case 'yarn':
       return 'resolutions';
     case 'npm':
+    case 'bun':
     default:
       return 'overrides';
   }
@@ -172,7 +173,7 @@ export function readOverrides(
       // Leaf: a direct `name` OR a chain key for pnpm/yarn.
       const chain = parseChainKey(k, manager);
       pushEntry(entries, chain, v);
-    } else if (manager === 'npm' && v && typeof v === 'object' && !Array.isArray(v)) {
+    } else if ((manager === 'npm' || manager === 'bun') && v && typeof v === 'object' && !Array.isArray(v)) {
       // npm nested object form. Walk it recursively so grandchildren (`foo>bar>baz` in npm
       // parlance = `{ foo: { bar: { baz: "X" } } }`) are flattened into a single chain.
       walkNpmNested([k], v as Record<string, unknown>, entries);

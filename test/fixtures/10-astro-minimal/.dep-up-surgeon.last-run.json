@@ -5,10 +5,11 @@
       "name": "astro",
       "success": true,
       "skipped": true,
-      "from": "6.0.0",
-      "to": "6.1.9",
+      "from": "^6.0.0",
+      "to": "7.2.2",
       "reason": "skipped",
-      "detail": "dry-run"
+      "detail": "dry-run",
+      "requestedLatest": "7.2.2"
     }
   ],
   "failed": [],
@@ -37,8 +38,8 @@
     }
   ],
   "installMode": "root",
-  "finishedAt": "2026-04-24T22:08:00.200Z",
-  "toolVersion": "2.2.7",
+  "finishedAt": "2026-08-16T11:41:08.826Z",
+  "toolVersion": "2.3.0",
   "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/10-astro-minimal",
   "dryRun": true
 }

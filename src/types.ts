@@ -197,10 +197,10 @@ export interface ConflictEntry {
  * detection themselves.
  */
 export interface ProjectInfoReport {
-  manager: 'npm' | 'pnpm' | 'yarn';
+  manager: 'npm' | 'pnpm' | 'yarn' | 'bun';
   managerVersion?: string;
   managerSource: 'cli' | 'package.json:packageManager' | 'lockfile' | 'pnpm-workspace' | 'default';
-  lockfile?: 'package-lock.json' | 'pnpm-lock.yaml' | 'yarn.lock';
+  lockfile?: 'package-lock.json' | 'pnpm-lock.yaml' | 'yarn.lock' | 'bun.lock' | 'bun.lockb';
   hasWorkspaces: boolean;
   workspaceGlobs: string[];
   workspaceMembers: Array<{ name: string; dir: string }>;
@@ -409,8 +409,8 @@ export interface LockfileStaleEntry {
  */
 export interface LockfileFixReport {
   status: 'ok' | 'failed' | 'skipped' | 'dry-run';
-  manager: 'npm' | 'pnpm' | 'yarn';
-  lockfile: 'package-lock.json' | 'pnpm-lock.yaml' | 'yarn.lock';
+  manager: 'npm' | 'pnpm' | 'yarn' | 'bun';
+  lockfile: 'package-lock.json' | 'pnpm-lock.yaml' | 'yarn.lock' | 'bun.lock' | 'bun.lockb';
   /** Present when `status !== 'skipped'`. */
   command?: string;
   /** Exit code from the dedupe command (0 for ok, non-zero for failed dedupe). */

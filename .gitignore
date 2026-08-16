@@ -2,4 +2,5 @@ node_modules/
 dist/
 *.log
 package.json.dep-up-surgeon.bak
+pnpm-workspace.yaml.dep-up-surgeon.bak
 .dep-up-surgeon.last-run.json

@@ -47,12 +47,14 @@ import { runWithConcurrency } from '../utils/concurrency.js';
  */
 function lockfileBasenameFor(
   manager: PackageManager,
-): 'package-lock.json' | 'pnpm-lock.yaml' | 'yarn.lock' {
+): 'package-lock.json' | 'pnpm-lock.yaml' | 'yarn.lock' | 'bun.lock' | 'bun.lockb' {
   switch (manager) {
     case 'pnpm':
       return 'pnpm-lock.yaml';
     case 'yarn':
       return 'yarn.lock';
+    case 'bun':
+      return 'bun.lock';
     case 'npm':
     default:
       return 'package-lock.json';
@@ -82,6 +84,9 @@ export function dedupeCommandFor(
       if ((opts.yarnMajorVersion ?? 1) >= 2) {
         return { bin: 'yarn', args: ['dedupe'] };
       }
+      return undefined;
+    case 'bun':
+      // bun has no `dedupe` subcommand — install already hoists.
       return undefined;
     case 'npm':
     default:
@@ -133,8 +138,15 @@ export interface RunLockfileFixResult {
  */
 export async function runLockfileFix(opts: RunLockfileFixOptions): Promise<RunLockfileFixResult> {
   const { cwd, manager, yarnMajorVersion, json, dryRun } = opts;
-  const lockfileBasename = lockfileBasenameFor(manager);
-  const lockfilePath = path.join(cwd, lockfileBasename);
+  let lockfileBasename = lockfileBasenameFor(manager);
+  let lockfilePath = path.join(cwd, lockfileBasename);
+  if (manager === 'bun' && !(await fs.pathExists(lockfilePath))) {
+    const binary = path.join(cwd, 'bun.lockb');
+    if (await fs.pathExists(binary)) {
+      lockfileBasename = 'bun.lockb';
+      lockfilePath = binary;
+    }
+  }
 
   // No lockfile → nothing to dedupe. Emit a `skipped` report so --json consumers see the
   // reason explicitly rather than the field being absent.
@@ -294,6 +306,9 @@ export function parseLockfileInstalledVersions(
     if (manager === 'yarn') {
       return parseYarnLockfile(raw);
     }
+    if (manager === 'bun') {
+      return parseBunLockfile(raw);
+    }
   } catch {
     /* fall through */
   }
@@ -394,6 +409,46 @@ function parseYarnLockfile(raw: string): Map<string, Set<string>> {
     }
   }
   return out;
+}
+
+/**
+ * bun.lock (text / JSONC, bun 1.1.38+). `packages` values are typically
+ * `["name@version", tarball, integrity, deps]`. Binary `bun.lockb` is not parsed here.
+ */
+function parseBunLockfile(raw: string): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>();
+  let json: { packages?: Record<string, unknown> };
+  try {
+    json = parseJsonc(raw) as { packages?: Record<string, unknown> };
+  } catch {
+    return out;
+  }
+  const packages = json?.packages;
+  if (!packages || typeof packages !== 'object') return out;
+  for (const [key, val] of Object.entries(packages)) {
+    const spec = Array.isArray(val) && typeof val[0] === 'string' ? val[0] : key;
+    const parsed = splitNameAtVersion(spec);
+    if (parsed) addVersion(out, parsed.name, parsed.version);
+  }
+  return out;
+}
+
+function parseJsonc(raw: string): unknown {
+  const stripped = raw
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
+    .replace(/,(\s*[}\]])/g, '$1');
+  return JSON.parse(stripped);
+}
+
+function splitNameAtVersion(spec: string): { name: string; version: string } | undefined {
+  const t = spec.trim().replace(/^"|"$/g, '');
+  const at = t.lastIndexOf('@');
+  if (at <= 0) return undefined;
+  const name = t.slice(0, at);
+  const version = t.slice(at + 1);
+  if (!name || !version) return undefined;
+  return { name, version };
 }
 
 /** Parse a yarn.lock header line into the list of package names it declares. */

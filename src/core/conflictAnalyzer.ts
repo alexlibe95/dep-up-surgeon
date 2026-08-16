@@ -173,7 +173,7 @@ function npmOverrodePeersButInstallSucceeded(
   return true;
 }
 
-type PackageManager = 'npm' | 'yarn' | 'pnpm';
+type PackageManager = 'npm' | 'yarn' | 'pnpm' | 'bun';
 
 /**
  * After a **successful** `npm install`, roll back if structured conflicts were detected (unless --force),

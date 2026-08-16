@@ -5,16 +5,17 @@
       "name": "@nestjs/cli",
       "success": true,
       "skipped": true,
-      "from": "11.0.0",
-      "to": "11.0.21",
+      "from": "^11.0.0",
+      "to": "11.0.24",
       "reason": "skipped",
-      "detail": "dry-run"
+      "detail": "dry-run",
+      "requestedLatest": "11.0.24"
     },
     {
       "name": "class-transformer",
       "success": true,
       "skipped": true,
-      "from": "0.5.1",
+      "from": "^0.5.1",
       "to": "0.5.1",
       "reason": "skipped",
       "detail": "already latest",
@@ -24,7 +25,7 @@
       "name": "reflect-metadata",
       "success": true,
       "skipped": true,
-      "from": "0.2.2",
+      "from": "^0.2.2",
       "to": "0.2.2",
       "reason": "skipped",
       "detail": "already latest",
@@ -34,8 +35,8 @@
       "name": "@nestjs/common",
       "success": true,
       "skipped": true,
-      "from": "11.1.0",
-      "to": "11.1.19",
+      "from": "^11.1.0",
+      "to": "11.2.1",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-0"
@@ -44,8 +45,8 @@
       "name": "@nestjs/core",
       "success": true,
       "skipped": true,
-      "from": "11.1.0",
-      "to": "11.1.19",
+      "from": "^11.1.0",
+      "to": "11.2.1",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-0"
@@ -54,8 +55,8 @@
       "name": "@nestjs/platform-express",
       "success": true,
       "skipped": true,
-      "from": "11.1.0",
-      "to": "11.1.19",
+      "from": "^11.1.0",
+      "to": "11.2.1",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-0"
@@ -64,8 +65,8 @@
       "name": "@nestjs/testing",
       "success": true,
       "skipped": true,
-      "from": "11.1.0",
-      "to": "11.1.19",
+      "from": "^11.1.0",
+      "to": "11.2.1",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-0"
@@ -74,7 +75,7 @@
       "name": "class-validator",
       "success": true,
       "skipped": true,
-      "from": "0.15.0",
+      "from": "^0.15.0",
       "to": "0.15.1",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
@@ -84,7 +85,7 @@
       "name": "rxjs",
       "success": true,
       "skipped": true,
-      "from": "7.8.0",
+      "from": "^7.8.0",
       "to": "7.8.2",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
@@ -94,28 +95,31 @@
       "name": "@types/express",
       "success": true,
       "skipped": true,
-      "from": "5.0.0",
+      "from": "^5.0.0",
       "to": "5.0.6",
       "reason": "skipped",
-      "detail": "dry-run"
+      "detail": "dry-run",
+      "requestedLatest": "5.0.6"
     },
     {
       "name": "@types/node",
       "success": true,
       "skipped": true,
-      "from": "24.0.0",
-      "to": "25.6.0",
+      "from": "^24.0.0",
+      "to": "26.2.0",
       "reason": "skipped",
-      "detail": "dry-run"
+      "detail": "dry-run",
+      "requestedLatest": "26.2.0"
     },
     {
       "name": "typescript",
       "success": true,
       "skipped": true,
-      "from": "5.9.0",
-      "to": "6.0.3",
+      "from": "^5.9.0",
+      "to": "7.0.2",
       "reason": "skipped",
-      "detail": "dry-run"
+      "detail": "dry-run",
+      "requestedLatest": "7.0.2"
     }
   ],
   "failed": [],
@@ -175,8 +179,8 @@
     }
   ],
   "installMode": "root",
-  "finishedAt": "2026-04-24T22:08:06.687Z",
-  "toolVersion": "2.2.7",
+  "finishedAt": "2026-08-16T11:41:11.912Z",
+  "toolVersion": "2.3.0",
   "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/11-nest-sample-cats",
   "dryRun": true
 }

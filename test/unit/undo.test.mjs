@@ -308,3 +308,103 @@ test('runUndo: workspace rows revert the correct workspace package.json', async 
     assert.equal(pkg.dependencies.lodash, '^4.17.19');
   });
 });
+
+test('runUndo: catalog: pointer stays; catalog file range reverts', async () => {
+  await withTempDir(async (cwd) => {
+    await fs.writeFile(
+      path.join(cwd, 'package.json'),
+      JSON.stringify({ name: 'demo', dependencies: { react: 'catalog:' } }, null, 2),
+    );
+    await fs.writeFile(
+      path.join(cwd, 'pnpm-workspace.yaml'),
+      'packages:\n  - packages/*\ncatalog:\n  react: ^19.0.0\n',
+    );
+    await writeLastRun(cwd, {
+      upgraded: [{ name: 'react', success: true, from: '^18.2.0', to: '^19.0.0' }],
+      project: {
+        manager: 'pnpm',
+        managerSource: 'lockfile',
+        hasWorkspaces: true,
+        workspaceGlobs: ['packages/*'],
+        workspaceMembers: [],
+      },
+    });
+    const { installer } = makeInstaller();
+    const result = await runUndo({ cwd, installer, skipValidator: true });
+    assert.equal(result.reverts[0].ok, true);
+    const pkg = JSON.parse(await fs.readFile(path.join(cwd, 'package.json'), 'utf8'));
+    assert.equal(pkg.dependencies.react, 'catalog:');
+    const yaml = await fs.readFile(path.join(cwd, 'pnpm-workspace.yaml'), 'utf8');
+    assert.match(yaml, /react:\s*['"]?\^18\.2\.0['"]?/);
+    assert.doesNotMatch(yaml, /\^19\.0\.0/);
+  });
+});
+
+test('runUndo: catalog drift skips without rewriting the catalog file', async () => {
+  await withTempDir(async (cwd) => {
+    await fs.writeFile(
+      path.join(cwd, 'package.json'),
+      JSON.stringify({ name: 'demo', dependencies: { react: 'catalog:' } }, null, 2),
+    );
+    await fs.writeFile(
+      path.join(cwd, 'pnpm-workspace.yaml'),
+      'packages:\n  - packages/*\ncatalog:\n  react: ^19.1.0\n',
+    );
+    await writeLastRun(cwd, {
+      upgraded: [{ name: 'react', success: true, from: '^18.2.0', to: '^19.0.0' }],
+    });
+    const { installer } = makeInstaller();
+    const result = await runUndo({ cwd, installer, skipValidator: true });
+    assert.equal(result.reverts[0].ok, false);
+    assert.equal(result.reverts[0].reason, 'drifted');
+    const yaml = await fs.readFile(path.join(cwd, 'pnpm-workspace.yaml'), 'utf8');
+    assert.match(yaml, /\^19\.1\.0/);
+  });
+});
+
+test('runUndo: planOnly does not write catalog file', async () => {
+  await withTempDir(async (cwd) => {
+    await fs.writeFile(
+      path.join(cwd, 'package.json'),
+      JSON.stringify({ name: 'demo', dependencies: { react: 'catalog:' } }, null, 2),
+    );
+    await fs.writeFile(
+      path.join(cwd, 'pnpm-workspace.yaml'),
+      'packages:\n  - packages/*\ncatalog:\n  react: ^19.0.0\n',
+    );
+    await writeLastRun(cwd, {
+      upgraded: [{ name: 'react', success: true, from: '^18.2.0', to: '^19.0.0' }],
+    });
+    const { installer, calls } = makeInstaller();
+    const result = await runUndo({ cwd, installer, planOnly: true, skipValidator: true });
+    assert.equal(result.reverts[0].ok, true);
+    assert.equal(calls.length, 0);
+    const yaml = await fs.readFile(path.join(cwd, 'pnpm-workspace.yaml'), 'utf8');
+    assert.match(yaml, /\^19\.0\.0/);
+    const pkg = JSON.parse(await fs.readFile(path.join(cwd, 'package.json'), 'utf8'));
+    assert.equal(pkg.dependencies.react, 'catalog:');
+  });
+});
+
+test('runUndo: named catalog: pointer reverts the named map', async () => {
+  await withTempDir(async (cwd) => {
+    await fs.writeFile(
+      path.join(cwd, 'package.json'),
+      JSON.stringify({ name: 'demo', dependencies: { react: 'catalog:react19' } }, null, 2),
+    );
+    await fs.writeFile(
+      path.join(cwd, 'pnpm-workspace.yaml'),
+      'packages:\n  - packages/*\ncatalogs:\n  react19:\n    react: ^19.0.0\n',
+    );
+    await writeLastRun(cwd, {
+      upgraded: [{ name: 'react', success: true, from: '^18.2.0', to: '^19.0.0' }],
+    });
+    const { installer } = makeInstaller();
+    const result = await runUndo({ cwd, installer, skipValidator: true });
+    assert.equal(result.reverts[0].ok, true);
+    const pkg = JSON.parse(await fs.readFile(path.join(cwd, 'package.json'), 'utf8'));
+    assert.equal(pkg.dependencies.react, 'catalog:react19');
+    const yaml = await fs.readFile(path.join(cwd, 'pnpm-workspace.yaml'), 'utf8');
+    assert.match(yaml, /react:\s*['"]?\^18\.2\.0['"]?/);
+  });
+});

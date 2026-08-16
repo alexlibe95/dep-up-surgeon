@@ -16,6 +16,9 @@ const {
   loadLastRunReport,
   persistLastRunReport,
 } = await import(path.join(root, 'dist/cli/lastRun.js'));
+const { materializeIgnoreForTarget, retryIgnoreKey } = await import(
+  path.join(root, 'dist/utils/ignoreMatch.js')
+);
 
 async function makeTmp(prefix) {
   return await fs.mkdtemp(path.join(os.tmpdir(), `dus-lr-${prefix}-`));
@@ -129,9 +132,10 @@ test('computeRetryFailedIgnores: expands [group:<id>] failures to all member pac
   assert.deepStrictEqual(r.retryableLastRun, ['[group:lint-stack]']);
 });
 
-test('computeRetryFailedIgnores: matches workspace-namespaced group ids on the bare id too', () => {
+test('computeRetryFailedIgnores: matches workspace-namespaced group ids without freezing the bare name globally', () => {
   // When --workspaces is used, group ids are persisted as `<workspace>::<id>` but the failure
-  // row is keyed on `[group:<id>]`. The helper must still find the members.
+  // row is keyed on `[group:<id>]`. Members must be frozen as `workspace::name`, not the bare
+  // package name (that would skip the same deps in every other workspace).
   const last = {
     upgraded: [],
     failed: [
@@ -152,5 +156,129 @@ test('computeRetryFailedIgnores: matches workspace-namespaced group ids on the b
     unresolved: [],
   };
   const r = computeRetryFailedIgnores(last);
-  assert.deepStrictEqual([...r.added].sort(), ['eslint', 'prettier']);
+  assert.deepStrictEqual([...r.added].sort(), ['@org/web::eslint', '@org/web::prettier']);
+  assert.ok(!r.added.has('eslint'));
+  assert.ok(!r.added.has('prettier'));
+});
+
+test('computeRetryFailedIgnores: success in one workspace does not freeze the same name in another', () => {
+  const last = {
+    upgraded: [
+      { name: 'lodash', success: true, from: '4.0.0', to: '4.17.21', workspace: '@org/web' },
+      { name: 'lodash', success: false, workspace: '@org/api' },
+    ],
+    failed: [
+      { name: 'lodash', reason: 'install', previousVersion: '4.0.0', workspace: '@org/api' },
+    ],
+    groups: [],
+    finishedAt: new Date().toISOString(),
+    toolVersion: '0.0.0',
+    cwd: '/tmp/x',
+    dryRun: false,
+    skipped: [],
+    conflicts: [],
+    unresolved: [],
+  };
+  const r = computeRetryFailedIgnores(last);
+  assert.deepStrictEqual([...r.added], ['@org/web::lodash']);
+  assert.ok(!r.added.has('lodash'));
+  assert.ok(!r.added.has('@org/api::lodash'));
+  assert.deepStrictEqual(r.retryableLastRun, ['lodash']);
+});
+
+test('computeRetryFailedIgnores: terminal failure in one workspace does not freeze the name in another', () => {
+  const last = {
+    upgraded: [],
+    failed: [
+      { name: 'react', reason: 'peer', previousVersion: '17.0.0', workspace: '@org/web' },
+      { name: 'react', reason: 'install', previousVersion: '17.0.0', workspace: '@org/api' },
+    ],
+    groups: [],
+    finishedAt: new Date().toISOString(),
+    toolVersion: '0.0.0',
+    cwd: '/tmp/x',
+    dryRun: false,
+    skipped: [],
+    conflicts: [],
+    unresolved: [],
+  };
+  const r = computeRetryFailedIgnores(last);
+  assert.deepStrictEqual([...r.added], ['@org/web::react']);
+  assert.ok(!r.added.has('react'));
+  assert.ok(!r.added.has('@org/api::react'));
+  assert.deepStrictEqual(r.retryableLastRun, ['react']);
+});
+
+test('computeRetryFailedIgnores: rows without workspace still emit a bare name (old reports)', () => {
+  const last = {
+    upgraded: [{ name: 'axios', success: true, from: '1.0.0', to: '1.6.0' }],
+    failed: [{ name: 'react', reason: 'peer', previousVersion: '17.0.0' }],
+    groups: [],
+    finishedAt: new Date().toISOString(),
+    toolVersion: '0.0.0',
+    cwd: '/tmp/x',
+    dryRun: false,
+    skipped: [],
+    conflicts: [],
+    unresolved: [],
+  };
+  const r = computeRetryFailedIgnores(last);
+  assert.deepStrictEqual([...r.added].sort(), ['axios', 'react']);
+});
+
+test('computeRetryFailedIgnores: terminal group failure is scoped to the workspace that owned it', () => {
+  const last = {
+    upgraded: [],
+    failed: [
+      {
+        name: '[group:tooling]',
+        reason: 'peer',
+        previousVersion: 'eslint@8',
+        linkedGroupId: 'tooling',
+        workspace: '@org/web',
+      },
+    ],
+    groups: [
+      { id: '@org/web::tooling', packages: ['eslint', 'prettier'] },
+      { id: '@org/api::tooling', packages: ['eslint', 'prettier'] },
+    ],
+    finishedAt: new Date().toISOString(),
+    toolVersion: '0.0.0',
+    cwd: '/tmp/x',
+    dryRun: false,
+    skipped: [],
+    conflicts: [],
+    unresolved: [],
+  };
+  const r = computeRetryFailedIgnores(last);
+  assert.deepStrictEqual([...r.added].sort(), ['@org/web::eslint', '@org/web::prettier']);
+  assert.ok(!r.added.has('@org/api::eslint'));
+  assert.ok(!r.added.has('eslint'));
+});
+
+test('retryIgnoreKey: scopes when workspace is set, stays bare otherwise', () => {
+  assert.strictEqual(retryIgnoreKey('@org/web', 'lodash'), '@org/web::lodash');
+  assert.strictEqual(retryIgnoreKey('root', 'typescript'), 'root::typescript');
+  assert.strictEqual(retryIgnoreKey(undefined, 'axios'), 'axios');
+});
+
+test('materializeIgnoreForTarget: promotes only the current workspace keys to bare names', () => {
+  const ignore = new Set(['lodash', '@org/web::axios', '@org/api::axios', 'root::typescript']);
+  const web = materializeIgnoreForTarget(ignore, '@org/web');
+  assert.ok(web.has('lodash'), 'bare --ignore names stay global');
+  assert.ok(web.has('axios'), 'web-scoped axios becomes a local bare name');
+  assert.ok(!materializeIgnoreForTarget(ignore, '@org/api').has('typescript'));
+  const api = materializeIgnoreForTarget(ignore, '@org/api');
+  assert.ok(api.has('axios'));
+  assert.ok(api.has('lodash'));
+  assert.ok(!api.has('typescript'));
+  const root = materializeIgnoreForTarget(ignore, 'root');
+  assert.ok(root.has('typescript'));
+  assert.ok(!root.has('axios'));
+  const none = materializeIgnoreForTarget(ignore, undefined);
+  assert.ok(!none.has('axios'));
+  assert.ok(none.has('@org/web::axios'));
+  // Original set is not mutated.
+  assert.ok(!ignore.has('axios'));
+  assert.ok(!ignore.has('typescript'));
 });

@@ -15,7 +15,6 @@ import type {
 } from '../types.js';
 import type { PackageJson } from '../types.js';
 import { addFailure, addUpgrade, createEmptyReport } from './conflict.js';
-import { isRegistryRange, scanProject } from './scanner.js';
 import { validateProject, type ValidationOptions, type ValidationResult } from './validator.js';
 import { createSpinner, log, type Spinner } from '../utils/logger.js';
 import {
@@ -30,6 +29,7 @@ import {
 } from '../utils/npm.js';
 import { detectProjectInfo, type PackageManager, type ProjectInfo } from './workspaces.js';
 import { tailLines } from '../utils/output.js';
+import { materializeIgnoreForTarget } from '../utils/ignoreMatch.js';
 import {
   KeyedMutex,
   createRegistryCache,
@@ -59,6 +59,15 @@ import {
 import { tryResolveAdHocPeerConflict } from './peerResolverAdHoc.js';
 import { formatUpgradeRange } from '../utils/rangeStyle.js';
 import {
+  catalogStyleRange,
+  loadCatalogIndex,
+  parseCatalogSpec,
+  resolveCatalogRange,
+  writeCatalogRange,
+  type CatalogIndex,
+} from '../utils/catalog.js';
+import { isDistTag, isRegistryRange, scanProject } from './scanner.js';
+import {
   loadLockfileVersionTree,
   resolveInstalledVersion,
   type LockfileVersionTree,
@@ -66,6 +75,7 @@ import {
 import { dedupeScannedByName } from './scannedDedup.js';
 
 const BACKUP_FILENAME = 'package.json.dep-up-surgeon.bak';
+const CATALOG_BACKUP_FILENAME = 'pnpm-workspace.yaml.dep-up-surgeon.bak';
 
 function classifyInstallOutput(output: string | undefined, opts: UpgradeEngineOptions): ClassifiedConflict[] {
   return extractClassifiedConflicts(output ?? '', { rootPackageName: opts.rootPackageName });
@@ -79,6 +89,12 @@ export interface UpgradeEngineOptions {
   interactive: boolean;
   force: boolean;
   jsonOutput: boolean;
+  /**
+   * Package names to skip. Bare names (from `--ignore` / rc / policy) apply in every workspace.
+   * `--retry-failed` also contributes `workspace::name` keys; `runUpgradeEngine` materializes
+   * those against `targetLabel` so a freeze in one member does not skip the same package in
+   * another. The set is copied per target and never mutated in place.
+   */
   ignore: Set<string>;
   /**
    * When set, only packages whose `name` is in this set are candidates for upgrade. Every other
@@ -238,6 +254,10 @@ export interface UpgradeEngineOptions {
    * When omitted, the engine loads it once from `installCwd`.
    */
   lockfileVersions?: LockfileVersionTree;
+  /**
+   * Loaded pnpm/Bun catalog maps (from workspace root). When omitted, loaded from `installCwd`.
+   */
+  catalog?: CatalogIndex;
 }
 
 /**
@@ -254,6 +274,8 @@ export interface UpgradeAppliedEvent {
   workspace?: string;
   /** Linked-group id when this success was a batch; absent for single upgrades. */
   groupId?: string;
+  /** Extra files mutated this step (e.g. `pnpm-workspace.yaml` for catalog: upgrades). */
+  extraFiles?: string[];
 }
 
 async function readPackageJson(cwd: string): Promise<PackageJson> {
@@ -300,6 +322,134 @@ function setUpgradeVersion(
 ): PackageJson {
   const written = pinExact ? targetVersion : formatUpgradeRange(scanned.currentRange, targetVersion);
   return setRange(pkg, scanned.section, scanned.name, written);
+}
+
+function formatWrittenRange(
+  scanned: ScannedPackage,
+  targetVersion: string,
+  pinExact: boolean | undefined,
+  catalog: CatalogIndex | undefined,
+): string {
+  if (pinExact) return targetVersion;
+  return formatUpgradeRange(catalogStyleRange(catalog, scanned.name, scanned.currentRange), targetVersion);
+}
+
+function catalogExtraFiles(
+  catalog: CatalogIndex | undefined,
+  ranges: Iterable<string>,
+): string[] | undefined {
+  if (!catalog?.file) return undefined;
+  for (const r of ranges) {
+    if (parseCatalogSpec(r)) return [catalog.file];
+  }
+  return undefined;
+}
+
+type RangeSnapshot = { section: DepSection; range: string; catalogRange?: string };
+
+function snapshotRange(scanned: ScannedPackage, catalog: CatalogIndex | undefined): RangeSnapshot {
+  const spec = parseCatalogSpec(scanned.currentRange);
+  const catalogRange = spec && catalog ? resolveCatalogRange(catalog, scanned.name, spec) : undefined;
+  const snap: RangeSnapshot = { section: scanned.section, range: scanned.currentRange };
+  if (catalogRange) snap.catalogRange = catalogRange;
+  return snap;
+}
+
+/**
+ * Apply bumps: `catalog:` pointers stay in package.json; the catalog file gets the new
+ * semver. Regular ranges still rewrite package.json.
+ */
+async function applyUpgradeWrites(
+  cwd: string,
+  bumps: Array<{ scanned: ScannedPackage; targetVersion: string }>,
+  opts: UpgradeEngineOptions,
+): Promise<void> {
+  const catalog = opts.catalog;
+  let pkg = await readPackageJson(cwd);
+  let pkgDirty = false;
+  const pkgPath = path.resolve(cwd, 'package.json');
+  for (const { scanned, targetVersion } of bumps) {
+    const spec = parseCatalogSpec(scanned.currentRange);
+    if (spec && catalog?.file) {
+      const written = formatWrittenRange(scanned, targetVersion, opts.pinExact, catalog);
+      await writeCatalogRange(catalog, scanned.name, spec, written);
+      if (catalog.source === 'package.json' && path.resolve(catalog.file) === pkgPath) {
+        pkg = await readPackageJson(cwd);
+      }
+    } else {
+      pkg = setUpgradeVersion(pkg, scanned, targetVersion, opts.pinExact);
+      pkgDirty = true;
+    }
+  }
+  if (pkgDirty) {
+    await writePackageJson(cwd, pkg);
+  }
+}
+
+async function restoreRangeSnapshots(
+  cwd: string,
+  bumps: Array<{ scanned: ScannedPackage }>,
+  previous: Map<string, RangeSnapshot>,
+  catalog: CatalogIndex | undefined,
+): Promise<void> {
+  for (const { scanned } of bumps) {
+    const snap = previous.get(scanned.name);
+    if (!snap) continue;
+    const spec = parseCatalogSpec(snap.range);
+    if (spec && catalog?.file && snap.catalogRange) {
+      await writeCatalogRange(catalog, scanned.name, spec, snap.catalogRange);
+    } else {
+      await writeDepRange(cwd, snap.section, scanned.name, snap.range);
+    }
+  }
+}
+
+function resolveUpgradeFrom(
+  scanned: ScannedPackage,
+  opts: UpgradeEngineOptions,
+): { fromVersion?: string; skipDetail?: string; reportFrom: string } {
+  const spec = parseCatalogSpec(scanned.currentRange);
+  const catalog = opts.catalog;
+  const reportFrom = catalogStyleRange(catalog, scanned.name, scanned.currentRange);
+  if (spec && (!catalog || !resolveCatalogRange(catalog, scanned.name, spec))) {
+    return {
+      skipDetail: 'catalog: pointer has no matching catalog entry',
+      reportFrom: scanned.currentRange,
+    };
+  }
+  const fromVersion = resolveInstalledVersion({
+    name: scanned.name,
+    declaredRange: reportFrom,
+    lockfileVersions: opts.lockfileVersions,
+  });
+  if (!fromVersion && !isDistTag(scanned.currentRange)) {
+    return { skipDetail: 'could not parse current version', reportFrom };
+  }
+  return { fromVersion, reportFrom };
+}
+
+async function backupSharedCatalogFiles(catalog: CatalogIndex): Promise<void> {
+  if (catalog.source === 'pnpm-workspace.yaml' && catalog.file) {
+    const dest = path.join(path.dirname(catalog.file), CATALOG_BACKUP_FILENAME);
+    if (!(await fs.pathExists(dest))) {
+      await fs.copy(catalog.file, dest);
+    }
+  }
+  if (catalog.source === 'package.json' && catalog.file) {
+    const dir = path.dirname(catalog.file);
+    const dest = path.join(dir, BACKUP_FILENAME);
+    if (!(await fs.pathExists(dest))) {
+      await backupPackageJson(dir);
+    }
+  }
+}
+
+async function restoreCatalogBackup(cwd: string): Promise<void> {
+  const src = path.join(cwd, CATALOG_BACKUP_FILENAME);
+  const dest = path.join(cwd, 'pnpm-workspace.yaml');
+  if (await fs.pathExists(src)) {
+    await fs.copy(src, dest, { overwrite: true });
+  }
 }
 
 async function writeDepRange(
@@ -481,6 +631,7 @@ async function fireUpgradeApplied(
   records: UpgradeRecord[],
   targetCwd: string,
   groupId: string | undefined,
+  extraFiles?: string[],
 ): Promise<void> {
   if (!opts.onUpgradeApplied || records.length === 0) {
     return;
@@ -497,6 +648,7 @@ async function fireUpgradeApplied(
         manager: (opts.projectInfo?.manager ?? 'npm') as PackageManager,
         workspace: opts.targetLabel,
         groupId,
+        ...(extraFiles && extraFiles.length > 0 ? { extraFiles } : {}),
       });
     } catch (e) {
       if (!opts.jsonOutput) {
@@ -576,7 +728,7 @@ async function attemptSingleUpgradeUnlocked(
   const manager = (opts.projectInfo?.manager ?? 'npm') as InstallManager;
   const installCwd = opts.installCwd ?? cwd;
   const installOpts = installFilterOptions(opts);
-  const previousRange = scanned.currentRange;
+  const previous = snapshotRange(scanned, opts.catalog);
   const install$ = opts.installer ?? runInstall;
 
   // Progress spinner: surfaces which phase is running (install → validate → optional
@@ -586,9 +738,7 @@ async function attemptSingleUpgradeUnlocked(
     ? undefined
     : createSpinner(`Installing ${scanned.name}@${targetVersion} with ${manager}...`);
 
-  let pkg = await readPackageJson(cwd);
-  pkg = setUpgradeVersion(pkg, scanned, targetVersion, opts.pinExact);
-  await writePackageJson(cwd, pkg);
+  await applyUpgradeWrites(cwd, [{ scanned, targetVersion }], opts);
 
   const install = await install$(installCwd, manager, installOpts);
   const installDiag = toInstallDiagnostic(install);
@@ -612,7 +762,7 @@ async function attemptSingleUpgradeUnlocked(
     spinner?.update(
       `Rolling back ${scanned.name}: install failed (exit ${install.exitCode ?? '?'})...`,
     );
-    await writeDepRange(cwd, scanned.section, scanned.name, previousRange);
+    await restoreRangeSnapshots(cwd, [{ scanned }], new Map([[scanned.name, previous]]), opts.catalog);
     await install$(installCwd, manager, installOpts);
     spinner?.stop();
     return {
@@ -632,7 +782,7 @@ async function attemptSingleUpgradeUnlocked(
 
   if (peerHit && !force) {
     spinner?.update(`Rolling back ${scanned.name}: peer conflict reported by ${manager}...`);
-    await writeDepRange(cwd, scanned.section, scanned.name, previousRange);
+    await restoreRangeSnapshots(cwd, [{ scanned }], new Map([[scanned.name, previous]]), opts.catalog);
     await install$(installCwd, manager, installOpts);
     spinner?.stop();
     return {
@@ -662,7 +812,7 @@ async function attemptSingleUpgradeUnlocked(
     spinner?.update(
       `Rolling back ${scanned.name}: \`${validation.command}\` failed (exit ${validation.exitCode ?? '?'})...`,
     );
-    await writeDepRange(cwd, scanned.section, scanned.name, previousRange);
+    await restoreRangeSnapshots(cwd, [{ scanned }], new Map([[scanned.name, previous]]), opts.catalog);
     await install$(installCwd, manager, installOpts);
     spinner?.stop();
     return {
@@ -729,9 +879,9 @@ async function attemptBatchUpgradeUnlocked(
     return { ok: true };
   }
 
-  const previous = new Map<string, { section: DepSection; range: string }>();
+  const previous = new Map<string, RangeSnapshot>();
   for (const { scanned } of bumps) {
-    previous.set(scanned.name, { section: scanned.section, range: scanned.currentRange });
+    previous.set(scanned.name, snapshotRange(scanned, opts.catalog));
   }
 
   // Compact batch label — first three packages, then "…+N more" if the group is larger. Avoids
@@ -745,11 +895,7 @@ async function attemptBatchUpgradeUnlocked(
     ? undefined
     : createSpinner(`Installing batch (${bumps.length} pkgs) with ${manager}: ${batchLabel}...`);
 
-  let pkg = await readPackageJson(cwd);
-  for (const { scanned, targetVersion } of bumps) {
-    pkg = setUpgradeVersion(pkg, scanned, targetVersion, opts.pinExact);
-  }
-  await writePackageJson(cwd, pkg);
+  await applyUpgradeWrites(cwd, bumps, opts);
 
   const install = await install$(installCwd, manager, installOpts);
   const installDiag = toInstallDiagnostic(install);
@@ -762,13 +908,7 @@ async function attemptBatchUpgradeUnlocked(
   );
 
   const rollbackAll = async (): Promise<void> => {
-    for (const { scanned } of bumps) {
-      const snap = previous.get(scanned.name);
-      if (!snap) {
-        continue;
-      }
-      await writeDepRange(cwd, snap.section, scanned.name, snap.range);
-    }
+    await restoreRangeSnapshots(cwd, bumps, previous, opts.catalog);
     await install$(installCwd, manager, installOpts);
   };
 
@@ -1199,28 +1339,24 @@ async function runSinglePackageUpgrade(
     return;
   }
 
-  const fromVersion = resolveInstalledVersion({
-    name: scanned.name,
-    declaredRange: scanned.currentRange,
-    lockfileVersions: opts.lockfileVersions,
-  });
-  if (!fromVersion) {
+  const { fromVersion, skipDetail, reportFrom } = resolveUpgradeFrom(scanned, opts);
+  if (skipDetail) {
     addUpgrade(report, {
       name: scanned.name,
       success: true,
       skipped: true,
       reason: 'skipped',
-      detail: 'could not parse current version',
+      detail: skipDetail,
     });
     return;
   }
 
-  if (semver.eq(fromVersion, latest)) {
+  if (fromVersion && semver.eq(fromVersion, latest)) {
     addUpgrade(report, {
       name: scanned.name,
       success: true,
       skipped: true,
-      from: scanned.currentRange,
+      from: reportFrom,
       to: latest,
       reason: 'skipped',
       detail: 'already latest',
@@ -1231,12 +1367,12 @@ async function runSinglePackageUpgrade(
     return;
   }
 
-  if (semver.gt(fromVersion, latest)) {
+  if (fromVersion && semver.gt(fromVersion, latest)) {
     addUpgrade(report, {
       name: scanned.name,
       success: true,
       skipped: true,
-      from: scanned.currentRange,
+      from: reportFrom,
       to: latest,
       reason: 'skipped',
       detail: 'ahead of latest',
@@ -1249,12 +1385,12 @@ async function runSinglePackageUpgrade(
 
   // Security preferred pin that equals installed — nothing to do for the minimal fix.
   const preferred = opts.preferredTargets?.get(scanned.name);
-  if (preferred && semver.valid(preferred) && semver.eq(preferred, fromVersion)) {
+  if (preferred && semver.valid(preferred) && fromVersion && semver.eq(preferred, fromVersion)) {
     addUpgrade(report, {
       name: scanned.name,
       success: true,
       skipped: true,
-      from: scanned.currentRange,
+      from: reportFrom,
       to: preferred,
       reason: 'skipped',
       detail: 'already at recommended security version',
@@ -1271,14 +1407,14 @@ async function runSinglePackageUpgrade(
       name: scanned.name,
       success: true,
       skipped: true,
-      from: scanned.currentRange,
+      from: reportFrom,
       to: plannedTo,
       reason: 'skipped',
       detail: preferred && semver.valid(preferred) ? 'dry-run (preferred security target)' : 'dry-run',
       requestedLatest: latest,
     });
     if (!jsonOutput) {
-      log.info(`[dry-run] ${scanned.name}: ${fromVersion} → ${plannedTo}`);
+      log.info(`[dry-run] ${scanned.name}: ${fromVersion ?? reportFrom} → ${plannedTo}`);
     }
     return;
   }
@@ -1292,7 +1428,7 @@ async function runSinglePackageUpgrade(
       preferred && semver.valid(preferred) && preferred !== latest
         ? ` (preferred ${preferred}, latest ${latest})`
         : ` → latest ${latest}`;
-    log.info(`Upgrading ${scanned.name}: ${fromVersion}${prefLabel}${fb} …`);
+    log.info(`Upgrading ${scanned.name}: ${fromVersion ?? reportFrom}${prefLabel}${fb} …`);
   }
 
   let {
@@ -1300,7 +1436,7 @@ async function runSinglePackageUpgrade(
     chosenVersion,
     usedFallback,
     lastAttemptedVersion,
-  } = await upgradeWithReleaseLineFallbacks(cwd, scanned, fromVersion, latest, opts);
+  } = await upgradeWithReleaseLineFallbacks(cwd, scanned, fromVersion ?? '0.0.0', latest, opts);
 
   // Ad-hoc peer-range resolver for **non-linked** single-package bumps. The resolver in
   // `peerResolver.ts` traditionally only fires for linked groups — a single bump that
@@ -1378,20 +1514,19 @@ async function runSinglePackageUpgrade(
         chosenVersion,
         usedFallback,
         lastAttemptedVersion,
-      } = await upgradeWithReleaseLineFallbacks(cwd, scanned, fromVersion, latest, opts));
+      } = await upgradeWithReleaseLineFallbacks(cwd, scanned, fromVersion ?? '0.0.0', latest, opts));
     }
   }
 
   if (result.ok) {
     const chosen = chosenVersion ?? latest;
-    const writtenTo = opts.pinExact
-      ? chosen
-      : formatUpgradeRange(scanned.currentRange, chosen);
+    const writtenTo = formatWrittenRange(scanned, chosen, opts.pinExact, opts.catalog);
     const row: UpgradeRecord = {
       name: scanned.name,
       success: true,
-      // Preserve the original declared range so `undo` can restore it exactly (including ^/~).
-      from: scanned.currentRange,
+      // Catalog upgrades record the catalog semver (not the `catalog:` pointer) so undo
+      // can restore the catalog file. Regular deps keep the declared range including ^/~.
+      from: reportFrom,
       to: writtenTo,
       requestedLatest: latest,
       usedFallback,
@@ -1409,7 +1544,7 @@ async function runSinglePackageUpgrade(
     if (adHocResolved) {
       const primaryBump = adHocResolved.bumps.find((b) => b.isPrimary);
       if (primaryBump) {
-        row.to = primaryBump.to;
+        row.to = formatWrittenRange(scanned, primaryBump.to, opts.pinExact, opts.catalog);
         if (primaryBump.to !== latest) {
           row.resolvedPeer = {
             originalTarget: latest,
@@ -1445,7 +1580,13 @@ async function runSinglePackageUpgrade(
         log.success(`upgraded: ${scanned.name} → ${writtenTo}`);
       }
     }
-    await fireUpgradeApplied(opts, [row], cwd, undefined);
+    await fireUpgradeApplied(
+      opts,
+      [row],
+      cwd,
+      undefined,
+      catalogExtraFiles(opts.catalog, [scanned.currentRange]),
+    );
   } else {
     const kind = result.kind ?? 'install';
     // Policy refusal is a deliberate choice, not a failure — record it as a skip so retry-failed
@@ -1594,12 +1735,13 @@ async function tryCoordinatedGroupFallback(
   const mode = opts.fallbackStrategy === 'minor-lines' ? 'minor' : 'major';
   const ladders: string[][] = [];
   for (const b of bumps) {
+    const declared = catalogStyleRange(opts.catalog, b.scanned.name, b.scanned.currentRange);
     const fromVersion =
       resolveInstalledVersion({
         name: b.scanned.name,
-        declaredRange: b.scanned.currentRange,
+        declaredRange: declared,
         lockfileVersions: opts.lockfileVersions,
-      }) ?? semver.coerce(b.scanned.currentRange)?.version;
+      }) ?? semver.coerce(declared)?.version;
     if (!fromVersion) {
       ladders.push([b.targetVersion]);
       continue;
@@ -1730,29 +1872,25 @@ async function runLinkedGroupUpgrade(
       continue;
     }
 
-    const fromVersion = resolveInstalledVersion({
-      name: scanned.name,
-      declaredRange: scanned.currentRange,
-      lockfileVersions: opts.lockfileVersions,
-    });
-    if (!fromVersion) {
+    const { fromVersion, skipDetail, reportFrom } = resolveUpgradeFrom(scanned, opts);
+    if (skipDetail) {
       addUpgrade(report, {
         name: scanned.name,
         success: true,
         skipped: true,
         reason: 'skipped',
-        detail: 'could not parse current version',
+        detail: skipDetail,
         linkedGroupId: gid,
       });
       continue;
     }
 
-    if (semver.eq(fromVersion, latest) || semver.gt(fromVersion, latest)) {
+    if (fromVersion && (semver.eq(fromVersion, latest) || semver.gt(fromVersion, latest))) {
       addUpgrade(report, {
         name: scanned.name,
         success: true,
         skipped: true,
-        from: scanned.currentRange,
+        from: reportFrom,
         to: latest,
         reason: 'skipped',
         detail: semver.gt(fromVersion, latest) ? 'ahead of latest' : 'already latest',
@@ -1770,7 +1908,7 @@ async function runLinkedGroupUpgrade(
 
     const preferred = opts.preferredTargets?.get(scanned.name);
     const targetVersion =
-      preferred && semver.valid(preferred) && semver.gt(preferred, fromVersion)
+      preferred && semver.valid(preferred) && (!fromVersion || semver.gt(preferred, fromVersion))
         ? preferred
         : latest;
     bumps.push({ scanned, targetVersion });
@@ -1782,16 +1920,17 @@ async function runLinkedGroupUpgrade(
 
   if (dryRun) {
     for (const b of bumps) {
+      const reportFrom = catalogStyleRange(opts.catalog, b.scanned.name, b.scanned.currentRange);
       const fromInstalled = resolveInstalledVersion({
         name: b.scanned.name,
-        declaredRange: b.scanned.currentRange,
+        declaredRange: reportFrom,
         lockfileVersions: opts.lockfileVersions,
       });
       addUpgrade(report, {
         name: b.scanned.name,
         success: true,
         skipped: true,
-        from: b.scanned.currentRange,
+        from: reportFrom,
         to: b.targetVersion,
         reason: 'skipped',
         detail: 'dry-run (linked group)',
@@ -1799,7 +1938,7 @@ async function runLinkedGroupUpgrade(
       });
       if (!jsonOutput) {
         log.info(
-          `[dry-run] [${gid}] ${b.scanned.name}: ${fromInstalled ?? b.scanned.currentRange} → ${b.targetVersion}`,
+          `[dry-run] [${gid}] ${b.scanned.name}: ${fromInstalled ?? reportFrom} → ${b.targetVersion}`,
         );
       }
     }
@@ -1940,13 +2079,11 @@ async function runLinkedGroupUpgrade(
   if (result.ok) {
     const groupRows: UpgradeRecord[] = [];
     for (const b of bumps) {
-      const writtenTo = opts.pinExact
-        ? b.targetVersion
-        : formatUpgradeRange(b.scanned.currentRange, b.targetVersion);
+      const writtenTo = formatWrittenRange(b.scanned, b.targetVersion, opts.pinExact, opts.catalog);
       const row: UpgradeRecord = {
         name: b.scanned.name,
         success: true,
-        from: b.scanned.currentRange,
+        from: catalogStyleRange(opts.catalog, b.scanned.name, b.scanned.currentRange),
         to: writtenTo,
         // `requestedLatest` should still reflect what the user ASKED for (registry latest),
         // even when the peer resolver nudged us to a slightly older version. That way the
@@ -1976,7 +2113,16 @@ async function runLinkedGroupUpgrade(
         log.success(`upgraded: ${b.scanned.name} → ${writtenTo} (group ${gid})${suffix}`);
       }
     }
-    await fireUpgradeApplied(opts, groupRows, cwd, gid);
+    await fireUpgradeApplied(
+      opts,
+      groupRows,
+      cwd,
+      gid,
+      catalogExtraFiles(
+        opts.catalog,
+        bumps.map((b) => b.scanned.currentRange),
+      ),
+    );
   } else {
     const kind = result.kind ?? 'install';
     const prev = bumps.map((b) => `${b.scanned.name}@${b.scanned.currentRange}`).join(', ');
@@ -2029,7 +2175,10 @@ async function runLinkedGroupUpgrade(
  * Expo SDK alignment (`expo install`-style) remains future work.
  */
 export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<FinalReport> {
-  const { cwd, dryRun, jsonOutput, ignore, force } = opts;
+  const { cwd, dryRun, jsonOutput, force } = opts;
+  // Per-target copy: promote `workspace::name` retry keys to bare names for this label only
+  // so a freeze in one workspace cannot leak into the shared ignore set (or another member).
+  const ignore = materializeIgnoreForTarget(opts.ignore, opts.targetLabel);
   const installCwd = opts.installCwd ?? cwd;
   const report = createEmptyReport();
 
@@ -2072,6 +2221,7 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
 
   const lockfileVersions =
     opts.lockfileVersions ?? (await loadLockfileVersionTree(installCwd, projectInfo.manager));
+  const catalog = opts.catalog ?? (await loadCatalogIndex(installCwd));
 
   const restrictToNames = opts.restrictToNames;
   const policyFreezeWildcards = (opts.policy?.freeze ?? []).filter((f) => f.pattern.includes('*'));
@@ -2114,6 +2264,7 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
     projectInfo,
     installCwd,
     lockfileVersions,
+    catalog,
   };
 
   if (!dryRun && !opts.skipPreflight) {
@@ -2170,6 +2321,7 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
 
   if (!dryRun) {
     await backupPackageJson(cwd);
+    await backupSharedCatalogFiles(catalog);
   }
 
   const groups =
@@ -2210,9 +2362,10 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
 
 export async function restoreInitialFromBackup(cwd: string): Promise<void> {
   await restoreBackup(cwd);
+  await restoreCatalogBackup(cwd);
 }
 
-export { backupPackageJson, BACKUP_FILENAME };
+export { backupPackageJson, BACKUP_FILENAME, CATALOG_BACKUP_FILENAME };
 
 /**
  * Workspace traversal mode for `runUpgradeFlow`.

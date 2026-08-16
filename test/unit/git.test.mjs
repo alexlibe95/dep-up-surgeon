@@ -225,6 +225,7 @@ test('lockfileBasenameFor: per-manager defaults', () => {
   assert.strictEqual(lockfileBasenameFor('npm'), 'package-lock.json');
   assert.strictEqual(lockfileBasenameFor('pnpm'), 'pnpm-lock.yaml');
   assert.strictEqual(lockfileBasenameFor('yarn'), 'yarn.lock');
+  assert.strictEqual(lockfileBasenameFor('bun'), 'bun.lock');
 });
 
 // ---------------------------------------------------------------------------
@@ -351,6 +352,78 @@ test('createGitFlow: per-success commits land on the branch with the right messa
   // Working tree must be clean (everything committed).
   const dirty = await getUncommittedFiles(repo);
   assert.deepStrictEqual(dirty, []);
+});
+
+test('createGitFlow: per-success stages extraFiles (catalog yaml)', async () => {
+  const repo = await makeTmpRepo();
+  await writeFile(
+    path.join(repo, 'package.json'),
+    JSON.stringify({ name: 'x', dependencies: { axios: 'catalog:' } }),
+  );
+  await writeFile(path.join(repo, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
+  await writeFile(path.join(repo, 'pnpm-workspace.yaml'), 'catalog:\n  axios: ^1.0.0\n');
+  await execa('git', ['add', '.'], { cwd: repo });
+  await execa('git', ['commit', '-q', '-m', 'init'], { cwd: repo });
+
+  const setup = await createGitFlow(
+    repo,
+    { enabled: true, mode: 'per-success', prefix: 'deps: ', sign: false, allowDirty: false },
+    true,
+    false,
+  );
+  const c = setup.controller;
+
+  await writeFile(path.join(repo, 'pnpm-workspace.yaml'), 'catalog:\n  axios: ^1.7.2\n');
+  await writeFile(path.join(repo, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\npackages: {}\n');
+
+  await c.onUpgradeApplied({
+    records: [{ name: 'axios', success: true, from: '^1.0.0', to: '^1.7.2' }],
+    targetCwd: repo,
+    installCwd: repo,
+    manager: 'pnpm',
+    workspace: 'root',
+    extraFiles: [path.join(repo, 'pnpm-workspace.yaml')],
+  });
+
+  assert.strictEqual(c.commits.length, 1);
+  assert.strictEqual(c.commits[0].ok, true, `commit must succeed: ${c.commits[0].error}`);
+  assert.ok(
+    c.commits[0].files.includes('pnpm-workspace.yaml'),
+    `expected catalog file staged, got ${JSON.stringify(c.commits[0].files)}`,
+  );
+  assert.deepStrictEqual(await getUncommittedFiles(repo), []);
+});
+
+test('createGitFlow: per-target flush stages extraFiles from buffered events', async () => {
+  const repo = await makeTmpRepo();
+  await writeFile(path.join(repo, 'package.json'), JSON.stringify({ name: 'root' }));
+  await writeFile(path.join(repo, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
+  await writeFile(path.join(repo, 'pnpm-workspace.yaml'), 'catalog:\n  axios: ^1.0.0\n');
+  await execa('git', ['add', '.'], { cwd: repo });
+  await execa('git', ['commit', '-q', '-m', 'init'], { cwd: repo });
+
+  const setup = await createGitFlow(
+    repo,
+    { enabled: true, mode: 'per-target', prefix: 'deps: ', sign: false, allowDirty: false },
+    true,
+    false,
+  );
+  const c = setup.controller;
+
+  await writeFile(path.join(repo, 'pnpm-workspace.yaml'), 'catalog:\n  axios: ^1.7.2\n');
+  await c.onUpgradeApplied({
+    records: [{ name: 'axios', success: true, from: '^1.0.0', to: '^1.7.2' }],
+    targetCwd: repo,
+    installCwd: repo,
+    manager: 'pnpm',
+    workspace: 'root',
+    extraFiles: [path.join(repo, 'pnpm-workspace.yaml')],
+  });
+  await c.flushAfterTarget('root', 'pnpm', repo);
+
+  assert.strictEqual(c.commits.length, 1);
+  assert.strictEqual(c.commits[0].ok, true, `commit must succeed: ${c.commits[0].error}`);
+  assert.ok(c.commits[0].files.includes('pnpm-workspace.yaml'));
 });
 
 test('createGitFlow: per-target buffers per workspace and commits on flushAfterTarget', async () => {

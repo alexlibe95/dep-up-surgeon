@@ -89,7 +89,7 @@ export async function runAudit(opts: RunAuditOptions): Promise<AuditResult> {
     if (opts.manager === 'yarn') {
       return { advisories: parseYarnAudit(stdout) };
     }
-    // npm / pnpm share the JSON shape.
+    // npm / pnpm / bun share the JSON shape.
     return { advisories: parseNpmLikeAudit(stdout) };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -119,6 +119,9 @@ function auditCommandFor(manager: PackageManager): { bin: string; args: string[]
       // Yarn classic emits newline-delimited JSON. Yarn berry maps `yarn npm audit` to a similar
       // shape; we prefer the classic form because it works on both when invoked as `yarn audit`.
       return { bin: 'yarn', args: ['audit', '--json'] };
+    case 'bun':
+      // bun audit --json follows the npm audit JSON shape (bun 1.2+).
+      return { bin: 'bun', args: ['audit', '--json'] };
     default:
       return undefined;
   }

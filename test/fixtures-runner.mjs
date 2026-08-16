@@ -39,6 +39,25 @@ test('CLI binary exists', () => {
   assert.ok(existsSync(cli), `Run npm run build first (missing ${cli})`);
 });
 
+test('--cwd runs a fixture from the repo root without cd', () => {
+  const fixture = path.join(root, 'test/fixtures', '01-minimal-single');
+  const r = spawnSync(process.execPath, [cli, '--dry-run', '--json', '--cwd', fixture], {
+    cwd: root,
+    encoding: 'utf8',
+    maxBuffer: 20 * 1024 * 1024,
+    env: { ...process.env },
+  });
+  assert.strictEqual(r.stderr ?? '', '', `stderr: ${r.stderr}`);
+  assert.strictEqual(r.status, 0, r.stdout ?? '');
+  const j = parseReport(r.stdout ?? '');
+  const names = new Set(j.groups.flatMap((g) => g.packages ?? []));
+  assert.ok(names.has('lodash'));
+  assert.ok(
+    j.targets?.some((t) => t.cwd === fixture),
+    `expected a target cwd of ${fixture}, got ${JSON.stringify(j.targets)}`,
+  );
+});
+
 test('fixture 01-minimal-single: dry-run exits 0 and reports groups', () => {
   const { status, stdout, stderr } = runFixture('01-minimal-single');
   assert.strictEqual(stderr, '', `stderr: ${stderr}`);

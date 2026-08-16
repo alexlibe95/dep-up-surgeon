@@ -207,6 +207,8 @@ export function lockfileBasenameFor(manager: PackageManager): string {
       return 'pnpm-lock.yaml';
     case 'yarn':
       return 'yarn.lock';
+    case 'bun':
+      return 'bun.lock';
     case 'npm':
     default:
       return 'package-lock.json';

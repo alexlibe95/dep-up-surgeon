@@ -24,6 +24,7 @@ import { checkoutBranch, getCurrentBranch, type GitCommitMode } from './cli/git.
 import { createGitFlow, type GitFlowController } from './cli/gitFlow.js';
 import {
   BACKUP_FILENAME,
+  CATALOG_BACKUP_FILENAME,
   restoreInitialFromBackup,
   runUpgradeFlow,
   type WorkspaceMode,
@@ -36,7 +37,7 @@ import {
   runAudit,
   type AuditResult,
 } from './core/audit.js';
-import type { PackageManager } from './core/workspaces.js';
+import { parsePackageManagerOption, type PackageManager } from './core/workspaces.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -210,8 +211,12 @@ async function main(): Promise<void> {
     )
     .option(
       '--package-manager <mgr>',
-      'Override detected package manager: auto (default), npm, pnpm, or yarn. `auto` reads `packageManager` field, then lockfile, then falls back to npm.',
+      'Override detected package manager: auto (default), npm, pnpm, yarn, or bun. `auto` reads `packageManager` field, then lockfile, then falls back to npm.',
       'auto',
+    )
+    .option(
+      '--cwd <path>',
+      'Run against this directory instead of the current one. Default is still `process.cwd()`, so scripts that `cd` first are unchanged.',
     )
     .option(
       '--include-workspace-deps',
@@ -262,7 +267,7 @@ async function main(): Promise<void> {
     )
     .option(
       '--retry-failed',
-      `Read ${LAST_RUN_FILENAME} from the previous run and only reattempt entries that failed for non-terminal reasons (i.e. NOT 'peer' or 'validation-script'). Successful upgrades + terminal failures from the last run are added to the ignore list automatically.`,
+      `Read ${LAST_RUN_FILENAME} from the previous run and only reattempt entries that failed for non-terminal reasons (i.e. NOT 'peer' or 'validation-script'). Successful upgrades + terminal failures from the last run are frozen per workspace (workspace::name) so a result in one member does not skip the same package in another.`,
       false,
     )
     .option(
@@ -387,6 +392,17 @@ async function main(): Promise<void> {
     .option(
       '--open-pr-assignees <users>',
       'Comma-separated usernames to assign. Passed through to `gh pr create --assignee`.',
+    )
+    .addHelpText(
+      'after',
+      `
+Commands:
+  doctor [options]     Read-only diagnostic (lockfile, peers, audit, validator)
+  undo [options]       Reverse the last recorded run
+  outdated [options]   Report direct deps behind registry @latest
+
+Run \`dep-up-surgeon <command> --help\` for command-specific options.
+`,
     );
 
   program.parse(process.argv);
@@ -400,6 +416,7 @@ async function main(): Promise<void> {
     linkGroups?: string;
     validate?: string | boolean;
     packageManager?: string;
+    cwd?: string;
     includeWorkspaceDeps?: boolean;
     includePeers?: boolean;
     pinExact?: boolean;
@@ -437,7 +454,7 @@ async function main(): Promise<void> {
     openPrAssignees?: string;
   }>();
 
-  const cwd = process.cwd();
+  const cwd = opts.cwd ? path.resolve(process.cwd(), opts.cwd) : process.cwd();
   const dryRun = Boolean(opts.dryRun);
   const ciMode = Boolean(opts.ci);
   // --ci is a no-prompt convenience for bots: force interactive off so we never block on stdin.
@@ -552,9 +569,7 @@ async function main(): Promise<void> {
   const cliNoValidate = opts.validate === false;
   const validate = resolveValidateOptions(config.validate, cliValidateCmd, cliNoValidate);
 
-  const pmRaw = String(opts.packageManager ?? 'auto').toLowerCase();
-  const packageManager: 'auto' | 'npm' | 'pnpm' | 'yarn' =
-    pmRaw === 'npm' || pmRaw === 'pnpm' || pmRaw === 'yarn' ? pmRaw : 'auto';
+  const packageManager: 'auto' | PackageManager = parsePackageManagerOption(opts.packageManager);
   const includeWorkspaceDeps = Boolean(opts.includeWorkspaceDeps);
   const includePeers = Boolean(opts.includePeers);
   const pinExact = Boolean(opts.pinExact);
@@ -684,21 +699,6 @@ async function main(): Promise<void> {
 
   let gitFlow: GitFlowController | undefined;
   if (gitEnabled) {
-    if (typeof opts.gitBranch === 'string' && opts.gitBranch.trim()) {
-      try {
-        const previous = await checkoutBranch(cwd, opts.gitBranch.trim());
-        if (!jsonOutput) {
-          log.info(
-            `git: switched to branch "${opts.gitBranch}"${previous ? ` (was on "${previous}")` : ''}`,
-          );
-        }
-      } catch (e) {
-        log.error(e instanceof Error ? e.message : String(e));
-        process.exitCode = 1;
-        return;
-      }
-    }
-
     const setup = await createGitFlow(
       cwd,
       {
@@ -719,6 +719,25 @@ async function main(): Promise<void> {
       return;
     }
     gitFlow = setup.controller;
+
+    // Checkout only after pre-flight succeeds. Doing this first left the user on a newly
+    // created branch when the dirty-tree check then aborted, and `--dry-run --git-branch`
+    // switched branches despite dry-run promising no mutations.
+    if (gitFlow.enabled && typeof opts.gitBranch === 'string' && opts.gitBranch.trim()) {
+      try {
+        const previous = await checkoutBranch(cwd, opts.gitBranch.trim());
+        if (!jsonOutput) {
+          log.info(
+            `git: switched to branch "${opts.gitBranch}"${previous ? ` (was on "${previous}")` : ''}`,
+          );
+        }
+      } catch (e) {
+        log.error(e instanceof Error ? e.message : String(e));
+        process.exitCode = 1;
+        return;
+      }
+    }
+
     if (!jsonOutput && gitFlow.enabled) {
       const branch = (await getCurrentBranch(cwd)) ?? '?';
       log.info(`git: ${gitCommitMode} commits will land on "${branch}"`);
@@ -1015,8 +1034,14 @@ async function main(): Promise<void> {
                 ...(vr.command ? { command: vr.command } : {}),
                 ...(vr.output ? { lastLines: vr.output } : {}),
               };
-            } catch {
-              return { ok: true };
+            } catch (e) {
+              // A thrown validator (missing package.json, unexpected crash) must fail the
+              // dedupe so we roll the lockfile back — treating it as pass would keep a
+              // potentially broken tree.
+              return {
+                ok: false,
+                lastLines: e instanceof Error ? e.message : String(e),
+              };
             }
           },
           runInstallAfterRollback: async () => {
@@ -1177,9 +1202,13 @@ async function main(): Promise<void> {
     }
 
     if (!dryRun) {
-      const baks = new Set<string>([path.join(cwd, BACKUP_FILENAME)]);
+      const baks = new Set<string>([
+        path.join(cwd, BACKUP_FILENAME),
+        path.join(cwd, CATALOG_BACKUP_FILENAME),
+      ]);
       for (const t of report?.targets ?? []) {
         baks.add(path.join(t.cwd, BACKUP_FILENAME));
+        baks.add(path.join(t.cwd, CATALOG_BACKUP_FILENAME));
       }
       for (const bak of baks) {
         if (await fs.pathExists(bak)) {

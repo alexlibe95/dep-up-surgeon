@@ -5,8 +5,8 @@
       "name": "@types/react",
       "success": true,
       "skipped": true,
-      "from": "18.2.0",
-      "to": "19.2.14",
+      "from": "^18.2.0",
+      "to": "19.2.18",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-0"
@@ -15,8 +15,8 @@
       "name": "@types/react-dom",
       "success": true,
       "skipped": true,
-      "from": "18.2.0",
-      "to": "19.2.3",
+      "from": "^18.2.0",
+      "to": "19.2.4",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-0"
@@ -25,8 +25,8 @@
       "name": "framer-motion",
       "success": true,
       "skipped": true,
-      "from": "10.16.0",
-      "to": "12.38.0",
+      "from": "^10.16.0",
+      "to": "13.1.0",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-0"
@@ -35,8 +35,8 @@
       "name": "immer",
       "success": true,
       "skipped": true,
-      "from": "10.0.0",
-      "to": "11.1.4",
+      "from": "^10.0.0",
+      "to": "11.1.17",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-0"
@@ -45,8 +45,8 @@
       "name": "lucide-react",
       "success": true,
       "skipped": true,
-      "from": "0.292.0",
-      "to": "1.11.0",
+      "from": "^0.292.0",
+      "to": "1.31.0",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-0"
@@ -55,8 +55,8 @@
       "name": "react",
       "success": true,
       "skipped": true,
-      "from": "18.2.0",
-      "to": "19.2.5",
+      "from": "^18.2.0",
+      "to": "19.2.8",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-0"
@@ -65,8 +65,8 @@
       "name": "react-dom",
       "success": true,
       "skipped": true,
-      "from": "18.2.0",
-      "to": "19.2.5",
+      "from": "^18.2.0",
+      "to": "19.2.8",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-0"
@@ -75,8 +75,8 @@
       "name": "react-hook-form",
       "success": true,
       "skipped": true,
-      "from": "7.50.0",
-      "to": "7.73.1",
+      "from": "^7.50.0",
+      "to": "7.85.0",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-0"
@@ -85,8 +85,8 @@
       "name": "react-router-dom",
       "success": true,
       "skipped": true,
-      "from": "6.21.0",
-      "to": "7.14.2",
+      "from": "^6.21.0",
+      "to": "7.18.2",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-0"
@@ -95,8 +95,8 @@
       "name": "swr",
       "success": true,
       "skipped": true,
-      "from": "2.2.0",
-      "to": "2.4.1",
+      "from": "^2.2.0",
+      "to": "2.5.1",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-0"
@@ -105,8 +105,8 @@
       "name": "zustand",
       "success": true,
       "skipped": true,
-      "from": "4.4.0",
-      "to": "5.0.12",
+      "from": "^4.4.0",
+      "to": "5.0.15",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-0"
@@ -115,8 +115,8 @@
       "name": "@vitejs/plugin-react",
       "success": true,
       "skipped": true,
-      "from": "4.2.0",
-      "to": "6.0.1",
+      "from": "^4.2.0",
+      "to": "6.0.5",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-1"
@@ -125,8 +125,8 @@
       "name": "vite",
       "success": true,
       "skipped": true,
-      "from": "5.0.0",
-      "to": "8.0.10",
+      "from": "^5.0.0",
+      "to": "8.2.1",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-1"
@@ -135,8 +135,8 @@
       "name": "autoprefixer",
       "success": true,
       "skipped": true,
-      "from": "10.4.18",
-      "to": "10.5.0",
+      "from": "^10.4.18",
+      "to": "10.5.4",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-2"
@@ -145,8 +145,8 @@
       "name": "postcss",
       "success": true,
       "skipped": true,
-      "from": "8.4.32",
-      "to": "8.5.10",
+      "from": "^8.4.32",
+      "to": "8.5.26",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-2"
@@ -155,35 +155,38 @@
       "name": "axios",
       "success": true,
       "skipped": true,
-      "from": "1.6.0",
-      "to": "1.15.2",
+      "from": "^1.6.0",
+      "to": "1.19.0",
       "reason": "skipped",
-      "detail": "dry-run"
+      "detail": "dry-run",
+      "requestedLatest": "1.19.0"
     },
     {
       "name": "clsx",
       "success": true,
       "skipped": true,
-      "from": "2.1.0",
+      "from": "^2.1.0",
       "to": "2.1.1",
       "reason": "skipped",
-      "detail": "dry-run"
+      "detail": "dry-run",
+      "requestedLatest": "2.1.1"
     },
     {
       "name": "date-fns",
       "success": true,
       "skipped": true,
-      "from": "3.0.0",
-      "to": "4.1.0",
+      "from": "^3.0.0",
+      "to": "4.4.0",
       "reason": "skipped",
-      "detail": "dry-run"
+      "detail": "dry-run",
+      "requestedLatest": "4.4.0"
     },
     {
       "name": "eslint",
       "success": true,
       "skipped": true,
-      "from": "8.55.0",
-      "to": "10.2.1",
+      "from": "^8.55.0",
+      "to": "10.8.1",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-3"
@@ -192,7 +195,7 @@
       "name": "eslint-plugin-import",
       "success": true,
       "skipped": true,
-      "from": "2.30.0",
+      "from": "^2.30.0",
       "to": "2.32.0",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
@@ -202,7 +205,7 @@
       "name": "eslint-plugin-react",
       "success": true,
       "skipped": true,
-      "from": "7.33.0",
+      "from": "^7.33.0",
       "to": "7.37.5",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
@@ -212,37 +215,41 @@
       "name": "prettier",
       "success": true,
       "skipped": true,
-      "from": "3.1.0",
-      "to": "3.8.3",
+      "from": "^3.1.0",
+      "to": "3.9.6",
       "reason": "skipped",
-      "detail": "dry-run"
+      "detail": "dry-run",
+      "requestedLatest": "3.9.6"
     },
     {
       "name": "tailwindcss",
       "success": true,
       "skipped": true,
-      "from": "3.4.0",
-      "to": "4.2.4",
+      "from": "^3.4.0",
+      "to": "4.3.3",
       "reason": "skipped",
-      "detail": "dry-run"
+      "detail": "dry-run",
+      "requestedLatest": "4.3.3"
     },
     {
       "name": "typescript",
       "success": true,
       "skipped": true,
-      "from": "5.3.3",
-      "to": "6.0.3",
+      "from": "^5.3.3",
+      "to": "7.0.2",
       "reason": "skipped",
-      "detail": "dry-run"
+      "detail": "dry-run",
+      "requestedLatest": "7.0.2"
     },
     {
       "name": "zod",
       "success": true,
       "skipped": true,
-      "from": "3.22.0",
-      "to": "4.3.6",
+      "from": "^3.22.0",
+      "to": "4.4.3",
       "reason": "skipped",
-      "detail": "dry-run"
+      "detail": "dry-run",
+      "requestedLatest": "4.4.3"
     }
   ],
   "failed": [],
@@ -345,8 +352,8 @@
     }
   ],
   "installMode": "root",
-  "finishedAt": "2026-04-24T22:08:21.426Z",
-  "toolVersion": "2.2.7",
+  "finishedAt": "2026-08-16T11:41:17.982Z",
+  "toolVersion": "2.3.0",
   "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/13-random",
   "dryRun": true
 }

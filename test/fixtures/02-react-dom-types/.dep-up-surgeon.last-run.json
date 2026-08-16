@@ -5,8 +5,8 @@
       "name": "@types/react",
       "success": true,
       "skipped": true,
-      "from": "18.3.0",
-      "to": "19.2.14",
+      "from": "^18.3.0",
+      "to": "19.2.18",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-0"
@@ -15,8 +15,8 @@
       "name": "react",
       "success": true,
       "skipped": true,
-      "from": "18.3.1",
-      "to": "19.2.5",
+      "from": "^18.3.1",
+      "to": "19.2.8",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-0"
@@ -25,8 +25,8 @@
       "name": "react-dom",
       "success": true,
       "skipped": true,
-      "from": "18.3.1",
-      "to": "19.2.5",
+      "from": "^18.3.1",
+      "to": "19.2.8",
       "reason": "skipped",
       "detail": "dry-run (linked group)",
       "linkedGroupId": "graph-0"
@@ -60,8 +60,8 @@
     }
   ],
   "installMode": "root",
-  "finishedAt": "2026-04-24T22:07:43.419Z",
-  "toolVersion": "2.2.7",
+  "finishedAt": "2026-08-16T11:41:00.426Z",
+  "toolVersion": "2.3.0",
   "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/02-react-dom-types",
   "dryRun": true
 }

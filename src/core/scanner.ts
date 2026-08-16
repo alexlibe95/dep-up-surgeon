@@ -5,17 +5,32 @@ import type { DepSection, ScannedPackage } from '../types.js';
 import type { PackageJson } from '../types.js';
 
 const NON_REGISTRY =
-  /^(workspace:|link:|file:|git\+|git:|http:|https:|catalog:|portal:|patch:|npm:)/i;
+  /^(workspace:|link:|file:|git\+|git:|http:|https:|portal:|patch:|npm:)/i;
 
 /**
- * Returns true if the version range points at the npm registry (semver-like).
+ * npm dist-tag: a single identifier, not a protocol and not a path.
+ * `latest`, `next`, `canary`, and custom tags all match.
+ */
+const DIST_TAG = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+export function isDistTag(range: string): boolean {
+  const t = range.trim();
+  return DIST_TAG.test(t) && semver.validRange(t) == null && semver.coerce(t) == null;
+}
+
+/**
+ * Returns true if the version range is something we can resolve from the npm registry:
+ * a semver range, a dist-tag (`latest`, `next`, …), or a pnpm/Bun `catalog:` pointer.
  */
 export function isRegistryRange(range: string): boolean {
   const t = range.trim();
   if (!t || NON_REGISTRY.test(t)) {
     return false;
   }
-  return semver.validRange(t) != null || semver.coerce(t) != null;
+  if (/^catalog:/i.test(t)) {
+    return true;
+  }
+  return semver.validRange(t) != null || semver.coerce(t) != null || isDistTag(t);
 }
 
 /**

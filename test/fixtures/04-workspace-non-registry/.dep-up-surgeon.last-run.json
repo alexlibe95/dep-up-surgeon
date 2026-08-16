@@ -5,7 +5,7 @@
       "name": "left-pad",
       "success": true,
       "skipped": true,
-      "from": "1.3.0",
+      "from": "^1.3.0",
       "to": "1.3.0",
       "reason": "skipped",
       "detail": "already latest"
@@ -50,8 +50,8 @@
     }
   ],
   "installMode": "root",
-  "finishedAt": "2026-04-24T22:07:46.026Z",
-  "toolVersion": "2.2.7",
+  "finishedAt": "2026-08-16T11:41:01.781Z",
+  "toolVersion": "2.3.0",
   "cwd": "/Users/alex/Desktop/projects/dep-up-surgeon/test/fixtures/04-workspace-non-registry",
   "dryRun": true
 }

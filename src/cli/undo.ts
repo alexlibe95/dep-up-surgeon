@@ -29,6 +29,13 @@ import path from 'node:path';
 import fs from 'fs-extra';
 import type { PackageManager } from '../core/workspaces.js';
 import {
+  isCatalogRange,
+  loadCatalogIndex,
+  parseCatalogSpec,
+  resolveCatalogRange,
+  writeCatalogRange,
+} from '../utils/catalog.js';
+import {
   readOverrides,
   removeOverrideFromFile,
   applyOverrideInMemory,
@@ -178,7 +185,14 @@ export async function runUndo(opts: UndoOptions): Promise<UndoResult> {
       });
       continue;
     }
-    const revert = await revertDepRange(target.packageJson, row.name, row.from, row.to);
+    const revert = await revertDepRange(
+      target.packageJson,
+      row.name,
+      row.from,
+      row.to,
+      opts.cwd,
+      !opts.planOnly,
+    );
     reverts.push({
       name: row.name,
       workspace,
@@ -191,7 +205,9 @@ export async function runUndo(opts: UndoOptions): Promise<UndoResult> {
       ...(revert.detail ? { detail: revert.detail } : {}),
     });
     if (revert.ok && !opts.planOnly) {
-      await fs.writeJson(target.packageJson, revert.pkg, { spaces: 2 });
+      if (!revert.catalogOnly && revert.pkg) {
+        await fs.writeJson(target.packageJson, revert.pkg, { spaces: 2 });
+      }
       editedTargets.add(target.cwd);
     }
   }
@@ -377,10 +393,13 @@ async function revertDepRange(
   name: string,
   from: string,
   to: string | undefined,
+  workspaceRoot: string,
+  write: boolean,
 ): Promise<{
   ok: boolean;
   pkg?: Record<string, unknown>;
   section?: DepSection;
+  catalogOnly?: boolean;
   reason?: UndoRevertRecord['reason'];
   detail?: string;
 }> {
@@ -394,6 +413,29 @@ async function revertDepRange(
     const map = sec as Record<string, unknown>;
     if (!(name in map)) continue;
     const current = typeof map[name] === 'string' ? (map[name] as string) : undefined;
+    if (current && isCatalogRange(current)) {
+      const catalog = await loadCatalogIndex(workspaceRoot);
+      const spec = parseCatalogSpec(current);
+      const catalogCurrent = spec ? resolveCatalogRange(catalog, name, spec) : undefined;
+      if (to && catalogCurrent !== undefined && catalogCurrent !== to) {
+        return {
+          ok: false,
+          reason: 'drifted',
+          detail: `current catalog entry for ${name} is "${catalogCurrent}" but the run recorded "${to}"; leaving as-is`,
+        };
+      }
+      if (!spec || !catalog.file) {
+        return {
+          ok: false,
+          reason: 'missing',
+          detail: `catalog: pointer for ${name} has no matching catalog file`,
+        };
+      }
+      if (write) {
+        await writeCatalogRange(catalog, name, spec, from);
+      }
+      return { ok: true, pkg, section, catalogOnly: true };
+    }
     if (to && current !== undefined && current !== to) {
       // The recorded run landed on `to` but the current file holds something else — another
       // run (or a human edit) changed it. Bail out of this row; undo is about REVERSING this

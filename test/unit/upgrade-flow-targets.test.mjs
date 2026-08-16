@@ -143,3 +143,47 @@ test('runUpgradeFlow: --workspace explicit name list filters and validates names
     /unknown workspace member/i,
   );
 });
+
+test('runUpgradeFlow: workspace-scoped ignore keys freeze a name in one member only', async () => {
+  const dir = await setupMonorepo();
+  const report = await runUpgradeFlow({
+    cwd: dir,
+    dryRun: true,
+    interactive: false,
+    force: false,
+    jsonOutput: true,
+    ignore: new Set(['@org/a::axios']),
+    fallbackStrategy: 'highest-stable',
+    linkGroups: 'off',
+    linkedGroupsConfig: [],
+    validate: { skip: true },
+    workspaceMode: 'all',
+  });
+  const packagesFor = (prefix) =>
+    new Set(
+      (report.groupPlan ?? [])
+        .filter((g) => g.id.startsWith(prefix))
+        .flatMap((g) => g.packages ?? []),
+    );
+  assert.ok(!packagesFor('@org/a::').has('axios'), 'axios in @org/a must be ignored');
+  assert.ok(packagesFor('@org/b::').has('axios'), 'axios in @org/b must still be planned');
+});
+
+test('runUpgradeFlow: bare ignore name still freezes the package in every workspace', async () => {
+  const dir = await setupMonorepo();
+  const report = await runUpgradeFlow({
+    cwd: dir,
+    dryRun: true,
+    interactive: false,
+    force: false,
+    jsonOutput: true,
+    ignore: new Set(['axios']),
+    fallbackStrategy: 'highest-stable',
+    linkGroups: 'off',
+    linkedGroupsConfig: [],
+    validate: { skip: true },
+    workspaceMode: 'all',
+  });
+  const planned = new Set((report.groupPlan ?? []).flatMap((g) => g.packages ?? []));
+  assert.ok(!planned.has('axios'));
+});

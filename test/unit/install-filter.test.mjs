@@ -81,6 +81,20 @@ test('installCommand: yarn + yarnSupportsFocus but NO filter still does `yarn in
   assert.strictEqual(r.filtered, false);
 });
 
+test('installCommand: bun with filter → `bun install --filter <name>`', () => {
+  const r = installCommand('bun', { filter: '@org/web' });
+  assert.strictEqual(r.bin, 'bun');
+  assert.deepStrictEqual(r.args, ['install', '--filter', '@org/web']);
+  assert.strictEqual(r.filtered, true);
+});
+
+test('installCommand: bun without filter → `bun install`', () => {
+  const r = installCommand('bun');
+  assert.strictEqual(r.bin, 'bun');
+  assert.deepStrictEqual(r.args, ['install']);
+  assert.strictEqual(r.filtered, false);
+});
+
 test('installCommand: yarnSupportsFocus is ignored for non-yarn managers', () => {
   // Sanity check: the capability flag is yarn-specific. Setting it on npm/pnpm shouldn't
   // change anything (those managers have their own filter syntax).

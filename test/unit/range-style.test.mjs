@@ -25,4 +25,7 @@ test('formatUpgradeRange: preserves caret and tilde', () => {
   assert.strictEqual(formatUpgradeRange('~1.0.0', '1.5.0'), '~1.5.0');
   assert.strictEqual(formatUpgradeRange('1.0.0', '1.5.0'), '1.5.0');
   assert.strictEqual(formatUpgradeRange('>=1.0.0', '2.0.0'), '2.0.0');
+  assert.strictEqual(formatUpgradeRange('latest', '2.0.0'), '2.0.0');
+  assert.strictEqual(formatUpgradeRange('next', '3.1.0'), '3.1.0');
+  assert.strictEqual(formatUpgradeRange('catalog:', '19.0.0'), '19.0.0');
 });

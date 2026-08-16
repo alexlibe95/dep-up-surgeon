@@ -27,6 +27,7 @@ test('overrideFieldFor: returns the right field per manager', () => {
   assert.equal(overrideFieldFor('npm'), 'overrides');
   assert.equal(overrideFieldFor('pnpm'), 'pnpm.overrides');
   assert.equal(overrideFieldFor('yarn'), 'resolutions');
+  assert.equal(overrideFieldFor('bun'), 'overrides');
 });
 
 test('readOverrides: npm top-level overrides block', () => {
@@ -60,8 +61,17 @@ test('readOverrides: yarn resolutions split chain-style keys into chains', () =>
   assert.deepEqual(bySig.plain.chain, ['plain']);
 });
 
+test('readOverrides: bun uses the npm-style overrides block', () => {
+  const pkg = { overrides: { lodash: '4.17.21' } };
+  const r = readOverrides(pkg, 'bun');
+  assert.equal(r.present, true);
+  assert.equal(r.field, 'overrides');
+  assert.equal(r.entries[0].name, 'lodash');
+  assert.equal(r.entries[0].range, '4.17.21');
+});
+
 test('readOverrides: missing field returns empty', () => {
-  for (const mgr of ['npm', 'pnpm', 'yarn']) {
+  for (const mgr of ['npm', 'pnpm', 'yarn', 'bun']) {
     const r = readOverrides({ name: 'x' }, mgr);
     assert.equal(r.present, false);
     assert.deepEqual(r.entries, []);

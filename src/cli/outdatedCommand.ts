@@ -4,6 +4,7 @@
  */
 import path from 'node:path';
 import { Command } from 'commander';
+import { parsePackageManagerOption } from '../core/workspaces.js';
 import { log } from '../utils/logger.js';
 import { renderOutdatedHuman, runOutdated } from './outdated.js';
 
@@ -25,7 +26,7 @@ export async function runOutdatedCommand(argv: string[], version: string): Promi
     )
     .option(
       '--package-manager <mgr>',
-      'Override detected package manager: auto (default), npm, pnpm, or yarn.',
+      'Override detected package manager: auto (default), npm, pnpm, yarn, or bun.',
       'auto',
     )
     .option('--cwd <path>', 'Run against this directory instead of the current one.');
@@ -46,8 +47,8 @@ export async function runOutdatedCommand(argv: string[], version: string): Promi
       cwd,
       includePeers: Boolean(opts.includePeers),
       json: Boolean(opts.json),
-      ...(opts.packageManager && opts.packageManager !== 'auto'
-        ? { packageManager: opts.packageManager as 'npm' | 'pnpm' | 'yarn' }
+      ...(parsePackageManagerOption(opts.packageManager) !== 'auto'
+        ? { packageManager: parsePackageManagerOption(opts.packageManager) as 'npm' | 'pnpm' | 'yarn' | 'bun' }
         : {}),
     });
 
