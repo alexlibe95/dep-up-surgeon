@@ -179,7 +179,13 @@ export function renderSummaryMarkdown(structured: StructuredReport, toolVersion:
           ? `[link](${s.url})`
           : '';
       lines.push(
-        `| \`${r.name}\`${workspaceTag(r.workspace)} | **${s.severity}** | ${idCell} | \`${r.from ?? '?'}\` → \`${r.to ?? '?'}\` | ${s.title ?? ''} |`,
+        mdRow(
+          `\`${r.name}\`${workspaceTag(r.workspace)}`,
+          `**${s.severity}**`,
+          idCell,
+          `\`${r.from ?? '?'}\` → \`${r.to ?? '?'}\``,
+          s.title ?? '',
+        ),
       );
     }
     lines.push('');
@@ -224,7 +230,13 @@ export function renderSummaryMarkdown(structured: StructuredReport, toolVersion:
     for (const r of peerResolved) {
       const rp = r.resolvedPeer!;
       lines.push(
-        `| \`${r.name}\` | \`${r.linkedGroupId ?? '?'}\` | \`${rp.originalTarget}\` | \`${r.to ?? '?'}\` | ${rp.tuplesExplored} |`,
+        mdRow(
+          `\`${r.name}\``,
+          `\`${r.linkedGroupId ?? '?'}\``,
+          `\`${rp.originalTarget}\``,
+          `\`${r.to ?? '?'}\``,
+          String(rp.tuplesExplored),
+        ),
       );
     }
     lines.push('');
@@ -237,7 +249,13 @@ export function renderSummaryMarkdown(structured: StructuredReport, toolVersion:
     lines.push(`| --- | --- | --- | --- | --- |`);
     for (const r of upgraded) {
       lines.push(
-        `| \`${r.name}\` | ${r.workspace ?? 'root'} | \`${r.from ?? '?'}\` | \`${r.to ?? '?'}\` | ${formatUpgradeNote(r)} |`,
+        mdRow(
+          `\`${r.name}\``,
+          r.workspace ?? 'root',
+          `\`${r.from ?? '?'}\``,
+          `\`${r.to ?? '?'}\``,
+          formatUpgradeNote(r),
+        ),
       );
     }
     lines.push('');
@@ -296,7 +314,13 @@ export function renderSummaryMarkdown(structured: StructuredReport, toolVersion:
     lines.push(`| --- | --- | --- | --- | --- |`);
     for (const f of failed) {
       lines.push(
-        `| \`${f.name}\`${workspaceTag(f.workspace)} | ${f.workspace ?? 'root'} | \`${f.reason}\` | \`${f.attemptedVersion ?? '?'}\` | ${formatFailureNote(f)} |`,
+        mdRow(
+          `\`${f.name}\`${workspaceTag(f.workspace)}`,
+          f.workspace ?? 'root',
+          `\`${f.reason}\``,
+          `\`${f.attemptedVersion ?? '?'}\``,
+          formatFailureNote(f),
+        ),
       );
     }
     lines.push('');
@@ -389,8 +413,8 @@ export function renderSummaryMarkdown(structured: StructuredReport, toolVersion:
         const label =
           a.chain && a.chain.length > 1 ? a.chain.join(' › ') : a.name;
         const sourceLabel = a.source === 'manual' ? '`--override`' : 'advisory';
-        const base = `| \`${label}\` | \`${a.applied ?? '?'}\` | ${sourceLabel} | ${a.severity} | ${advCell} |`;
-        lines.push(hasReason ? `${base} ${a.policyReason ?? ''} |` : base);
+        const cells = [`\`${label}\``, `\`${a.applied ?? '?'}\``, sourceLabel, `${a.severity}`, advCell];
+        lines.push(mdRow(...(hasReason ? [...cells, a.policyReason ?? ''] : cells)));
       }
       lines.push('');
     }
@@ -763,4 +787,16 @@ function formatFailureNote(f: ConflictEntry): string {
     return f.message.replace(/\s+/g, ' ').slice(0, 200);
   }
   return '';
+}
+
+/**
+ * Make a value safe inside a GFM table cell: `|` splits cells even inside code spans (e.g. an
+ * ERESOLVE range `^17 || ^18`), and a newline ends the row.
+ */
+function mdCell(value: string): string {
+  return value.replace(/\r?\n/g, ' ').replace(/\\?\|/g, '\\|');
+}
+
+function mdRow(...cells: string[]): string {
+  return `| ${cells.map(mdCell).join(' | ')} |`;
 }

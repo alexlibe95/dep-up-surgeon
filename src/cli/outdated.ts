@@ -13,7 +13,7 @@ import {
   resolveInstalledVersion,
 } from '../utils/installedVersion.js';
 import { catalogStyleRange, loadCatalogIndex } from '../utils/catalog.js';
-import { createRegistryCache, mapWithConcurrency } from '../utils/concurrency.js';
+import { createRegistryCache, mapWithConcurrency, type RegistryCache } from '../utils/concurrency.js';
 import semver from 'semver';
 
 export type OutdatedStatus = 'up-to-date' | 'outdated' | 'ahead' | 'unknown';
@@ -25,6 +25,8 @@ export interface OutdatedRow {
   installed?: string;
   latest?: string;
   status: OutdatedStatus;
+  /** Registry lookup failure message when `latest` could not be fetched. */
+  error?: string;
 }
 
 export interface OutdatedReport {
@@ -45,6 +47,17 @@ export interface RunOutdatedOptions {
   packageManager?: 'auto' | PackageManager;
   includePeers?: boolean;
   json?: boolean;
+  /** Registry cache to reuse (or pre-seed in tests); a fresh one is created when omitted. */
+  registryCache?: RegistryCache;
+}
+
+/**
+ * Exit-code contract: 2 when no package could be checked (every registry lookup failed),
+ * 1 when any package is outdated, 0 otherwise.
+ */
+export function outdatedExitCode(report: OutdatedReport): number {
+  if (report.rows.length > 0 && report.rows.every((r) => r.error)) return 2;
+  return report.summary.outdated > 0 ? 1 : 0;
 }
 
 export async function runOutdated(opts: RunOutdatedOptions): Promise<OutdatedReport> {
@@ -58,7 +71,7 @@ export async function runOutdated(opts: RunOutdatedOptions): Promise<OutdatedRep
   });
   const lockfileVersions = await loadLockfileVersionTree(opts.cwd, info.manager);
   const catalog = await loadCatalogIndex(opts.cwd);
-  const cache = createRegistryCache();
+  const cache = opts.registryCache ?? createRegistryCache();
 
   const rows = await mapWithConcurrency(scanned, 8, async (p) => {
     const declared = catalogStyleRange(catalog, p.name, p.currentRange);
@@ -68,10 +81,11 @@ export async function runOutdated(opts: RunOutdatedOptions): Promise<OutdatedRep
       lockfileVersions,
     });
     let latest: string | undefined;
+    let error: string | undefined;
     try {
       latest = await fetchLatestVersion(p.name, cache);
-    } catch {
-      latest = undefined;
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
     }
     let status: OutdatedStatus = 'unknown';
     if (installed && latest) {
@@ -87,6 +101,7 @@ export async function runOutdated(opts: RunOutdatedOptions): Promise<OutdatedRep
     };
     if (installed) row.installed = installed;
     if (latest) row.latest = latest;
+    if (error) row.error = error;
     return row;
   });
 
@@ -133,11 +148,14 @@ export function renderOutdatedHuman(report: OutdatedReport): string {
         : r.status === 'ahead'
           ? chalk.cyan(r.status)
           : chalk.dim(r.status);
+    const error = r.error ? chalk.dim(`  (${r.error})`) : '';
     lines.push(
-      `  ${pad(r.name, nameW)}  ${pad(r.installed ?? '?', verW)}  ${pad(r.latest ?? '?', verW)}  ${statusColor}`,
+      `  ${pad(r.name, nameW)}  ${pad(r.installed ?? '?', verW)}  ${pad(r.latest ?? '?', verW)}  ${statusColor}${error}`,
     );
   }
-  if (report.summary.outdated === 0 && report.summary.ahead === 0 && report.summary.unknown === 0) {
+  if (report.rows.every((r) => r.error)) {
+    lines.push(chalk.red('  No package could be checked — every registry lookup failed.'));
+  } else if (report.summary.outdated === 0 && report.summary.ahead === 0 && report.summary.unknown === 0) {
     lines.push(chalk.green('  All scanned dependencies are up to date.'));
   }
   return lines.join('\n');

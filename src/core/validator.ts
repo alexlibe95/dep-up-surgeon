@@ -50,6 +50,11 @@ export { DEFAULT_OUTPUT_TAIL_LINES };
 
 const tail = tailLines;
 
+/** The script `npm init` writes: `echo "Error: no test specified" && exit 1`. */
+function isPlaceholderTestScript(script: string): boolean {
+  return /no test specified/i.test(script) && /\bexit 1\b/.test(script);
+}
+
 /**
  * Resolve the validator command for this run.
  *
@@ -57,7 +62,7 @@ const tail = tailLines;
  *   1. `--no-validate`            → skip
  *   2. `--validate <cmd>`         → run that command
  *   3. `.dep-up-surgeonrc.validate` → run that command
- *   4. `npm test` if `scripts.test` is non-empty
+ *   4. `npm test` if `scripts.test` is non-empty (npm init's always-failing placeholder doesn't count)
  *   5. `npm run build` if `scripts.build` is non-empty
  *   6. otherwise: skip (no validator available)
  */
@@ -96,7 +101,10 @@ export async function validateProject(
   const buildArgs = manager === 'yarn' ? ['build'] : ['run', 'build'];
 
   const scripts = pkgJson.scripts ?? {};
-  const testScript = typeof scripts.test === 'string' ? scripts.test.trim() : '';
+  const rawTestScript = typeof scripts.test === 'string' ? scripts.test.trim() : '';
+  // `npm init` writes a test script that always exits 1; treating it as a real validator would
+  // abort every run at pre-flight, so fall through to `build` instead.
+  const testScript = isPlaceholderTestScript(rawTestScript) ? '' : rawTestScript;
   if (testScript) {
     options.onResolved?.({
       command: `${manager} ${testArgs.join(' ')}`,

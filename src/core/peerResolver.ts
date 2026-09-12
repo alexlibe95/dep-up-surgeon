@@ -13,8 +13,8 @@
  *     (≥ currentVersion, ≤ requestedTarget). Ordered newest-first.
  *   - Constraints: for every ordered pair (A, B) in the tuple where A@version.peerDeps[B] is
  *     set, B's chosen version must satisfy that range. Peers on packages OUTSIDE the linked
- *     set are checked against the "currently installed" ranges from the workspace package.json
- *     (best-effort via `semver.minVersion`).
+ *     set are checked against the installed version (`lockfileVersions`, when provided), else
+ *     the floor of the workspace package.json range (`semver.minVersion`).
  *
  * We enumerate tuples with a newest-first backtracking search so the FIRST solution we find
  * is also the "least-downgrade" solution — the whole point of the resolver is to stay as
@@ -23,12 +23,13 @@
  * Scope + non-goals:
  *   - Only affects LINKED GROUPS (never single-package upgrades). A single package bump
  *     that fails with peer conflicts is still rolled back as today.
- *   - Optional peers (`peerDependenciesMeta[name].optional === true`) are ignored — they're
- *     informational, not hard constraints.
+ *   - Optional peers (`peerDependenciesMeta[name].optional === true`) only bind when the peer
+ *     is present (a linked member or an installed external): npm enforces a present optional
+ *     peer like a required one. An absent one is skipped, same as any unknown peer.
  *   - Deprecated versions are skipped. We'd rather fail to find a solution than auto-suggest
  *     a deprecated version as the "fix".
- *   - Prerelease versions are filtered out unless the user's current range already included
- *     prereleases (which we'd detect by the `scanned.currentRange` having a `-` suffix).
+ *   - Prerelease versions are filtered out unless the domain floor (installed version, else the
+ *     current range's minimum) is itself a prerelease.
  *   - Search is capped at 400 version combos explored. Past that we give up silently — the
  *     point is to be helpful, not to block a run on an intractable constraint graph.
  *   - Peers on packages that appear in neither the linked group nor the workspace dependency
@@ -38,6 +39,7 @@
  */
 import semver from 'semver';
 import type { VersionPeers } from '../utils/concurrency.js';
+import type { LockfileVersionTree } from '../utils/installedVersion.js';
 
 /** One member of a linked group, with the version we *wanted* to bump to. */
 export interface ResolverInput {
@@ -47,6 +49,12 @@ export interface ResolverInput {
   currentRange: string;
   /** The version the engine initially picked (usually `latest` for this package). */
   requestedTarget: string;
+  /**
+   * Version actually installed (lockfile, or what a `catalog:` entry resolves to). Raises the
+   * domain floor so the resolver never proposes going below it, and gives ranges without a
+   * semver floor (`catalog:`, `latest`) one.
+   */
+  installedVersion?: string;
 }
 
 /**
@@ -93,6 +101,12 @@ export interface ResolveOptions {
    */
   externalInstalled: Map<string, string>;
   /**
+   * Installed versions (lockfile tree). When one satisfies an `externalInstalled` range, external
+   * peers are checked against it instead of the range floor — a `^5.0.0` floor would reject a
+   * `>=5.8` peer although 5.9.3 is installed.
+   */
+  lockfileVersions?: LockfileVersionTree;
+  /**
    * Upper bound on tuples we examine before giving up. Keeps the search bounded on pathological
    * inputs (e.g. 5 packages × 50 versions each = 312M combos). Tuned to handle the typical
    * "3 linked packages × 10 recent versions" case (~1000 combos) with headroom.
@@ -124,9 +138,11 @@ export type ResolverMethod = 'backtracking' | 'sat';
 
 /**
  * Build a candidate version domain for one linked package:
- *   - Keep versions from `semver.minVersion(currentRange)` up to `requestedTarget` (inclusive).
+ *   - Keep versions from the floor up to `requestedTarget` (inclusive). The floor is the higher
+ *     of `semver.minVersion(currentRange)` and `input.installedVersion`; with neither (e.g.
+ *     `"*"`, or `catalog:` without an installed version) everything up to the target is kept.
  *   - Drop deprecated versions (the resolver shouldn't auto-suggest a known-bad version).
- *   - Drop prereleases unless `includePrereleases` is set OR the current range already has a `-`.
+ *   - Drop prereleases unless `includePrereleases` is set OR the floor is itself a prerelease.
  *   - Sort descending (newest first).
  *
  * Returns an empty array when `input.requestedTarget` is not a valid semver or the peer map
@@ -142,12 +158,12 @@ export function buildDomain(
   if (!semver.valid(input.requestedTarget)) {
     return result;
   }
-  const currentMin = safeMin(input.currentRange);
-  if (!currentMin) {
-    // No lower bound (e.g. `"*"` range) — include every non-prerelease up to the target.
-  }
-  const allowPreInCurrent = /-/.test(input.currentRange);
-  const allowPre = includePrereleases || allowPreInCurrent;
+  const rangeMin = safeMin(input.currentRange);
+  const installed = semver.valid(input.installedVersion ?? '') ?? undefined;
+  const currentMin =
+    rangeMin && installed ? (semver.gt(installed, rangeMin) ? installed : rangeMin) : (installed ?? rangeMin);
+  // Judge the floor version, not a `-` in the range text (`catalog:react-19`, `1.0.0 - 2.0.0`).
+  const allowPre = includePrereleases || Boolean(currentMin && semver.prerelease(currentMin));
 
   const eligible: string[] = [];
   for (const v of peers.keys()) {
@@ -207,6 +223,7 @@ export function resolvePeerRangesBacktracking(
   if (domains.length === 0) return undefined;
   if (domains.some((d) => d.versions.length === 0)) return undefined;
 
+  options = withInstalledExternals(options);
   const maxTuples = options.maxTuples ?? 400;
   const memberNames = new Set(domains.map((d) => d.name));
   const assignment = new Map<string, string>();
@@ -283,6 +300,7 @@ export function resolvePeerRangesSat(
   if (domains.length === 0) return undefined;
   if (domains.some((d) => d.versions.length === 0)) return undefined;
 
+  options = withInstalledExternals(options);
   const memberNames = new Set(domains.map((d) => d.name));
   const nameToIdx = new Map<string, number>(domains.map((d, i) => [d.name, i]));
   const satMaxRounds = options.satMaxRounds ?? 128;
@@ -407,6 +425,37 @@ function pruneDomainAgainstPair(
 }
 
 /**
+ * Installed version of `name` from a lockfile tree: the highest copy satisfying `declaredRange`
+ * (a lockfile can also hold older nested copies), or the highest copy when the range isn't
+ * semver (`catalog:`, `latest`). `undefined` when nothing usable is installed.
+ */
+export function installedVersionFor(
+  name: string,
+  declaredRange: string,
+  lockfileVersions: LockfileVersionTree | undefined,
+): string | undefined {
+  const raw = lockfileVersions?.get(name);
+  if (!raw) return undefined;
+  const versions = [...raw].filter((v) => semver.valid(v)).sort(semver.rcompare);
+  if (semver.validRange(declaredRange) === null) return versions[0];
+  return versions.find((v) => safeSatisfies(v, declaredRange));
+}
+
+/**
+ * `options` with each `externalInstalled` range swapped for its installed version when the
+ * lockfile has one. An exact version is its own `minVersion`, so the external peer checks
+ * compare against what's installed and keep using the range floor otherwise.
+ */
+function withInstalledExternals(options: ResolveOptions): ResolveOptions {
+  if (!options.lockfileVersions) return options;
+  const externalInstalled = new Map<string, string>();
+  for (const [name, range] of options.externalInstalled) {
+    externalInstalled.set(name, installedVersionFor(name, range, options.lockfileVersions) ?? range);
+  }
+  return { ...options, externalInstalled };
+}
+
+/**
  * Do `dA@va` and `dB@vb` mutually satisfy each other's peerDependencies (if they peer on
  * each other at all)? Unknown peers (not in the linked set, not in `externalInstalled`) are
  * treated as "no constraint" — same as `checkPartial`.
@@ -417,17 +466,16 @@ function pairIsCompatible(
   dB: CandidateDomain,
   vb: string,
 ): boolean {
+  // Both are linked members, so both get installed: optional peers between them bind too.
   const sa = dA.peers.get(va);
   const sb = dB.peers.get(vb);
   if (sa) {
-    const optional = sa.peerDependenciesMeta?.[dB.name]?.optional === true;
     const range = sa.peerDependencies[dB.name];
-    if (range && !optional && !safeSatisfies(vb, range)) return false;
+    if (range && !safeSatisfies(vb, range)) return false;
   }
   if (sb) {
-    const optional = sb.peerDependenciesMeta?.[dA.name]?.optional === true;
     const range = sb.peerDependencies[dA.name];
-    if (range && !optional && !safeSatisfies(va, range)) return false;
+    if (range && !safeSatisfies(va, range)) return false;
   }
   return true;
 }
@@ -436,7 +484,8 @@ function pairIsCompatible(
  * Return true when every **external** peer of `d@v` (i.e. a peer on a package NOT in the
  * linked set) is satisfied by what's installed at the workspace root. Unknown externals are
  * treated as "satisfied" per the module doc (we don't have the full install tree, and
- * rejecting every candidate with an unknown peer would make the resolver useless).
+ * rejecting every candidate with an unknown peer would make the resolver useless). Optional
+ * peers get the same treatment: enforced when installed, skipped when absent.
  */
 function externalsSatisfied(
   d: CandidateDomain,
@@ -448,8 +497,6 @@ function externalsSatisfied(
   if (!slice) return true;
   for (const [peerName, peerRange] of Object.entries(slice.peerDependencies)) {
     if (memberNames.has(peerName)) continue;
-    const optional = slice.peerDependenciesMeta?.[peerName]?.optional === true;
-    if (optional) continue;
     const ext = externalInstalled.get(peerName);
     if (!ext) continue;
     const extMin = safeMin(ext);
@@ -467,10 +514,12 @@ function externalsSatisfied(
  *     - If `peerName` IS in the linked set:
  *       - If that peer is already assigned → check `satisfies(peerVersion, peerRange)`.
  *       - If not yet assigned → defer (later recursion will hit it).
- *     - If `peerName` is in `externalInstalled` → check against its `minVersion`.
+ *     - If `peerName` is in `externalInstalled` → check against its `minVersion` (the installed
+ *       version when `lockfileVersions` was provided).
  *     - Otherwise → unknown, skip (see module doc).
  *
- * Returns false as soon as any check fails. Optional peers are ignored.
+ * Returns false as soon as any check fails. Optional peers are checked like required ones: a
+ * present optional peer binds, and an absent one already falls into the "unknown" case.
  */
 function checkPartial(
   assignment: Map<string, string>,
@@ -484,8 +533,6 @@ function checkPartial(
     const slice = d.peers.get(version);
     if (!slice) continue;
     for (const [peerName, peerRange] of Object.entries(slice.peerDependencies)) {
-      const optional = slice.peerDependenciesMeta?.[peerName]?.optional === true;
-      if (optional) continue;
       if (memberNames.has(peerName)) {
         const peerAssigned = assignment.get(peerName);
         if (!peerAssigned) continue; // deferred; revisit later

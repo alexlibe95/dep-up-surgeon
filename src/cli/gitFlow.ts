@@ -36,11 +36,13 @@ import {
   getUncommittedFiles,
   gitAdd,
   gitCommit,
+  gitUnstage,
   isGitRepo,
-  lockfileBasenameFor,
+  lockfileBasenamesFor,
   type GitCommitMode,
   type UpgradeChange,
 } from './git.js';
+import { LAST_RUN_FILENAME } from './lastRun.js';
 
 export interface GitFlowConfig {
   enabled: boolean;
@@ -143,7 +145,9 @@ export async function createGitFlow(
   }
 
   if (!config.allowDirty) {
-    const dirty = await getUncommittedFiles(cwd);
+    // The tool's own outputs from a previous run (last-run report, summary, backups) are not
+    // user changes; counting them would make every follow-up `--git-commit` run refuse.
+    const dirty = (await getUncommittedFiles(cwd)).filter((f) => !isToolArtifact(f));
     if (dirty.length > 0) {
       const sample = dirty.slice(0, 5).join(', ');
       const more = dirty.length > 5 ? ` (+${dirty.length - 5} more)` : '';
@@ -217,6 +221,21 @@ export async function createGitFlow(
   const bufferedExtraFiles = new Map<string, Set<string>>();
   const commits: GitCommitRecord[] = [];
 
+  /**
+   * Every lockfile the manager may have written, in the install dir AND each target dir. Covers
+   * `bun.lockb` / `npm-shrinkwrap.json` and isolated-lockfile monorepos where each member keeps
+   * its own lockfile; `gitAdd` silently drops paths that don't exist.
+   */
+  const lockfilePaths = (dirs: Iterable<string>, manager: PackageManager): string[] => {
+    const out = new Set<string>();
+    for (const dir of dirs) {
+      for (const base of lockfileBasenamesFor(manager)) {
+        out.add(path.join(dir, base));
+      }
+    }
+    return [...out];
+  };
+
   const stageFilesForTarget = (
     targetCwd: string,
     installCwd: string,
@@ -225,7 +244,7 @@ export async function createGitFlow(
   ): string[] => {
     const files = [
       path.join(targetCwd, 'package.json'),
-      path.join(installCwd, lockfileBasenameFor(manager)),
+      ...lockfilePaths([installCwd, targetCwd], manager),
     ];
     if (extraFiles) files.push(...extraFiles);
     return files;
@@ -254,6 +273,11 @@ export async function createGitFlow(
     }
 
     const result = await gitCommit({ cwd: cwdForGit, sign }, message, staged);
+    if (!result.ok) {
+      // A hook / signing refusal leaves these files staged; unstage them so the NEXT commit
+      // doesn't silently sweep this change in under the wrong subject.
+      await gitUnstage({ cwd: cwdForGit }, staged);
+    }
     const record: GitCommitRecord = {
       ok: result.ok,
       sha: result.sha,
@@ -351,7 +375,9 @@ export async function createGitFlow(
     for (const tcwd of cwdsForTarget) {
       files.add(path.join(tcwd, 'package.json'));
     }
-    files.add(path.join(installCwd, lockfileBasenameFor(manager)));
+    for (const f of lockfilePaths([installCwd, ...cwdsForTarget], manager)) {
+      files.add(f);
+    }
     const extras = bufferedExtraFiles.get(workspace);
     bufferedExtraFiles.delete(workspace);
     if (extras) {
@@ -381,7 +407,9 @@ export async function createGitFlow(
     const message = formatAllInOneMessage(prefix, allChanges);
     const files = new Set<string>();
     for (const c of cwds) files.add(path.join(c, 'package.json'));
-    files.add(path.join(installCwd, lockfileBasenameFor(manager)));
+    for (const f of lockfilePaths([installCwd, ...cwds], manager)) {
+      files.add(f);
+    }
     for (const extraSet of bufferedExtraFiles.values()) {
       for (const f of extraSet) files.add(f);
     }
@@ -418,6 +446,16 @@ export async function createGitFlow(
       commits,
     },
   };
+}
+
+/** Files dep-up-surgeon itself writes into the project (report, summary, rollback backups). */
+function isToolArtifact(file: string): boolean {
+  const base = path.basename(file);
+  return (
+    base === LAST_RUN_FILENAME ||
+    /^dep-up-surgeon-summary\.(md|html)$/.test(base) ||
+    base.endsWith('.dep-up-surgeon.bak')
+  );
 }
 
 function firstLine(s: string): string {

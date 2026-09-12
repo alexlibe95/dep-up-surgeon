@@ -25,12 +25,14 @@ import { createGitFlow, type GitFlowController } from './cli/gitFlow.js';
 import {
   BACKUP_FILENAME,
   CATALOG_BACKUP_FILENAME,
-  restoreInitialFromBackup,
+  removeCreatedBackups,
+  rollbackInFlightAttemptsSync,
   runUpgradeFlow,
   type WorkspaceMode,
 } from './core/upgrader.js';
+import { initRegistryOptions } from './utils/npmConfig.js';
 import type { FinalReport } from './types.js';
-import { log } from './utils/logger.js';
+import { log, setLogToStderr } from './utils/logger.js';
 import {
   filterAdvisoriesBySeverity,
   parseMinSeverity,
@@ -146,10 +148,36 @@ async function postRunInteractive(cwd: string, report: FinalReport): Promise<voi
   ]);
 
   if (res?.addAllIgnored) {
-    const names = report.failed.map((f) => f.name);
-    await appendIgnoreToRc(cwd, ...names);
-    log.warn(`Added ${names.length} package(s) to ignore in .dep-up-surgeonrc`);
+    const names = failedPackageNames(report);
+    try {
+      await appendIgnoreToRc(cwd, ...names);
+      log.warn(`Added ${names.length} package(s) to ignore in .dep-up-surgeonrc`);
+    } catch (e) {
+      // e.g. an rc that doesn't parse: refusing to rewrite it beats destroying the user's config.
+      log.error(`Could not update .dep-up-surgeonrc: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
+}
+
+/**
+ * Real package names behind `report.failed`. A linked-group failure is recorded as
+ * `[group:<id>]`, which never matches anything in an ignore list, so expand it to its members.
+ */
+function failedPackageNames(report: FinalReport): string[] {
+  const names = new Set<string>();
+  for (const f of report.failed) {
+    const groupId = /^\[group:(.+)\]$/.exec(f.name)?.[1];
+    if (!groupId) {
+      names.add(f.name);
+      continue;
+    }
+    const ids = [f.workspace ? `${f.workspace}::${groupId}` : undefined, groupId, f.linkedGroupId];
+    const group = report.groupPlan?.find((g) => ids.includes(g.id));
+    for (const member of group?.packages ?? []) {
+      names.add(member);
+    }
+  }
+  return [...names];
 }
 
 async function main(): Promise<void> {
@@ -461,6 +489,26 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
   const interactive = Boolean(opts.interactive) && !ciMode;
   const force = Boolean(opts.force);
   const jsonOutput = Boolean(opts.json);
+  if (jsonOutput) {
+    // stdout is reserved for the JSON report; warnings, errors and progress go to stderr.
+    setLogToStderr(true);
+  }
+  // Registry lookups honor the project's / user's .npmrc (mirrors, scoped registries, auth).
+  initRegistryOptions(cwd);
+
+  // Ctrl+C / CI cancellation mid-install: put back the half-applied step so package.json and the
+  // lockfile agree, then exit with the conventional signal status. Completed upgrades stay.
+  const onSignal = (signal: NodeJS.Signals): void => {
+    const undone = rollbackInFlightAttemptsSync();
+    log.error(
+      undone > 0
+        ? `Interrupted (${signal}): rolled back the upgrade in progress; upgrades that already finished were kept. Re-run your package manager's install to resync node_modules.`
+        : `Interrupted (${signal}).`,
+    );
+    process.exit(signal === 'SIGINT' ? 130 : 143);
+  };
+  process.once('SIGINT', onSignal);
+  process.once('SIGTERM', onSignal);
 
   // Resolve --summary. Explicit flag wins; otherwise --ci auto-enables md.
   let summaryFormat: SummaryFormat | undefined;
@@ -632,6 +680,8 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
 
   // ---- --security-only: run audit up front (before gitFlow so per-success commits see it) ----
   let auditResult: AuditResult | undefined;
+  /** Advisories at or above `--min-severity` (what `--apply-overrides` may act on). */
+  let securityAdvisories: AuditResult['advisories'] | undefined;
   let restrictToNames: Set<string> | undefined;
   let preferredTargets: Map<string, string> | undefined;
   let securityAdvisoryMap:
@@ -664,10 +714,23 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
       log.info(`--security-only: running ${auditManager} audit --json (min-severity: ${minSev})`);
     }
     auditResult = await runAudit({ manager: auditManager, cwd });
-    if (auditResult.error && !jsonOutput) {
+    if (auditResult.error && auditResult.advisories.length === 0) {
+      // A failed audit must not look like a clean one: "no advisories, nothing to do" + exit 0
+      // would let a CI security gate pass without anything having been checked.
+      const message = `--security-only: ${auditManager} audit failed: ${auditResult.error}`;
+      if (jsonOutput) {
+        console.log(JSON.stringify({ error: message }, null, 2));
+      } else {
+        log.error(message);
+      }
+      process.exitCode = 1;
+      return;
+    }
+    if (auditResult.error) {
       log.warn(`audit: ${auditResult.error}`);
     }
     const filtered = filterAdvisoriesBySeverity(auditResult.advisories, minSev);
+    securityAdvisories = filtered;
     restrictToNames = new Set(filtered.map((a) => a.name));
     preferredTargets = new Map();
     for (const a of filtered) {
@@ -952,7 +1015,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
 
       if (
         wantsAdvisoryOverrides &&
-        (!opts.securityOnly || !auditResult || auditResult.advisories.length === 0) &&
+        (!opts.securityOnly || (securityAdvisories?.length ?? 0) === 0) &&
         !effectivelyHasManual
       ) {
         if (!jsonOutput) {
@@ -976,8 +1039,8 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
           );
           const overrideManager: PackageManager =
             packageManager !== 'auto' ? packageManager : report!.project?.manager ?? 'npm';
-          const advisoriesForFlow =
-            wantsAdvisoryOverrides && auditResult ? auditResult.advisories : [];
+          // Only advisories at or above --min-severity: the user filtered the rest out on purpose.
+          const advisoriesForFlow = wantsAdvisoryOverrides ? (securityAdvisories ?? []) : [];
           const flowResult = await runOverrideFlow({
             cwd,
             manager: overrideManager,
@@ -1190,7 +1253,9 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
       await postRunInteractive(cwd, report!);
     }
 
-    if (opts.persistReport !== false) {
+    // A dry run never overwrites the record: `undo` / `--retry-failed` must keep seeing the last
+    // run that actually changed package.json.
+    if (opts.persistReport !== false && !dryRun) {
       const written = await persistLastRunReport(structuredFinal, {
         cwd,
         toolVersion: version,
@@ -1215,6 +1280,8 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
           await fs.remove(bak);
         }
       }
+      // Catalog backups can live outside every target dir (e.g. a workspaces-only run).
+      await removeCreatedBackups();
     }
 
     const preflightFailed = Boolean(report!.preflightAborted);
@@ -1239,17 +1306,10 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
     } else {
       console.log(JSON.stringify({ error: msg }, null, 2));
     }
-    try {
-      const dirs = new Set<string>([cwd]);
-      for (const t of report?.targets ?? []) {
-        dirs.add(t.cwd);
-      }
-      for (const dir of dirs) {
-        await restoreInitialFromBackup(dir);
-      }
-    } catch {
-      /* ignore restore errors */
-    }
+    // Deliberately no restore from the `.bak` files: the engine already put back the step it was
+    // in the middle of, and upgrades that completed earlier were validated and match the lockfile.
+    // Restoring the run-start package.json (or a stale backup from an older run) desynced the two.
+    await removeCreatedBackups().catch(() => undefined);
     process.exitCode = 1;
   }
 }

@@ -319,12 +319,15 @@ function normalizeAllowMajorAfterEntry(
 
 /**
  * Match a package name against a pattern. Supports `*` as "any sequence of non-separator
- * characters" and literal exact names. Not a full glob — that's intentional; deps names
- * don't need `[abc]` / `{a,b}` / `**` to stay expressive.
+ * characters" and literal exact names; a bare `*` matches every name, scoped ones included.
+ * Not a full glob — that's intentional; deps names don't need `[abc]` / `{a,b}` / `**` to
+ * stay expressive.
  */
 export function matchPattern(pattern: string, name: string): boolean {
   if (pattern === name) return true;
   if (!pattern.includes('*')) return false;
+  // `freeze: ["*"]` means everything; the segment-bound regex below would miss `@scope/name`.
+  if (pattern === '*') return true;
   // Escape regex specials except `*`, then replace `*` with `[^/]*` so `@types/*` does NOT
   // match `@types/foo/bar` (which isn't a real package name anyway).
   const re = new RegExp(
@@ -342,8 +345,13 @@ export function matchPattern(pattern: string, name: string): boolean {
 export interface PolicyDecision {
   /** When true, the package should NOT be upgraded at all. `reason` will be populated. */
   frozen: boolean;
-  /** When set, the engine must not attempt versions outside this semver range. */
+  /**
+   * When set, the engine must not attempt versions outside this semver range. With several
+   * matching rules it is their intersection, spelled so it stays correct with `||` ranges.
+   */
   maxRange?: string;
+  /** Every matching `maxVersion` range in rule order; a version must satisfy all of them. */
+  maxRanges?: string[];
   /** When set, major bumps are blocked until the listed date. */
   blockedMajorUntil?: Date;
   /** The reason surfaced to the user / report when the package was skipped or capped. */
@@ -352,8 +360,8 @@ export interface PolicyDecision {
 
 /**
  * Compute the combined decision for a single package name. If the package matches multiple
- * rules we combine them conservatively: freeze always wins; otherwise the tightest `maxRange`
- * and earliest `blockedMajorUntil` apply.
+ * rules we combine them conservatively: freeze always wins; otherwise every matching
+ * `maxVersion` range must hold and the earliest `blockedMajorUntil` applies.
  */
 export function evaluatePolicy(
   policy: Policy,
@@ -371,16 +379,14 @@ export function evaluatePolicy(
     return decision;
   }
 
-  // Max-version: tighten to the intersection of all matching rules.
-  for (const rule of policy.maxVersion) {
-    if (!matchPattern(rule.pattern, packageName)) continue;
-    if (!decision.maxRange) {
-      decision.maxRange = rule.range;
-    } else {
-      // Use semver to compute the intersection. `validRange` already checked; we simply join.
-      const combined = `${decision.maxRange} ${rule.range}`;
-      decision.maxRange = semver.validRange(combined) ? combined : rule.range;
-    }
+  // Max-version: every matching rule must hold. Keep the list — space-joining the raw strings
+  // breaks on `||` (`8.x || 9.x >=9` still admits 8.57.0).
+  const maxRanges = policy.maxVersion
+    .filter((rule) => matchPattern(rule.pattern, packageName))
+    .map((rule) => rule.range);
+  if (maxRanges.length > 0) {
+    decision.maxRanges = maxRanges;
+    decision.maxRange = maxRanges.length === 1 ? maxRanges[0]! : intersectRanges(maxRanges);
   }
 
   // Blocked major: earliest gate wins (conservative).
@@ -394,7 +400,13 @@ export function evaluatePolicy(
 
   if (!decision.reason) {
     const bits: string[] = [];
-    if (decision.maxRange) bits.push(`capped to ${decision.maxRange}`);
+    if (decision.maxRanges) {
+      const caps =
+        decision.maxRanges.length === 1
+          ? decision.maxRanges
+          : decision.maxRanges.map((r) => `(${r})`);
+      bits.push(`capped to ${caps.join(' and ')}`);
+    }
     if (decision.blockedMajorUntil) {
       bits.push(`majors blocked until ${decision.blockedMajorUntil.toISOString().slice(0, 10)}`);
     }
@@ -405,15 +417,30 @@ export function evaluatePolicy(
 }
 
 /**
+ * Intersect semver ranges into one equivalent range string. A space (AND) binds tighter than
+ * `||`, so the alternatives are distributed: `(a || b)` AND `c` → `a c || b c`.
+ */
+function intersectRanges(ranges: string[]): string {
+  let alternatives: string[][] = [[]];
+  for (const range of ranges) {
+    const conjunctions = new semver.Range(range).set.map((comparators) =>
+      comparators.map((c) => c.value).filter(Boolean),
+    );
+    alternatives = alternatives.flatMap((acc) => conjunctions.map((conj) => [...acc, ...conj]));
+  }
+  return alternatives.map((conj) => conj.join(' ') || '*').join(' || ');
+}
+
+/**
  * Given a current version range and a candidate target version, return either the version
  * itself (ok) or a REPLACEMENT target that respects the policy. When no acceptable version can
  * be found (e.g. the policy forbids every direction), returns `undefined` to signal "skip".
  *
  * Rules applied:
  *   - `frozen` → undefined (engine treats as ignore).
- *   - `maxRange` → if `target` satisfies it, keep it; else pick the highest version that does
- *     from the provided `availableVersions` (descending preference). Returns undefined when
- *     nothing satisfies the range.
+ *   - `maxRanges` (or a lone `maxRange`) → if `target` satisfies every range, keep it; else
+ *     pick the highest version that does from the provided `availableVersions` (descending
+ *     preference). Returns undefined when nothing satisfies them all.
  *   - `blockedMajorUntil` → if `target` would be a major bump over `fromVersion`, demote to
  *     the highest available version within the SAME major as `fromVersion`.
  */
@@ -440,13 +467,15 @@ export function applyPolicyToTarget(
     }
   }
 
-  // Then apply maxRange. If already within range, no change.
-  if (decision.maxRange) {
-    if (semver.satisfies(candidate, decision.maxRange)) {
+  // Then apply the max-version caps. If already within all of them, no change.
+  const caps = decision.maxRanges ?? (decision.maxRange ? [decision.maxRange] : []);
+  if (caps.length > 0) {
+    const allowed = (v: string): boolean => caps.every((range) => semver.satisfies(v, range));
+    if (allowed(candidate)) {
       return candidate;
     }
     const inRange = availableVersions
-      .filter((v) => semver.valid(v) && semver.satisfies(v, decision.maxRange!))
+      .filter((v) => semver.valid(v) && allowed(v))
       .sort(semver.rcompare);
     if (inRange.length === 0) return undefined;
     candidate = inRange[0]!;

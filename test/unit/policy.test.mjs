@@ -56,6 +56,18 @@ test('matchPattern: wildcard does not span slashes', () => {
   assert.strictEqual(matchPattern('@types/*', '@types/foo/bar'), false);
 });
 
+test('matchPattern: bare "*" matches every package, scoped names included', () => {
+  assert.strictEqual(matchPattern('*', 'react'), true);
+  assert.strictEqual(matchPattern('*', '@babel/core'), true);
+  assert.strictEqual(matchPattern('@babel/*', '@babel/core'), true);
+  assert.strictEqual(matchPattern('@babel/*', '@types/node'), false);
+});
+
+test('matchPattern: regex metacharacters in patterns stay literal', () => {
+  assert.strictEqual(matchPattern('lodash.*', 'lodash.merge'), true);
+  assert.strictEqual(matchPattern('lodash.*', 'lodashXmerge'), false);
+});
+
 // ---------------------------------------------------------------------------
 // loadPolicy
 // ---------------------------------------------------------------------------
@@ -219,6 +231,24 @@ test('evaluatePolicy: allowMajorAfter in the past is a no-op', () => {
   });
   const d = evaluatePolicy(policy, 'react', new Date('2026-01-01'));
   assert.strictEqual(d.blockedMajorUntil, undefined);
+});
+
+test('evaluatePolicy: every matching maxVersion rule must hold, including `||` ranges', () => {
+  const policy = normalizePolicy({
+    maxVersion: [
+      { name: 'eslint', version: '8.x || 9.x' },
+      { name: 'eslint', version: '>=9' },
+    ],
+  });
+  const d = evaluatePolicy(policy, 'eslint');
+  assert.deepStrictEqual(d.maxRanges, ['8.x || 9.x', '>=9']);
+  const available = ['8.57.0', '9.1.0', '10.0.0'];
+  assert.strictEqual(applyPolicyToTarget(d, '8.0.0', '8.57.0', available), '9.1.0');
+  // Consumers that only read the combined `maxRange` string must get the same answer.
+  assert.strictEqual(
+    applyPolicyToTarget({ frozen: false, maxRange: d.maxRange }, '8.0.0', '8.57.0', available),
+    '9.1.0',
+  );
 });
 
 // ---------------------------------------------------------------------------

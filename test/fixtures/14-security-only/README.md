@@ -16,3 +16,9 @@ step is replaced by a stub on `UpgradeEngineOptions.installer`.
 
 `left-pad` is intentionally clean so assertions can check that packages **without**
 advisories are excluded from the restricted plan.
+
+`audit-npm11-express.json` is verbatim `npm audit --json` output (npm 11.19.0) for a
+project pinning `express@4.17.1`, `compression@1.7.4`, `lodash@4.17.20` and
+`minimist@1.2.5`. It covers the npm 11 quirks the parser must handle: a direct dep whose
+`via[]` holds only strings (`compression`), transitive rows whose `fixAvailable` names the
+parent (`qs` → `express`), and ids that only carry the GHSA in `url`.

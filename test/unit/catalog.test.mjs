@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs/promises';
+import YAML from 'yaml';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(here, '..', '..');
@@ -335,5 +336,123 @@ test('runUpgradeFlow: dist-tag is pinned to a concrete version in package.json',
     assert.strictEqual(row.to, '4.17.21');
     const pkg = JSON.parse(await fs.readFile(path.join(dir, 'package.json'), 'utf8'));
     assert.strictEqual(pkg.dependencies.lodash, '4.17.21');
+  });
+});
+
+// pnpm treats `catalog:` and `catalog:default` as the same catalog, which can be declared as
+// top-level `catalog` or as `catalogs.default`.
+
+test('parseCatalogSpec: catalog:default is the default catalog', () => {
+  assert.deepStrictEqual(parseCatalogSpec('catalog:default'), { kind: 'default' });
+  assert.deepStrictEqual(parseCatalogSpec('catalog: default'), { kind: 'default' });
+});
+
+test('resolveCatalogRange: catalog:default reads the top-level yaml catalog', async () => {
+  await withTempDir(async (dir) => {
+    await fs.writeFile(
+      path.join(dir, 'pnpm-workspace.yaml'),
+      'packages:\n  - packages/*\ncatalog:\n  react: ^18.2.0\n',
+    );
+    const index = await loadCatalogIndex(dir);
+    assert.strictEqual(resolveCatalogRange(index, 'react', parseCatalogSpec('catalog:default')), '^18.2.0');
+    assert.strictEqual(catalogStyleRange(index, 'react', 'catalog:default'), '^18.2.0');
+  });
+});
+
+test('loadCatalogIndex + writeCatalogRange: yaml catalogs.default is the default catalog', async () => {
+  await withTempDir(async (dir) => {
+    const file = path.join(dir, 'pnpm-workspace.yaml');
+    await fs.writeFile(
+      file,
+      [
+        'packages:',
+        '  - packages/*',
+        'catalogs:',
+        '  default:',
+        '    react: ^18.2.0',
+        '  legacy:',
+        '    react: ^17.0.2',
+        '',
+      ].join('\n'),
+    );
+    const index = await loadCatalogIndex(dir);
+    assert.strictEqual(resolveCatalogRange(index, 'react', parseCatalogSpec('catalog:')), '^18.2.0');
+    assert.strictEqual(resolveCatalogRange(index, 'react', parseCatalogSpec('catalog:default')), '^18.2.0');
+    assert.strictEqual(resolveCatalogRange(index, 'react', parseCatalogSpec('catalog:legacy')), '^17.0.2');
+
+    await writeCatalogRange(index, 'react', parseCatalogSpec('catalog:'), '^19.0.0');
+    const doc = YAML.parse(await fs.readFile(file, 'utf8'));
+    // pnpm rejects a default catalog declared both ways, so no top-level `catalog` may appear.
+    assert.strictEqual(doc.catalog, undefined);
+    assert.strictEqual(doc.catalogs.default.react, '^19.0.0');
+    assert.strictEqual(doc.catalogs.legacy.react, '^17.0.2');
+  });
+});
+
+test('loadCatalogIndex: numeric YAML catalog values are kept as strings', async () => {
+  await withTempDir(async (dir) => {
+    await fs.writeFile(
+      path.join(dir, 'pnpm-workspace.yaml'),
+      'catalog:\n  semver: 7\n  react: ^18.2.0\ncatalogs:\n  legacy:\n    semver: 6\n',
+    );
+    const index = await loadCatalogIndex(dir);
+    assert.strictEqual(resolveCatalogRange(index, 'semver', { kind: 'default' }), '7');
+    assert.strictEqual(resolveCatalogRange(index, 'semver', { kind: 'named', name: 'legacy' }), '6');
+    assert.strictEqual(resolveCatalogRange(index, 'react', { kind: 'default' }), '^18.2.0');
+  });
+});
+
+test('loadCatalogIndex + writeCatalogRange: Bun default catalog via workspaces.catalog or catalogs.default', async () => {
+  const layouts = [
+    { catalog: { chalk: '^5.0.0' } },
+    { catalogs: { default: { chalk: '^5.0.0' }, next: { react: '^18.0.0' } } },
+  ];
+  for (const layout of layouts) {
+    await withTempDir(async (dir) => {
+      const file = path.join(dir, 'package.json');
+      await fs.writeFile(
+        file,
+        JSON.stringify({ name: 'root', workspaces: { packages: ['packages/*'], ...layout } }, null, 2),
+      );
+      const index = await loadCatalogIndex(dir);
+      assert.strictEqual(index.source, 'package.json');
+      for (const pointer of ['catalog:', 'catalog:default']) {
+        assert.strictEqual(resolveCatalogRange(index, 'chalk', parseCatalogSpec(pointer)), '^5.0.0', pointer);
+      }
+
+      await writeCatalogRange(index, 'chalk', parseCatalogSpec('catalog:default'), '^5.4.0');
+      const pkg = JSON.parse(await fs.readFile(file, 'utf8'));
+      if (layout.catalog) {
+        assert.strictEqual(pkg.workspaces.catalog.chalk, '^5.4.0');
+        assert.strictEqual(pkg.workspaces.catalogs, undefined);
+      } else {
+        assert.strictEqual(pkg.workspaces.catalogs.default.chalk, '^5.4.0');
+        assert.strictEqual(pkg.workspaces.catalogs.next.react, '^18.0.0');
+        assert.strictEqual(pkg.workspaces.catalog, undefined);
+      }
+    });
+  }
+});
+
+test('runUpgradeFlow dry-run: catalog: pointer resolves against catalogs.default', async () => {
+  await withTempDir(async (dir) => {
+    await fs.writeFile(
+      path.join(dir, 'package.json'),
+      JSON.stringify({ name: 'app', dependencies: { react: 'catalog:' } }),
+    );
+    await fs.writeFile(
+      path.join(dir, 'pnpm-workspace.yaml'),
+      'packages:\n  - packages/*\ncatalogs:\n  default:\n    react: ^18.2.0\n',
+    );
+    const report = await runUpgradeFlow({
+      cwd: dir,
+      ...dryRunOpts,
+      registryCache: seededCache({ react: '19.0.0' }),
+    });
+    const row = report.upgraded.find((r) => r.name === 'react');
+    assert.ok(row, `expected react row, got ${JSON.stringify(report.upgraded)}`);
+    assert.strictEqual(row.from, '^18.2.0');
+    assert.strictEqual(row.to, '19.0.0');
+    assert.strictEqual(row.detail, 'dry-run');
   });
 });

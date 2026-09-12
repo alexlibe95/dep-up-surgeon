@@ -218,3 +218,124 @@ test('shouldRollbackAfterSuccessfulInstall: no override keyword in log → still
   assert.ok(c.length > 0, 'expected peer tuple');
   assert.strictEqual(shouldRollbackAfterSuccessfulInstall(out, c, false, 'npm'), true);
 });
+
+// ---------------------------------------------------------------------------
+// Engine warnings: npm prints EBADENGINE for ANY package in the tree whose `engines` doesn't
+// match, on installs that exit 0. They are reported, but must never undo the install.
+// ---------------------------------------------------------------------------
+
+test('shouldRollbackAfterSuccessfulInstall: npm EBADENGINE warning alone does not roll back', () => {
+  const out = [
+    'npm warn EBADENGINE Unsupported engine {',
+    "npm warn EBADENGINE   package: 'undici@7.16.0',",
+    "npm warn EBADENGINE   required: { node: '>=20.18.1' },",
+    "npm warn EBADENGINE   current: { node: 'v18.20.4', npm: '10.8.2' }",
+    'npm warn EBADENGINE }',
+    '',
+    'changed 1 package, and audited 412 packages in 3s',
+  ].join('\n');
+  const c = extractClassifiedConflicts(out);
+  assert.ok(c.some((x) => x.category === 'incompatibleEngine'), 'engine row is still reported');
+  assert.strictEqual(shouldRollbackAfterSuccessfulInstall(out, c, false, 'npm'), false);
+});
+
+test('shouldRollbackAfterSuccessfulInstall: pnpm Unsupported engine warning alone does not roll back', () => {
+  const out = [
+    ' WARN  Unsupported engine: wanted: {"node":">=18"} (current: {"node":"v16.20.0","pnpm":"9.0.0"})',
+    'Packages: +1',
+    'Done in 1.2s',
+  ].join('\n');
+  const c = extractClassifiedConflicts(out);
+  assert.ok(c.some((x) => x.category === 'incompatibleEngine'), 'engine row is still reported');
+  assert.strictEqual(shouldRollbackAfterSuccessfulInstall(out, c, false, 'pnpm'), false);
+});
+
+test('shouldRollbackAfterSuccessfulInstall: an engine warning does not mask a real npm peer row', () => {
+  const out = [
+    'npm warn EBADENGINE Unsupported engine {',
+    "npm warn EBADENGINE   package: 'undici@7.16.0',",
+    'npm warn EBADENGINE }',
+    'npm warn peer eslint@"9" from eslint-plugin@1.0.0',
+  ].join('\n');
+  const c = extractClassifiedConflicts(out);
+  assert.strictEqual(shouldRollbackAfterSuccessfulInstall(out, c, false, 'npm'), true);
+});
+
+// ---------------------------------------------------------------------------
+// pnpm / yarn / bun unmet-peer warnings are routine on exit 0 (like npm's "overriding peer
+// dependency"). They must classify a NON-zero exit as a peer failure (resolver runs) but
+// must not roll back an install that succeeded.
+// ---------------------------------------------------------------------------
+
+test('pnpm peer issues on exit 0: peer-like rows, but no rollback', () => {
+  const out = [
+    'Progress: resolved 312, reused 290, downloaded 0, added 0, done',
+    ' WARN  Issues with peer dependencies found',
+    '.',
+    '└─┬ @testing-library/react 16.0.0',
+    '  ├── ✕ missing peer react-dom@"^18.0.0"',
+    '  └── ✕ unmet peer react@"^18.0.0": found 17.0.2',
+    '',
+    'Done in 2.1s',
+  ].join('\n');
+  const c = extractClassifiedConflicts(out);
+  assert.ok(classifiedHasPeerLikeFailure(c));
+  assert.strictEqual(shouldRollbackAfterSuccessfulInstall(out, c, false, 'pnpm'), false);
+});
+
+test('pnpm ERR_PNPM_PEER_DEP_ISSUES: peer-like failure, and strict if it ever shows on exit 0', () => {
+  const out = [
+    ' ERR_PNPM_PEER_DEP_ISSUES  Unmet peer dependencies',
+    '',
+    '.',
+    '└─┬ @testing-library/react 16.0.0',
+    '  └── ✕ unmet peer react@"^18.0.0": found 17.0.2',
+  ].join('\n');
+  const c = extractClassifiedConflicts(out);
+  assert.ok(classifiedHasPeerLikeFailure(c));
+  assert.strictEqual(shouldRollbackAfterSuccessfulInstall(out, c, false, 'pnpm'), true);
+  const truncated = ' ERR_PNPM_PEER_DEP_ISSUES  Unmet peer dependencies';
+  assert.ok(classifiedHasPeerLikeFailure(extractClassifiedConflicts(truncated)));
+});
+
+test('yarn classic peer warnings on exit 0: peer-like rows, but no rollback', () => {
+  const out = [
+    'yarn install v1.22.22',
+    '[3/4] Linking dependencies...',
+    'warning " > @testing-library/react@16.0.0" has unmet peer dependency "react-dom@^18.0.0".',
+    'warning " > @testing-library/react@16.0.0" has incorrect peer dependency "react@^18.0.0".',
+    '[4/4] Building fresh packages...',
+    'Done in 3.42s.',
+  ].join('\n');
+  const c = extractClassifiedConflicts(out);
+  assert.ok(classifiedHasPeerLikeFailure(c));
+  assert.strictEqual(shouldRollbackAfterSuccessfulInstall(out, c, false, 'yarn'), false);
+});
+
+test('yarn berry YN0060 / YN0002 / YN0086 on exit 0: peer-like rows, but no rollback', () => {
+  const out = [
+    '➤ YN0000: ┌ Resolution step',
+    "➤ YN0060: │ react is listed by your project with version 17.0.2 (p1a2b3), which doesn't satisfy what @testing-library/react requests (^18.0.0).",
+    "➤ YN0002: │ my-app@workspace:. doesn't provide react-dom (p4c5d6), requested by @testing-library/react.",
+    '➤ YN0086: │ Some peer dependencies are incorrectly met by dependencies; run yarn explain peer-requirements for details.',
+    '➤ YN0000: └ Completed in 0s 412ms',
+    '➤ YN0000: · Done with warnings in 2s 104ms',
+  ].join('\n');
+  const c = extractClassifiedConflicts(out, { rootPackageName: 'my-app' });
+  assert.ok(classifiedHasPeerLikeFailure(c));
+  assert.strictEqual(shouldRollbackAfterSuccessfulInstall(out, c, false, 'yarn'), false);
+});
+
+test('bun incorrect peer dependency on exit 0: peer-like rows, but no rollback', () => {
+  const out = [
+    'bun install v1.2.19 (aad3abea)',
+    'warn: incorrect peer dependency "react@17.0.2"',
+    '',
+    '+ @testing-library/react@16.0.0',
+    '',
+    '1 package installed [812.00ms]',
+  ].join('\n');
+  const c = extractClassifiedConflicts(out);
+  assert.ok(classifiedHasPeerLikeFailure(c));
+  assert.strictEqual(shouldRollbackAfterSuccessfulInstall(out, c, false, 'bun'), false);
+});

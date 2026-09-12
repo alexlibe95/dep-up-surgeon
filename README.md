@@ -55,7 +55,7 @@ dep-up-surgeon outdated [options]
 | `--interactive` | On failure, prompts for next steps (see **Interactive mode**). After the run, optionally bulk-add failed names to `.dep-up-surgeonrc`. |
 | `--force` | Keep a version bump even when validation fails; also skips **rollback** when structured conflicts are detected in npm output after a successful exit code (use with care). |
 | `--ignore <pkgs>` | Comma-separated **package names** to skip in **every** workspace (merged with `.dep-up-surgeonrc`). This is global by name — unlike `--retry-failed`, which freezes per workspace. |
-| `--json` | Machine-readable report on stdout (see **JSON report**). |
+| `--json` | Machine-readable report on stdout (see **JSON report**). Progress, warnings and errors go to stderr, so stdout is always valid JSON. |
 | `--fallback-strategy <mode>` | `major-lines` (**default**), `minor-lines`, or `none`. After `@latest` fails, **`major-lines`** tries the best stable version per **major** (e.g. `9.x` → `8.x` → `7.x` …). **`minor-lines`** steps one **`major.minor` line** at a time. If npm output looks like **ESM vs CommonJS** (`ERR_REQUIRE_ESM`), further fallbacks for that package **stop**. `none` only attempts `@latest`. |
 | `--link-groups <mode>` | `auto` (**default**) or `none`. **`auto`** builds **linked batches** from the registry graph and optional **`linkedGroups`**. **`none`** upgrades one dependency per step. |
 | `--validate <cmd>` | Override the validator command run after every install. Defaults to `<manager> test` if a `test` script exists, else `<manager> run build` (yarn classic uses `yarn build`), else nothing. Useful in monorepos where the default build is heavy or fragile (e.g. `--validate "tsc -p tsconfig.json --noEmit"`). |
@@ -111,7 +111,7 @@ The pre-flight outcome is also surfaced under `preflight` / `preflightAborted` i
 
 ### Persisted last-run report
 
-After every CLI run the structured report is written to `.dep-up-surgeon.last-run.json` next to the workspace root (set `--no-persist-report` to opt out). The file mirrors the `--json` output and adds a small header (`finishedAt`, `toolVersion`, `cwd`, `dryRun`) so CI dashboards / bots can pick it up without re-running the tool. Each `upgraded` / `failed` row carries a `workspace` field when more than one target was traversed — `--retry-failed` uses that label so a freeze in one member does not skip the same package name in another. Add the file to your `.gitignore` if you don't want it tracked.
+After every CLI run that changes the project the structured report is written to `.dep-up-surgeon.last-run.json` next to the workspace root (set `--no-persist-report` to opt out). `--dry-run` never writes it, so a dry run can't overwrite the record `undo` and `--retry-failed` rely on. The file mirrors the `--json` output and adds a small header (`finishedAt`, `toolVersion`, `cwd`, `dryRun`) so CI dashboards / bots can pick it up without re-running the tool. Each `upgraded` / `failed` row carries a `workspace` field when more than one target was traversed — `--retry-failed` uses that label so a freeze in one member does not skip the same package name in another. Add the file to your `.gitignore` if you don't want it tracked.
 
 ### Retry-failed mode (`--retry-failed`)
 
@@ -552,7 +552,7 @@ npx dep-up-surgeon doctor
 
 ### Outdated report (`dep-up-surgeon outdated`)
 
-`outdated` is a **read-only** scan of direct dependencies vs registry `@latest`. Installed versions come from the lockfile when available (so `^1.0.0` that already resolved to `1.9.0` is not flagged if `1.9.0` is latest). Exits `1` when anything is outdated, `0` otherwise — useful as a CI soft gate before an upgrade run.
+`outdated` is a **read-only** scan of direct dependencies vs registry `@latest`. Installed versions come from the lockfile when available (so `^1.0.0` that already resolved to `1.9.0` is not flagged if `1.9.0` is latest). Exits `1` when anything is outdated, `2` when no package could be checked (every registry lookup failed), `0` otherwise — useful as a CI soft gate before an upgrade run.
 
 ```bash
 npx dep-up-surgeon outdated
@@ -749,8 +749,8 @@ Use this for CI or tooling that needs structured results.
 
 **Runtime behavior (this CLI)**
 
-- Before the first real change, the tool copies `package.json` to `package.json.dep-up-surgeon.bak`.
-- On uncaught errors, it tries to restore `package.json` from that backup. If that happens, run `npm install` again to sync `node_modules`.
+- Before the first real change, the tool copies `package.json` to `package.json.dep-up-surgeon.bak`; the copy is removed when the run ends.
+- Every install attempt first snapshots `package.json`, the lockfile and any catalog file. A failed attempt, an uncaught error, or Ctrl+C / `SIGTERM` puts those files back byte-for-byte: upgrades that already passed validation stay, the one in progress is undone. After an interruption, run your package manager's install to resync `node_modules`.
 
 **Supply chain & registry trust**
 
@@ -814,7 +814,7 @@ npm test
 
 Runs **unit tests** (conflict parsing, npm output samples, workspace + yarn-capability detection, install command builder, concurrency primitives, summary writer, persisted last-run + retry classification, git helpers + flow controller — all offline) **and fixture integration tests** (`test/fixtures/*/package.json` exercised with `dep-up-surgeon --dry-run --json`). The fixture suite requires **network** access to the npm registry. See `test/fixtures/README.md`. Run only the offline suite with `npm run test:unit`.
 
-Push and pull requests run the same `npm test` command on **Node 22 and 24** (see `.github/workflows/ci.yml`).
+Push and pull requests run the same `npm test` command on **Node 22, 24, and 26** (see `.github/workflows/ci.yml`).
 
 ## Development
 

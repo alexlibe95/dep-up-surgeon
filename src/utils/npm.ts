@@ -2,6 +2,7 @@ import { execa } from 'execa';
 import pacote from 'pacote';
 import type { RegistryCache } from './concurrency.js';
 import type { PackageManager } from '../core/workspaces.js';
+import { registryOptions } from './npmConfig.js';
 
 /**
  * Regex / heuristics for npm stderr+stdout (install, ci, etc.).
@@ -41,6 +42,18 @@ export function detectEsmCommonJsBlockage(output: string): boolean {
 }
 
 /**
+ * Forget a cached lookup that failed, so one registry blip doesn't disable the package for every
+ * later workspace target in the run. Only an entry still pointing at `p` is removed.
+ */
+function evictOnFailure<T>(map: Map<string, Promise<T>>, key: string, p: Promise<T>): void {
+  p.catch(() => {
+    if (map.get(key) === p) {
+      map.delete(key);
+    }
+  });
+}
+
+/**
  * Latest published version for a package name (respects dist-tags; default latest).
  *
  * When a `cache` is provided, concurrent or repeated requests for the same package name share
@@ -57,12 +70,14 @@ export async function fetchLatestVersion(
       return hit;
     }
     const p = pacote
-      .manifest(`${packageName}@latest`, { fullMetadata: false })
+      .manifest(`${packageName}@latest`, { ...registryOptions(), fullMetadata: false })
       .then((m) => m.version);
     cache.latest.set(packageName, p);
+    evictOnFailure(cache.latest, packageName, p);
     return p;
   }
   const manifest = await pacote.manifest(`${packageName}@latest`, {
+    ...registryOptions(),
     fullMetadata: false,
   });
   return manifest.version;
@@ -76,6 +91,7 @@ export async function fetchLatestVersion(
  * Design notes:
  *   - Returns an EMPTY map on any error (network blip, 404, malformed packument). The resolver
  *     treats that as "no candidate info available" and bails out gracefully — never throws.
+ *     Failures aren't cached, so a later target can still get real data.
  *   - Deprecated versions are kept in the map but flagged; the resolver filters them out.
  *   - `peerDependenciesMeta[name].optional === true` marks a peer as optional — the resolver
  *     ignores those when intersecting, because an unsatisfied optional peer isn't a hard
@@ -87,43 +103,42 @@ export async function fetchVersionPeers(
 ): Promise<Map<string, import('./concurrency.js').VersionPeers>> {
   const doFetch = async (): Promise<Map<string, import('./concurrency.js').VersionPeers>> => {
     const out = new Map<string, import('./concurrency.js').VersionPeers>();
-    try {
-      const pack = await pacote.packument(packageName, { fullMetadata: true });
-      const versions = pack?.versions as
-        | Record<
-            string,
-            {
-              peerDependencies?: Record<string, string>;
-              peerDependenciesMeta?: Record<string, { optional?: boolean }>;
-              deprecated?: string;
-            }
-          >
-        | undefined;
-      if (!versions || typeof versions !== 'object') {
-        return out;
-      }
-      for (const [v, info] of Object.entries(versions)) {
-        const slice: import('./concurrency.js').VersionPeers = {
-          peerDependencies: info.peerDependencies ?? {},
-        };
-        if (info.peerDependenciesMeta) slice.peerDependenciesMeta = info.peerDependenciesMeta;
-        if (typeof info.deprecated === 'string') slice.deprecated = info.deprecated;
-        out.set(v, slice);
-      }
-      return out;
-    } catch {
+    const pack = await pacote.packument(packageName, { ...registryOptions(), fullMetadata: true });
+    const versions = pack?.versions as
+      | Record<
+          string,
+          {
+            peerDependencies?: Record<string, string>;
+            peerDependenciesMeta?: Record<string, { optional?: boolean }>;
+            deprecated?: string;
+          }
+        >
+      | undefined;
+    if (!versions || typeof versions !== 'object') {
       return out;
     }
+    for (const [v, info] of Object.entries(versions)) {
+      const slice: import('./concurrency.js').VersionPeers = {
+        peerDependencies: info.peerDependencies ?? {},
+      };
+      if (info.peerDependenciesMeta) slice.peerDependenciesMeta = info.peerDependenciesMeta;
+      if (typeof info.deprecated === 'string') slice.deprecated = info.deprecated;
+      out.set(v, slice);
+    }
+    return out;
   };
 
   if (cache) {
     const hit = cache.peers.get(packageName);
     if (hit) return hit;
-    const p = doFetch();
+    const p = doFetch().catch(() => {
+      if (cache.peers.get(packageName) === p) cache.peers.delete(packageName);
+      return new Map<string, import('./concurrency.js').VersionPeers>();
+    });
     cache.peers.set(packageName, p);
     return p;
   }
-  return doFetch();
+  return doFetch().catch(() => new Map<string, import('./concurrency.js').VersionPeers>());
 }
 
 /**
@@ -139,7 +154,7 @@ export async function fetchAllPublishedVersions(
     if (hit) {
       return hit;
     }
-    const p = pacote.packument(packageName).then((pack) => {
+    const p = pacote.packument(packageName, registryOptions()).then((pack) => {
       const v = pack?.versions;
       if (!v || typeof v !== 'object') {
         return [] as string[];
@@ -147,9 +162,10 @@ export async function fetchAllPublishedVersions(
       return Object.keys(v);
     });
     cache.versions.set(packageName, p);
+    evictOnFailure(cache.versions, packageName, p);
     return p;
   }
-  const pack = await pacote.packument(packageName);
+  const pack = await pacote.packument(packageName, registryOptions());
   const v = pack?.versions;
   if (!v || typeof v !== 'object') {
     return [];
@@ -202,9 +218,11 @@ export function installCommand(
   const { filter, yarnSupportsFocus } = options;
   switch (manager) {
     case 'pnpm':
+      // pnpm switches to --frozen-lockfile when `CI` is set, which would fail every bump: the
+      // lockfile is necessarily out of date right after we edit package.json.
       return filter
-        ? { bin: 'pnpm', args: ['install', '--filter', filter], filtered: true }
-        : { bin: 'pnpm', args: ['install'], filtered: false };
+        ? { bin: 'pnpm', args: ['install', '--filter', filter, '--no-frozen-lockfile'], filtered: true }
+        : { bin: 'pnpm', args: ['install', '--no-frozen-lockfile'], filtered: false };
     case 'yarn':
       // Yarn classic (v1) has no clean per-workspace install path; we fall back to the full
       // install. Yarn berry (v2+) has `yarn workspaces focus <name>` BUT only when the
@@ -240,7 +258,14 @@ export async function runInstall(
   options: InstallOptions = {},
 ): Promise<InstallResult> {
   const { bin, args, filtered } = installCommand(manager, options);
-  const r = await execa(bin, args, { cwd, reject: false, all: true });
+  const r = await execa(bin, args, {
+    cwd,
+    reject: false,
+    all: true,
+    // Yarn Berry enables immutable installs when `CI` is set (same failure as pnpm above). An env
+    // var rather than `--no-immutable` because Yarn classic rejects unknown flags.
+    ...(manager === 'yarn' ? { env: { YARN_ENABLE_IMMUTABLE_INSTALLS: 'false' } } : {}),
+  });
   const output = [r.stdout, r.stderr].filter(Boolean).join('\n');
   return {
     ok: r.exitCode === 0,

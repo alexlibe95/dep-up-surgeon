@@ -1,5 +1,6 @@
 /**
- * Parse npm install / npm ci combined stdout+stderr into structured conflicts.
+ * Parse npm install / npm ci combined stdout+stderr into structured conflicts (plus the peer
+ * diagnostics pnpm, yarn classic / berry and bun print).
  * Patterns are generic — no package names are hard-coded.
  */
 
@@ -56,6 +57,65 @@ const LINE_PATTERNS: Array<{
       dependency: m[1]!,
       requiredRange: m[2]!,
     }),
+  },
+  // yarn classic: `warning " > @testing-library/react@16.0.0" has unmet peer dependency "react@^18.0.0".`
+  // (`incorrect` when a copy is installed but out of range). The depender is the last `>` hop.
+  {
+    re: /warning\s+"([^"]*)"\s+has\s+(?:unmet|incorrect)\s+peer dependency\s+"([^"]+)"/i,
+    map: (m) => {
+      const peer = parsePackageSpec(m[2]!);
+      return {
+        depender: m[1]!.split('>').pop()!.trim() || 'unknown',
+        dependency: peer.name,
+        requiredRange: peer.version ?? '*',
+      };
+    },
+  },
+  // yarn berry YN0060: `react is listed by your project with version 17.0.2 (p1a2b3), which
+  // doesn't satisfy what @testing-library/react requests (^18.0.0).`
+  {
+    re: /YN0060:.*?((?:@[^/\s]+\/)?[^\s@]+) is listed by your project with version (\S+?)(?: \([^)]*\))?, which doesn't satisfy what ((?:@[^/\s]+\/)?[^\s@]+)(?: and (?:\d+ )?other dependenc(?:y|ies))? requests? \(([^)]+)\)/i,
+    map: (m) => ({
+      depender: m[3]!,
+      dependency: m[1]!,
+      requiredRange: m[4]!,
+      installedVersion: m[2]!,
+    }),
+  },
+  // yarn berry YN0002: `my-app@workspace:. doesn't provide react (p4c5d6), requested by
+  // @testing-library/react.` — no range is printed.
+  {
+    re: /YN0002:.*? doesn't provide ((?:@[^/\s]+\/)?[^\s@]+)(?: \([^)]*\))?, requested by (\S+?)\.?$/i,
+    map: (m) => ({
+      depender: m[2]!,
+      dependency: m[1]!,
+      requiredRange: '*',
+    }),
+  },
+  // yarn berry YN0086: summary pointer for peer issues it doesn't list individually.
+  {
+    re: /YN0086:/,
+    map: () => ({
+      depender: 'unknown',
+      dependency: 'unknown',
+      requiredRange: '*',
+    }),
+  },
+  // bun: `warn: incorrect peer dependency "react@17.0.2"` — only the installed copy is printed.
+  {
+    re: /warn: incorrect peer dependency "([^"]+)"/i,
+    map: (m) => {
+      const p = parsePackageSpec(m[1]!);
+      if (!p.version) {
+        return null;
+      }
+      return {
+        depender: 'unknown',
+        dependency: p.name,
+        requiredRange: '*',
+        installedVersion: p.version,
+      };
+    },
   },
   // npm peer missing
   {
@@ -206,17 +266,86 @@ function shouldSkipDep(name: string, skip?: Set<string>): boolean {
   return skip.has(name);
 }
 
+/** SGR color codes (pnpm / yarn colorize under FORCE_COLOR); they split tokens the patterns need. */
+const ANSI_SGR = /\u001b\[[0-9;]*m/g;
+
+/** pnpm peer-issue tree parent row (archy): `├─┬ @testing-library/react 16.0.0`. */
+const PNPM_TREE_PARENT = /[├└]─┬ (\S+) (\S+)\s*$/;
+
 /**
- * Split npm output into lines and apply regex extractors.
+ * pnpm 8+ peer-issue rows: `└── ✕ unmet peer react@"^18.0.0": found 17.0.2` and
+ * `├── ✕ missing peer react-dom@^18.0.0` (range quoted only when it has spaces or is `*`).
+ */
+const PNPM_PEER_ISSUE =
+  /(?:[├└]── )?✕ (unmet|missing) peer ((?:@[^/\s]+\/)?[^\s@]+)@(?:"([^"]+)"|(\S+?))(?:: found (\S+)(?: in \S+)?)?\s*$/;
+
+/**
+ * One line of a pnpm peer-issue tree. An issue's depender is its enclosing `┬ <name> <version>`
+ * node: archy puts a child's `├──` / `└──` in the same column as the parent's `┬`, so `parents`
+ * is keyed by that column. Returns `null` for parent rows, the conflict for issue rows, and
+ * `undefined` for anything else.
+ */
+function parsePnpmTreeLine(
+  line: string,
+  parents: Map<number, string>,
+): Omit<Conflict, 'rawMessage'> | null | undefined {
+  const parent = PNPM_TREE_PARENT.exec(line);
+  if (parent) {
+    const col = parent.index + 2;
+    for (const c of [...parents.keys()]) {
+      if (c >= col) {
+        parents.delete(c);
+      }
+    }
+    parents.set(col, `${parent[1]!}@${parent[2]!}`);
+    return null;
+  }
+  const issue = PNPM_PEER_ISSUE.exec(line);
+  if (!issue) {
+    if (!/[│├└]/.test(line)) {
+      parents.clear();
+    }
+    return undefined;
+  }
+  let depender = 'unknown';
+  if (line[issue.index] === '├' || line[issue.index] === '└') {
+    let best = -1;
+    for (const c of parents.keys()) {
+      if (c <= issue.index && c > best) {
+        best = c;
+      }
+    }
+    depender = parents.get(best) ?? 'unknown';
+  }
+  return {
+    depender,
+    dependency: issue[2]!,
+    requiredRange: issue[3] ?? issue[4]!,
+    ...(issue[1] === 'unmet' && issue[5] ? { installedVersion: issue[5] } : {}),
+  };
+}
+
+/**
+ * Split install output (npm, plus pnpm / yarn / bun peer diagnostics) into lines and apply
+ * regex extractors.
  */
 export function parseConflictsFromNpmOutput(output: string, options?: ParseConflictsOptions): Conflict[] {
   const skip = options?.skipDependencyNames;
-  const lines = (output || '').split(/\r?\n/);
+  const lines = (output || '').replace(ANSI_SGR, '').split(/\r?\n/);
   const out: Conflict[] = [];
+  const pnpmParents = new Map<number, string>();
 
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) {
+      pnpmParents.clear();
+      continue;
+    }
+    const pnpmIssue = parsePnpmTreeLine(line, pnpmParents);
+    if (pnpmIssue !== undefined) {
+      if (pnpmIssue && !shouldSkipDep(pnpmIssue.dependency, skip)) {
+        pushUnique(out, { ...pnpmIssue, rawMessage: trimmed });
+      }
       continue;
     }
     for (const { re, map } of LINE_PATTERNS) {
@@ -278,7 +407,12 @@ export function parseEresolveFallback(output: string): Conflict[] {
   if (out.length > 0) {
     return out;
   }
+  // pnpm strict mode: its issue tree (parsed line by line) is the structured part; the marker
+  // only stands in when the log was cut before the tree.
+  const pnpmStrictWithoutTree =
+    /ERR_PNPM_PEER_DEP_ISSUES/.test(t) && !/✕ (?:unmet|missing) peer/.test(t);
   if (
+    !pnpmStrictWithoutTree &&
     !/ERESOLVE|unable to resolve dependency tree|overriding peer dependency/i.test(t)
   ) {
     return [];
@@ -288,7 +422,9 @@ export function parseEresolveFallback(output: string): Conflict[] {
       depender: 'unknown',
       dependency: 'unknown',
       requiredRange: '*',
-      rawMessage: t.split(/\r?\n/).find((l) => /ERESOLVE|unable to resolve|overriding peer/i.test(l)) ?? 'ERESOLVE',
+      rawMessage:
+        t.split(/\r?\n/).find((l) => /ERESOLVE|unable to resolve|overriding peer|ERR_PNPM_PEER_DEP_ISSUES/i.test(l)) ??
+        'ERESOLVE',
     },
   ];
 }

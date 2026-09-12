@@ -17,7 +17,8 @@ function runFixture(relDir, extraArgs = []) {
   if (!existsSync(path.join(cwd, 'package.json'))) {
     throw new Error(`Missing fixture: ${cwd}`);
   }
-  const r = spawnSync(process.execPath, [cli, '--dry-run', '--json', ...extraArgs], {
+  // --no-persist-report: otherwise every test run rewrites .dep-up-surgeon.last-run.json in each fixture.
+  const r = spawnSync(process.execPath, [cli, '--dry-run', '--json', '--no-persist-report', ...extraArgs], {
     cwd,
     encoding: 'utf8',
     maxBuffer: 20 * 1024 * 1024,
@@ -41,7 +42,7 @@ test('CLI binary exists', () => {
 
 test('--cwd runs a fixture from the repo root without cd', () => {
   const fixture = path.join(root, 'test/fixtures', '01-minimal-single');
-  const r = spawnSync(process.execPath, [cli, '--dry-run', '--json', '--cwd', fixture], {
+  const r = spawnSync(process.execPath, [cli, '--dry-run', '--json', '--no-persist-report', '--cwd', fixture], {
     cwd: root,
     encoding: 'utf8',
     maxBuffer: 20 * 1024 * 1024,

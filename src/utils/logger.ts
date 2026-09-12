@@ -1,27 +1,49 @@
 import chalk from 'chalk';
 
+/**
+ * `--json` routes every human-facing line to stderr so stdout carries nothing but the JSON
+ * report — a stray warning printed before it would break `JSON.parse` for consumers.
+ */
+let useStderr = false;
+
+export function setLogToStderr(enabled: boolean): void {
+  useStderr = enabled;
+}
+
+function stream(): NodeJS.WriteStream {
+  return useStderr ? process.stderr : process.stdout;
+}
+
+function emit(...parts: unknown[]): void {
+  if (useStderr) {
+    console.error(...parts);
+  } else {
+    console.log(...parts);
+  }
+}
+
 /** Human-facing log helpers (skip when --json). */
 export const log = {
   info(msg: string): void {
-    console.log(msg);
+    emit(msg);
   },
   dim(msg: string): void {
-    console.log(chalk.dim(msg));
+    emit(chalk.dim(msg));
   },
   success(msg: string): void {
-    console.log(chalk.green('✔'), msg);
+    emit(chalk.green('✔'), msg);
   },
   warn(msg: string): void {
-    console.log(chalk.yellow('⚠'), msg);
+    emit(chalk.yellow('⚠'), msg);
   },
   error(msg: string): void {
-    console.log(chalk.red('✖'), msg);
+    emit(chalk.red('✖'), msg);
   },
   peer(msg: string): void {
-    console.log(chalk.magenta('⚠ peer conflict:'), msg);
+    emit(chalk.magenta('⚠ peer conflict:'), msg);
   },
   title(msg: string): void {
-    console.log(chalk.bold.cyan(`\n${msg}\n`));
+    emit(chalk.bold.cyan(`\n${msg}\n`));
   },
 };
 
@@ -55,7 +77,7 @@ const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', 
 const SPINNER_INTERVAL_MS = 220;
 
 function defaultEnabled(): boolean {
-  return Boolean(process.stdout.isTTY);
+  return Boolean(stream().isTTY);
 }
 
 function formatElapsed(startedAt: number): string {
@@ -84,11 +106,11 @@ export function createSpinner(initial: string, options?: { enabled?: boolean }):
     const frame = SPINNER_FRAMES[frameIdx]!;
     frameIdx = (frameIdx + 1) % SPINNER_FRAMES.length;
     const line = `${chalk.cyan(frame)} ${currentText}${chalk.dim(formatElapsed(startedAt))}`;
-    process.stdout.write(`\r\x1b[2K${line}`);
+    stream().write(`\r\x1b[2K${line}`);
   };
 
   const clearLine = (): void => {
-    process.stdout.write('\r\x1b[2K');
+    stream().write('\r\x1b[2K');
   };
 
   if (enabled) {
@@ -96,7 +118,7 @@ export function createSpinner(initial: string, options?: { enabled?: boolean }):
     interval = setInterval(writeFrame, SPINNER_INTERVAL_MS);
     interval.unref?.();
   } else {
-    console.log(chalk.dim('›'), initial);
+    emit(chalk.dim('›'), initial);
   }
 
   const stopAnimation = (): void => {
@@ -111,7 +133,7 @@ export function createSpinner(initial: string, options?: { enabled?: boolean }):
 
   const finalLine = (glyph: string, text: string): void => {
     const elapsed = formatElapsed(startedAt);
-    console.log(`${glyph} ${text}${chalk.dim(elapsed)}`);
+    emit(`${glyph} ${text}${chalk.dim(elapsed)}`);
   };
 
   return {
@@ -121,7 +143,7 @@ export function createSpinner(initial: string, options?: { enabled?: boolean }):
       if (enabled) {
         writeFrame();
       } else {
-        console.log(chalk.dim('›'), text);
+        emit(chalk.dim('›'), text);
       }
     },
     succeed(text?: string): void {
@@ -147,7 +169,7 @@ export function createSpinner(initial: string, options?: { enabled?: boolean }):
       settled = true;
       stopAnimation();
       if (note) {
-        console.log(chalk.dim('·'), note);
+        emit(chalk.dim('·'), note);
       }
     },
   };

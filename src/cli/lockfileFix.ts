@@ -32,6 +32,7 @@
 import path from 'node:path';
 import fs from 'fs-extra';
 import semver from 'semver';
+import YAML from 'yaml';
 import { execa } from 'execa';
 import { log } from '../utils/logger.js';
 import type { PackageManager } from '../core/workspaces.js';
@@ -316,6 +317,117 @@ export function parseLockfileInstalledVersions(
 }
 
 /**
+ * Locked versions of each importer's DIRECT dependencies, keyed by importer dir (`.` = the
+ * lockfile's own directory, otherwise a workspace member's path relative to it). Unlike the
+ * flat map above, nested copies (`node_modules/a/node_modules/debug`) never leak in.
+ */
+export interface LockfileDirectVersions {
+  importers: Map<string, Map<string, string>>;
+  /** npm hoists: a member without its own `<member>/node_modules/<name>` uses the root copy. */
+  hoisted: boolean;
+}
+
+/**
+ * Only npm and pnpm lockfiles record resolutions per importer; yarn / bun (and unparseable
+ * input) return `undefined` so callers fall back to matching the declared range.
+ */
+export function parseLockfileDirectVersions(
+  raw: string,
+  manager: PackageManager,
+): LockfileDirectVersions | undefined {
+  try {
+    if (manager === 'npm') {
+      return parseNpmDirectVersions(raw);
+    }
+    if (manager === 'pnpm') {
+      return parsePnpmDirectVersions(raw);
+    }
+  } catch {
+    /* fall through */
+  }
+  return undefined;
+}
+
+function parseNpmDirectVersions(raw: string): LockfileDirectVersions {
+  const importers = new Map<string, Map<string, string>>();
+  const j = JSON.parse(raw) as {
+    packages?: Record<string, { version?: string }>;
+    dependencies?: Record<string, { version?: string }>;
+  };
+  if (j.packages && typeof j.packages === 'object') {
+    for (const [key, entry] of Object.entries(j.packages)) {
+      if (typeof entry?.version !== 'string') continue;
+      const m = key.match(/^(?:(.+)\/)?node_modules\/((?:@[^/]+\/)?[^/]+)$/);
+      // A `node_modules` segment before the last one means a private copy of some dependency.
+      if (!m || (m[1] && /(?:^|\/)node_modules(?:\/|$)/.test(m[1]))) continue;
+      addDirectVersion(importers, m[1] ?? '.', m[2]!, entry.version);
+    }
+  } else if (j.dependencies && typeof j.dependencies === 'object') {
+    // v1: top-level keys are the hoisted copies the root resolves to.
+    for (const [name, d] of Object.entries(j.dependencies)) {
+      if (typeof d?.version === 'string') addDirectVersion(importers, '.', name, d.version);
+    }
+  }
+  return { importers, hoisted: true };
+}
+
+const PNPM_DEP_SECTIONS = ['dependencies', 'devDependencies', 'optionalDependencies'] as const;
+
+function parsePnpmDirectVersions(raw: string): LockfileDirectVersions {
+  const importers = new Map<string, Map<string, string>>();
+  // pnpm 10 may prepend an env lockfile as a separate `---` document.
+  for (const doc of raw.split(/^---[ \t]*$/m)) {
+    // YAML-parse only the importer blocks; `packages:` / `snapshots:` can be megabytes.
+    const picked: string[] = [];
+    let keep = false;
+    for (const line of doc.split(/\r?\n/)) {
+      if (/^[^\s#]/.test(line)) {
+        keep = /^(?:importers|dependencies|devDependencies|optionalDependencies):/.test(line);
+      }
+      if (keep) picked.push(line);
+    }
+    if (picked.length === 0) continue;
+    const parsed = YAML.parse(picked.join('\n')) as Record<string, unknown> | null;
+    if (!parsed || typeof parsed !== 'object') continue;
+    // Single-project v5/v6 lockfiles keep the root importer's sections at the top level.
+    const byImporter =
+      parsed.importers && typeof parsed.importers === 'object'
+        ? (parsed.importers as Record<string, unknown>)
+        : { '.': parsed };
+    for (const [importer, node] of Object.entries(byImporter)) {
+      if (!node || typeof node !== 'object') continue;
+      for (const section of PNPM_DEP_SECTIONS) {
+        const deps = (node as Record<string, unknown>)[section];
+        if (!deps || typeof deps !== 'object') continue;
+        for (const [name, value] of Object.entries(deps as Record<string, unknown>)) {
+          // v6+: `{ specifier, version }`; v5: bare version. Strip peer suffixes
+          // (`18.3.1(react@18.3.1)` / v5 `18.2.0_react@18.2.0`).
+          const version = typeof value === 'string' ? value : (value as { version?: unknown }).version;
+          if (typeof version === 'string') {
+            addDirectVersion(importers, importer, name, version.replace(/[(_].*$/, ''));
+          }
+        }
+      }
+    }
+  }
+  return { importers, hoisted: false };
+}
+
+function addDirectVersion(
+  importers: Map<string, Map<string, string>>,
+  importer: string,
+  name: string,
+  version: string,
+): void {
+  let deps = importers.get(importer);
+  if (!deps) {
+    deps = new Map();
+    importers.set(importer, deps);
+  }
+  deps.set(name, version);
+}
+
+/**
  * npm lockfile parsers handle both v1 (top-level `dependencies`) and v2/v3 (`packages` map
  * keyed by on-disk path). v2 lockfiles carry BOTH fields for backward compatibility with
  * npm@6; we prefer `packages` because it's flatter and reliable.
@@ -384,9 +496,9 @@ function parsePnpmLockfile(raw: string): Map<string, Set<string>> {
 }
 
 /**
- * yarn.lock is a bespoke text format (classic) or YAML-ish (berry). We scrape `version
- * "x.y.z"` lines following a `<spec>:` header — that shape is common across both versions
- * and gives us everything we need without a real parser.
+ * yarn.lock is a bespoke text format (classic) or YAML (berry). We scrape the version line
+ * following a `<spec>:` header — classic writes `version "x.y.z"`, berry `version: x.y.z` —
+ * which gives us everything we need without a real parser.
  */
 function parseYarnLockfile(raw: string): Map<string, Set<string>> {
   const out = new Map<string, Set<string>>();
@@ -397,12 +509,13 @@ function parseYarnLockfile(raw: string): Map<string, Set<string>> {
     //   axios@^1.6.0:
     //   "axios@^1.6.0", "axios@1.7.2":
     //   "@types/node@^20":
+    //   "lodash@npm:^4.17.0, lodash@npm:^4.17.21":   (berry)
     const headerMatch = line.match(/^(?:"[^"]+"|\S[^:]*):\s*$/);
     if (headerMatch && !/^\s/.test(line)) {
       currentNames = parseYarnEntryHeader(line);
       continue;
     }
-    const versionMatch = line.match(/^\s+version\s+"?([^"]+)"?\s*$/);
+    const versionMatch = line.match(/^\s+version:?\s+"?([^"\s]+)"?\s*$/);
     if (versionMatch && currentNames.length > 0) {
       for (const n of currentNames) addVersion(out, n, versionMatch[1]!);
       currentNames = [];
@@ -473,14 +586,12 @@ function parseYarnEntryHeader(header: string): string[] {
   if (cur.trim()) parts.push(cur.trim());
   const names = new Set<string>();
   for (const spec of parts) {
-    // Scoped: @scope/name@range → we want `@scope/name`.
-    if (spec.startsWith('@')) {
-      const at2 = spec.indexOf('@', 1);
-      if (at2 > 0) names.add(spec.slice(0, at2));
-    } else {
-      const at = spec.indexOf('@');
-      if (at > 0) names.add(spec.slice(0, at));
-    }
+    // Scoped: @scope/name@range → we want `@scope/name`. Berry's `__metadata` has no `@`.
+    const at = spec.indexOf('@', spec.startsWith('@') ? 1 : 0);
+    if (at <= 0) continue;
+    // Berry lists local workspaces (`app@workspace:.`, version `0.0.0-use.local`); not installs.
+    if (/^(?:workspace|link|portal):/.test(spec.slice(at + 1))) continue;
+    names.add(spec.slice(0, at));
   }
   return [...names];
 }
@@ -595,7 +706,8 @@ async function scanStaleTransitives(
   const results = await runWithConcurrency(ranked, 8, async (entry) => {
     try {
       const latest = await fetchLatestVersion(entry.name, cache);
-      const highestInstalled = entry.versions.sort(semverCompareSafe).pop()!;
+      const installed = [...entry.versions].sort(semverCompareSafe);
+      const highestInstalled = installed[installed.length - 1]!;
       if (!semver.valid(latest) || !semver.valid(highestInstalled)) return undefined;
       if (semver.gte(highestInstalled, latest)) return undefined;
       const majorDelta = semver.major(latest) - semver.major(highestInstalled);
@@ -604,7 +716,7 @@ async function scanStaleTransitives(
       if (majorDelta === 0 && minorDelta <= 1) return undefined;
       return {
         name: entry.name,
-        installed: entry.versions.sort(semverCompareSafe),
+        installed,
         latest,
         majorBehind: Math.max(0, majorDelta),
         minorBehind: Math.max(0, minorDelta),

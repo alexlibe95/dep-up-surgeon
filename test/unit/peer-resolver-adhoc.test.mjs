@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { tryResolveAdHocPeerConflict } from '../../dist/core/peerResolverAdHoc.js';
+import { extractClassifiedConflicts } from '../../dist/core/conflictAnalyzer.js';
 
 /**
  * The ad-hoc resolver fetches packuments + `latest` through `src/utils/npm.ts`. For tests
@@ -238,4 +239,164 @@ test('tryResolveAdHocPeerConflict: does not silently bump a blocker past its pin
   assert.equal(res.bumps.find((b) => b.name === 'eslint'), undefined);
   // Primary is downgraded to 4.6.0 (the version that peers on ^7 || ^8).
   assert.equal(res.bumps.find((b) => b.isPrimary).to, '4.6.0');
+});
+
+// Real npm 10 ERESOLVE output: the depender is printed as `<name>@<version>`.
+const TYPESCRIPT_6_ERESOLVE = [
+  'npm error code ERESOLVE',
+  'npm error ERESOLVE unable to resolve dependency tree',
+  'npm error',
+  'npm error While resolving: my-app@0.0.0',
+  'npm error Found: typescript@6.0.3',
+  'npm error node_modules/typescript',
+  'npm error   dev typescript@"6.0.3" from the root project',
+  'npm error',
+  'npm error Could not resolve dependency:',
+  'npm error peer typescript@">=5.9 <6.0" from @angular/build@21.2.8',
+  'npm error node_modules/@angular/build',
+  'npm error   dev @angular/build@"^21.2.8" from the root project',
+  'npm error',
+  'npm error Fix the upstream dependency conflict, or retry',
+  'npm error this command with --force or --legacy-peer-deps',
+  'npm error to accept an incorrect (and potentially broken) dependency resolution.',
+].join('\n');
+
+test('tryResolveAdHocPeerConflict: finds a blocker from a versioned npm depender (@scope/name@ver)', async () => {
+  const classified = extractClassifiedConflicts(TYPESCRIPT_6_ERESOLVE, { rootPackageName: 'my-app' });
+  assert.ok(classified.some((c) => c.depender === '@angular/build@21.2.8'));
+  const registryCache = makeCache(
+    { typescript: '6.0.3', '@angular/build': '21.2.8' },
+    {
+      typescript: { '5.9.2': {}, '5.9.3': {}, '6.0.3': {} },
+      '@angular/build': { '21.2.8': { peerDependencies: { typescript: '>=5.9 <6.0' } } },
+    },
+  );
+  const res = await tryResolveAdHocPeerConflict({
+    primary: { name: 'typescript', section: 'devDependencies', currentRange: '~5.9.2' },
+    primaryTarget: '6.0.3',
+    classified,
+    pkg: {
+      name: 'my-app',
+      version: '0.0.0',
+      devDependencies: { '@angular/build': '^21.2.8', typescript: '~5.9.2' },
+    },
+    registryCache,
+  });
+  assert.ok(res, 'ad-hoc resolver should treat @angular/build as the blocker');
+  assert.equal(res.bumps.find((b) => b.isPrimary).to, '5.9.3');
+  assert.equal(res.bumps.find((b) => b.name === '@angular/build'), undefined);
+});
+
+// eslint-plugin-react-hooks@5 needs eslint ^8; the workspace pins eslint ^7.0.0 (7.32.0 published).
+const HOOKS_ERESOLVE = [
+  'npm error code ERESOLVE',
+  'npm error ERESOLVE unable to resolve dependency tree',
+  'npm error',
+  'npm error While resolving: demo@0.0.0',
+  'npm error Found: eslint@7.32.0',
+  'npm error node_modules/eslint',
+  'npm error   dev eslint@"^7.0.0" from the root project',
+  'npm error',
+  'npm error Could not resolve dependency:',
+  'npm error peer eslint@"^8.0.0" from eslint-plugin-react-hooks@5.0.0',
+  'npm error node_modules/eslint-plugin-react-hooks',
+  'npm error   dev eslint-plugin-react-hooks@"5.0.0" from the root project',
+].join('\n');
+
+function hooksInput(pkg, extra = {}) {
+  return {
+    primary: { name: 'eslint-plugin-react-hooks', section: 'devDependencies', currentRange: '^4.0.0' },
+    primaryTarget: '5.0.0',
+    classified: extractClassifiedConflicts(HOOKS_ERESOLVE, { rootPackageName: 'demo' }),
+    pkg,
+    registryCache: makeCache(
+      { 'eslint-plugin-react-hooks': '5.0.0', eslint: '7.32.0' },
+      {
+        'eslint-plugin-react-hooks': {
+          '5.0.0': { peerDependencies: { eslint: '^8.0.0' } },
+          '4.6.0': { peerDependencies: { eslint: '^7.0.0 || ^8.0.0' } },
+        },
+        eslint: { '7.0.0': {}, '7.32.0': {} },
+      },
+    ),
+    ...extra,
+  };
+}
+
+test('tryResolveAdHocPeerConflict: never moves a frozen (ignored / policy / security-only) blocker', async () => {
+  const pkg = {
+    name: 'demo',
+    version: '0.0.0',
+    devDependencies: { 'eslint-plugin-react-hooks': '^4.0.0', eslint: '^7.0.0' },
+  };
+  const res = await tryResolveAdHocPeerConflict(
+    hooksInput(pkg, { isFrozen: (name) => name === 'eslint' }),
+  );
+  assert.equal(res?.bumps.some((b) => b.name === 'eslint') ?? false, false);
+});
+
+test('tryResolveAdHocPeerConflict: peerDependencies-only blockers are left alone unless includePeers', async () => {
+  const pkg = {
+    name: 'demo',
+    version: '0.0.0',
+    devDependencies: { 'eslint-plugin-react-hooks': '^4.0.0' },
+    peerDependencies: { eslint: '^7.0.0' },
+  };
+  const res = await tryResolveAdHocPeerConflict(hooksInput(pkg));
+  assert.equal(res?.bumps.some((b) => b.name === 'eslint') ?? false, false);
+  const allowed = await tryResolveAdHocPeerConflict(hooksInput(pkg, { includePeers: true }));
+  assert.ok(allowed, 'with includePeers the peer-section blocker joins the ad-hoc group');
+  assert.equal(allowed.bumps.find((b) => b.isPrimary).to, '4.6.0');
+});
+
+test('tryResolveAdHocPeerConflict: lockfileVersions replaces declared range floors for external peers', async () => {
+  // Bumping @angular/build 20 → 21 fails on compiler-cli (pinned ^20.3.4). The 20.x line needs
+  // typescript >=5.8; package.json still says ^5.4.0 but 5.9.3 is what's installed.
+  const output = [
+    'npm error code ERESOLVE',
+    'npm error ERESOLVE unable to resolve dependency tree',
+    'npm error',
+    'npm error While resolving: my-app@0.0.0',
+    'npm error Found: @angular/compiler-cli@20.3.4',
+    'npm error node_modules/@angular/compiler-cli',
+    'npm error   dev @angular/compiler-cli@"^20.3.4" from the root project',
+    'npm error',
+    'npm error Could not resolve dependency:',
+    'npm error peer @angular/compiler-cli@"^21.0.0" from @angular/build@21.2.8',
+    'npm error node_modules/@angular/build',
+    'npm error   dev @angular/build@"21.2.8" from the root project',
+  ].join('\n');
+  const input = () => ({
+    primary: { name: '@angular/build', section: 'devDependencies', currentRange: '^20.3.0' },
+    primaryTarget: '21.2.8',
+    classified: extractClassifiedConflicts(output, { rootPackageName: 'my-app' }),
+    pkg: {
+      name: 'my-app',
+      version: '0.0.0',
+      devDependencies: {
+        '@angular/build': '^20.3.0',
+        '@angular/compiler-cli': '^20.3.4',
+        typescript: '^5.4.0',
+      },
+    },
+    registryCache: makeCache(
+      { '@angular/build': '21.2.8', '@angular/compiler-cli': '21.2.8' },
+      {
+        '@angular/build': {
+          '20.3.4': { peerDependencies: { '@angular/compiler-cli': '^20.0.0', typescript: '>=5.8 <6.0' } },
+          '21.2.8': { peerDependencies: { '@angular/compiler-cli': '^21.0.0', typescript: '>=5.9 <6.0' } },
+        },
+        '@angular/compiler-cli': {
+          '20.3.4': { peerDependencies: { typescript: '>=5.8 <6.0' } },
+          '21.2.8': { peerDependencies: { typescript: '>=5.9 <6.0' } },
+        },
+      },
+    ),
+  });
+  const res = await tryResolveAdHocPeerConflict({
+    ...input(),
+    lockfileVersions: new Map([['typescript', new Set(['5.9.3'])]]),
+  });
+  assert.ok(res, 'installed typescript 5.9.3 satisfies the 20.x peer range');
+  assert.equal(res.bumps.find((b) => b.isPrimary).to, '20.3.4');
 });

@@ -96,7 +96,8 @@ export async function runWithConcurrency<T, R>(
 ): Promise<R[]> {
   const n = items.length;
   const results: R[] = new Array(n);
-  const limit = Math.max(1, Math.min(concurrency, n));
+  // A NaN limit would otherwise spawn zero workers and silently return no results.
+  const limit = Math.max(1, Math.min(Number.isFinite(concurrency) ? concurrency : 1, n));
 
   if (limit === 1) {
     for (let i = 0; i < n; i++) {
@@ -106,16 +107,24 @@ export async function runWithConcurrency<T, R>(
   }
 
   let cursor = 0;
+  // Once one item throws, the other workers stop picking up new items: the caller already gets a
+  // rejection, so starting more installs would only mutate the project behind its back.
+  let failed = false;
   const workers: Promise<void>[] = [];
   for (let w = 0; w < limit; w++) {
     workers.push(
       (async () => {
-        while (true) {
+        while (!failed) {
           const idx = cursor++;
           if (idx >= n) {
             return;
           }
-          results[idx] = await worker(items[idx], idx);
+          try {
+            results[idx] = await worker(items[idx], idx);
+          } catch (e) {
+            failed = true;
+            throw e;
+          }
         }
       })(),
     );

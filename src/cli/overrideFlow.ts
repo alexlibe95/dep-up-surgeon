@@ -15,9 +15,10 @@
  *   - **Sequential by design.** Overrides interact with the lockfile; running two installs
  *     in parallel in the same cwd would clobber each other. We also want the validator to
  *     verify the cumulative state after each pin, so "install after each override" is correct.
- *   - **Rollback on validator failure.** If the install succeeds but the validator fails,
- *     we remove the override we just added AND re-run install, so the working tree is left in
- *     the same shape the user started in. If the rollback install itself fails, we surface
+ *   - **Rollback on validator failure.** If the install succeeds but the validator fails, we
+ *     put back the exact bytes of every file the write could touch (package.json, plus
+ *     pnpm-workspace.yaml for pnpm) AND re-run install, so a pin the user already had is
+ *     restored rather than deleted. If the rollback install itself fails, we surface
  *     that in the record too and keep going — one broken pin shouldn't strand every other one.
  *   - Never fatal. The returned `OverrideFlowResult` lists every attempt so the JSON consumer
  *     (and the summary writer) can render exactly what happened.
@@ -32,7 +33,6 @@ import { log } from '../utils/logger.js';
 import {
   applyOverrideToFile,
   overrideFieldFor,
-  removeOverrideFromFile,
   type OverrideField,
   type OverrideEntry,
 } from '../utils/overrides.js';
@@ -196,6 +196,7 @@ export async function runOverrideFlow(opts: OverrideFlowOptions): Promise<Overri
       opts,
       pkgJson,
       `--apply-overrides`,
+      adv.vulnerableRange,
     );
     attempts.push(rec);
   }
@@ -245,6 +246,7 @@ async function processPin(
   opts: OverrideFlowOptions,
   pkgJson: string,
   logTag: string,
+  vulnerableRange?: string,
 ): Promise<void> {
   const label =
     entry.parentChain && entry.parentChain.length > 0
@@ -258,11 +260,20 @@ async function processPin(
     return;
   }
 
+  // Snapshot before writing so a rollback restores exactly what the user had (their own pin,
+  // their formatting) instead of deleting the entry.
+  const touched =
+    opts.manager === 'pnpm'
+      ? [pkgJson, path.join(path.dirname(pkgJson), 'pnpm-workspace.yaml')]
+      : [pkgJson];
+  const snapshot = await snapshotFiles(touched);
+
   const applied = await applyOverrideToFile({
     packageJsonPath: pkgJson,
     manager: opts.manager,
     entry,
     ...(opts.overwriteConflicts ? { overwriteConflicts: true } : {}),
+    ...(vulnerableRange ? { vulnerableRange } : {}),
   });
   if (!applied.ok) {
     rec.skipped = true;
@@ -290,7 +301,7 @@ async function processPin(
   const install = await installer(opts.cwd, opts.manager, {});
   if (!install.ok) {
     rec.installLog = tailOutput(install);
-    const rb = await rollback(pkgJson, opts, entry);
+    const rb = await rollback(snapshot, opts, label);
     rec.rolledBack = rb.rolledBack;
     rec.reason = `install failed after override (exit ${install.exitCode})`;
     return;
@@ -300,7 +311,7 @@ async function processPin(
     const v = await opts.runValidator();
     if (!v.ok) {
       if (v.message) rec.installLog = v.message;
-      const rb = await rollback(pkgJson, opts, entry);
+      const rb = await rollback(snapshot, opts, label);
       rec.rolledBack = rb.rolledBack;
       rec.reason = `validator failed after override: ${v.message ?? 'non-zero exit'}`;
       return;
@@ -313,29 +324,57 @@ async function processPin(
   }
 }
 
+interface FileSnapshot {
+  file: string;
+  /** Original bytes; absent when the file didn't exist (nothing to restore). */
+  bytes?: Buffer;
+}
+
+async function snapshotFiles(files: string[]): Promise<FileSnapshot[]> {
+  return Promise.all(
+    files.map(async (file): Promise<FileSnapshot> => {
+      try {
+        return { file, bytes: await fs.readFile(file) };
+      } catch {
+        return { file };
+      }
+    }),
+  );
+}
+
 /**
- * Remove the override we just added and re-run install so the workspace ends up in the same
- * state the user had at the start of the attempt. The entry's parent chain (if any) is
- * threaded through to `removeOverrideFromFile` so we delete the EXACT slot we wrote and
- * never touch an adjacent flat pin or sibling. Install failures during rollback are logged
- * but don't crash the flow — the next override attempt will run whatever state we're in.
+ * Put back the exact bytes of every file the pin write could have touched, then re-run install
+ * so the workspace ends up in the state the user had before the attempt. Restoring bytes rather
+ * than deleting the entry we wrote keeps a pre-existing pin and the file's formatting intact.
+ * Install failures during rollback are logged but don't crash the flow — the next override
+ * attempt will run whatever state we're in.
  */
 async function rollback(
-  pkgJson: string,
+  snapshot: FileSnapshot[],
   opts: OverrideFlowOptions,
-  entry: OverrideEntry,
+  label: string,
 ): Promise<{ rolledBack: boolean; reinstallOk: boolean }> {
-  const chain = [...(entry.parentChain ?? []), entry.name];
-  const label = chain.join('>');
-  const removed = await removeOverrideFromFile(pkgJson, opts.manager, { chain });
-  if (!removed.ok || !removed.removed) {
-    return { rolledBack: false, reinstallOk: false };
+  for (const { file, bytes } of snapshot) {
+    if (!bytes) continue;
+    try {
+      const current = await fs.readFile(file).catch(() => undefined);
+      if (!current?.equals(bytes)) {
+        await fs.writeFile(file, bytes);
+      }
+    } catch (e) {
+      if (!opts.json) {
+        log.warn(
+          `rollback: could not restore ${path.basename(file)} for ${label}: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+      return { rolledBack: false, reinstallOk: false };
+    }
   }
   const installer = opts.installer ?? runInstall;
   const reinstall = await installer(opts.cwd, opts.manager, {});
   if (!reinstall.ok && !opts.json) {
     log.warn(
-      `rollback: re-install after removing override for ${label} exited ${reinstall.exitCode}; workspace may need manual cleanup.`,
+      `rollback: re-install after restoring the pre-override state for ${label} exited ${reinstall.exitCode}; workspace may need manual cleanup.`,
     );
   }
   return { rolledBack: true, reinstallOk: reinstall.ok };

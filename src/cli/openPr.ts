@@ -136,6 +136,30 @@ export function defaultPrBody(report: FinalReport): string {
   return lines.join('\n');
 }
 
+/** GitHub rejects PR bodies over 65,536 characters; leave headroom for the truncation note. */
+export const MAX_PR_BODY_CHARS = 60_000;
+
+/**
+ * Trim an oversized PR body (release notes for dozens of packages add up fast) instead of letting
+ * `gh pr create` fail. Cuts at a line boundary and closes any code fence / <details> left open.
+ */
+export function truncatePrBody(body: string, max = MAX_PR_BODY_CHARS): string {
+  if (body.length <= max) {
+    return body;
+  }
+  const cut = body.lastIndexOf('\n', max);
+  let head = body.slice(0, cut > 0 ? cut : max);
+  if ((head.match(/^```/gm)?.length ?? 0) % 2 === 1) {
+    head += '\n```';
+  }
+  const openDetails =
+    (head.match(/<details>/g)?.length ?? 0) - (head.match(/<\/details>/g)?.length ?? 0);
+  for (let i = 0; i < openDetails; i++) {
+    head += '\n\n</details>';
+  }
+  return `${head}\n\n_…truncated: the full report exceeds GitHub's PR description limit. See the job summary or \`.dep-up-surgeon.last-run.json\` for the rest._\n`;
+}
+
 /**
  * Best-effort `which`. Intentionally lightweight — we only need it to decide between
  * "CLI present → try it" and "CLI missing → bail out with a friendly hint".
@@ -189,8 +213,19 @@ export async function openPullRequest(
     };
   }
 
-  // Confirm auth before we push; `gh auth status` exits non-zero when not logged in.
-  const authCheck = await exec('gh', ['auth', 'status', '-h', 'github.com'], {
+  // Confirm auth before we push; `gh auth status` exits non-zero when not logged in. Ask about
+  // the remote's own host so GitHub Enterprise works; `GH_HOST` wins, as it does inside gh.
+  const remoteUrl = await exec('git', ['remote', 'get-url', remote], {
+    cwd: config.cwd,
+    reject: false,
+  });
+  const remoteHost =
+    remoteUrl.exitCode === 0
+      ? // https://host/o/r.git · git@host:o/r.git · ssh://git@host:2222/o/r
+        /^(?:[a-z][a-z0-9+.-]*:\/\/)?(?:[^@/]+@)?([^/:]+)[:/]/i.exec(remoteUrl.stdout.trim())?.[1]
+      : undefined;
+  const host = process.env.GH_HOST?.trim() || remoteHost || 'github.com';
+  const authCheck = await exec('gh', ['auth', 'status', '-h', host], {
     cwd: config.cwd,
     reject: false,
   });
@@ -255,10 +290,11 @@ export async function openPullRequest(
   }
 
   // Check for an existing PR for this branch — `gh pr create` also does, but we want to
-  // distinguish reuse in the structured report.
+  // distinguish reuse in the structured report. `gh pr view <branch>` also matches MERGED /
+  // CLOSED PRs (e.g. last week's run on the same branch name), so only an OPEN one is reused.
   const existing = await exec(
     'gh',
-    ['pr', 'view', branch, '--json', 'url,number,isDraft', '--jq', '.'],
+    ['pr', 'view', branch, '--json', 'url,number,isDraft,state', '--jq', '.'],
     { cwd: config.cwd, reject: false },
   );
   if (existing.exitCode === 0 && existing.stdout.trim()) {
@@ -267,18 +303,21 @@ export async function openPullRequest(
         url?: unknown;
         number?: unknown;
         isDraft?: unknown;
+        state?: unknown;
       };
-      return {
-        ok: true,
-        provider: 'github',
-        branch,
-        repo: repoSlug,
-        base: baseBranch,
-        url: typeof parsed.url === 'string' ? parsed.url : undefined,
-        number: typeof parsed.number === 'number' ? parsed.number : undefined,
-        draft: typeof parsed.isDraft === 'boolean' ? parsed.isDraft : config.draft,
-        reused: true,
-      };
+      if (parsed.state === 'OPEN') {
+        return {
+          ok: true,
+          provider: 'github',
+          branch,
+          repo: repoSlug,
+          base: baseBranch,
+          url: typeof parsed.url === 'string' ? parsed.url : undefined,
+          number: typeof parsed.number === 'number' ? parsed.number : undefined,
+          draft: typeof parsed.isDraft === 'boolean' ? parsed.isDraft : config.draft,
+          reused: true,
+        };
+      }
     } catch {
       // fall through to create
     }
@@ -287,7 +326,7 @@ export async function openPullRequest(
   // Create the PR. `--body-file -` lets us stream the summary via stdin, avoiding argv/quoting
   // hell (summaries can be several KB of markdown with backticks, emoji, and newlines).
   const title = config.title ?? defaultPrTitle(report);
-  const body = config.body ?? defaultPrBody(report);
+  const body = truncatePrBody(config.body ?? defaultPrBody(report));
   const args = ['pr', 'create', '--title', title, '--head', branch, '--body-file', '-'];
   if (baseBranch) {
     args.push('--base', baseBranch);

@@ -41,16 +41,18 @@ test('installCommand: npm with filter → `npm install --workspace <name>` and f
   assert.strictEqual(r.filtered, true);
 });
 
-test('installCommand: pnpm with filter → `pnpm install --filter <name>`', () => {
+// pnpm defaults to --frozen-lockfile when `CI` is set; every install we run follows a package.json
+// edit, so the flag is always turned off explicitly.
+test('installCommand: pnpm with filter → `pnpm install --filter <name> --no-frozen-lockfile`', () => {
   const r = installCommand('pnpm', { filter: '@org/api' });
   assert.strictEqual(r.bin, 'pnpm');
-  assert.deepStrictEqual(r.args, ['install', '--filter', '@org/api']);
+  assert.deepStrictEqual(r.args, ['install', '--filter', '@org/api', '--no-frozen-lockfile']);
   assert.strictEqual(r.filtered, true);
 });
 
-test('installCommand: pnpm without filter → `pnpm install` (filtered=false)', () => {
+test('installCommand: pnpm without filter → `pnpm install --no-frozen-lockfile` (filtered=false)', () => {
   const r = installCommand('pnpm');
-  assert.deepStrictEqual(r.args, ['install']);
+  assert.deepStrictEqual(r.args, ['install', '--no-frozen-lockfile']);
   assert.strictEqual(r.filtered, false);
 });
 
@@ -102,7 +104,7 @@ test('installCommand: yarnSupportsFocus is ignored for non-yarn managers', () =>
   assert.deepStrictEqual(npm.args, ['install', '--workspace', '@org/web']);
 
   const pnpm = installCommand('pnpm', { filter: '@org/web', yarnSupportsFocus: true });
-  assert.deepStrictEqual(pnpm.args, ['install', '--filter', '@org/web']);
+  assert.deepStrictEqual(pnpm.args, ['install', '--filter', '@org/web', '--no-frozen-lockfile']);
 });
 
 // ---------------------------------------------------------------------------

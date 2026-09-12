@@ -2,8 +2,12 @@
  * When the same package name appears in multiple package.json sections (e.g. both
  * `dependencies` and `peerDependencies`), pick one row for upgrade planning.
  *
- * Preference order (runtime deps win over contracts / tooling):
- *   dependencies > optionalDependencies > peerDependencies > devDependencies
+ * Preference order (installed copies win over the peer contract):
+ *   dependencies > optionalDependencies > devDependencies > peerDependencies
+ *
+ * Peers rank last because they're skipped by default: the standard library layout declares the
+ * same name in `devDependencies` (the copy it builds against) and `peerDependencies` (the range it
+ * supports), and letting the peer row win meant the dev copy was never upgraded.
  *
  * Callers that want to upgrade every section must iterate the full scan instead.
  */
@@ -12,8 +16,8 @@ import type { DepSection, ScannedPackage } from '../types.js';
 const SECTION_RANK: Record<DepSection, number> = {
   dependencies: 0,
   optionalDependencies: 1,
-  peerDependencies: 2,
-  devDependencies: 3,
+  devDependencies: 2,
+  peerDependencies: 3,
 };
 
 export function preferSection(a: DepSection, b: DepSection): DepSection {

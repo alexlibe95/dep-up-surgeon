@@ -121,11 +121,27 @@ export interface BuildDependencyGraphOptions {
 }
 
 /**
+ * DefinitelyTyped package for `name`: `react` → `@types/react`, `@babel/core` →
+ * `@types/babel__core`. `undefined` for `@types/*` itself and for `node` (`@types/node` types
+ * the runtime, not the npm package literally named `node`).
+ */
+function typesPackageFor(name: string): string | undefined {
+  if (name.startsWith('@types/') || name === 'node') {
+    return undefined;
+  }
+  if (name.startsWith('@')) {
+    const [scope, bare] = name.slice(1).split('/');
+    return scope && bare ? `@types/${scope}__${bare}` : undefined;
+  }
+  return `@types/${name}`;
+}
+
+/**
  * Build an undirected graph: project packages are nodes; edges come only from published
- * **peerDependencies** (the signal that versions must align), not from runtime
- * `dependencies` / `optionalDependencies` (those create hub edges through `typescript`,
- * `eslint`, etc. and collapse unrelated tools into one giant batch). Also
- * `@types/<name>` ↔ `<name>` when both exist.
+ * **required peerDependencies** (the signal that versions must align), not from runtime
+ * `dependencies` / `optionalDependencies` or optional peers (those create hub edges through
+ * `typescript`, `vite`, etc. and collapse unrelated tools into one giant batch). Also
+ * `@types/<name>` ↔ `<name>` (`@types/<scope>__<name>` for scoped packages) when both exist.
  */
 export async function buildDependencyGraph(
   pkg: PackageJson,
@@ -152,13 +168,17 @@ export async function buildDependencyGraph(
       }
     };
     for (const k of Object.keys(m.peerDependencies ?? {})) {
+      // Optional peers aren't an alignment signal (vitest and vite each list a dozen).
+      if (m.peerDependenciesMeta?.[k]?.optional === true) {
+        continue;
+      }
       link(k, 'registry-peer');
     }
   }
 
   for (const n of registryNames) {
-    const typed = `@types/${n}`;
-    if (registrySet.has(typed)) {
+    const typed = typesPackageFor(n);
+    if (typed && registrySet.has(typed)) {
       addUndirectedEdge(edges, edgeKeys, n, typed, 'types-pair');
     }
   }

@@ -5,7 +5,10 @@ import type { DepSection, ScannedPackage } from '../types.js';
 import type { PackageJson } from '../types.js';
 
 const NON_REGISTRY =
-  /^(workspace:|link:|file:|git\+|git:|http:|https:|portal:|patch:|npm:)/i;
+  /^(workspace:|link:|file:|git\+|git:|http:|https:|portal:|patch:|npm:|github:|gitlab:|bitbucket:|gist:|ssh:|git@|jsr:|exec:|ftp:)/i;
+
+/** Local directories and tarballs: `./vendor/x`, `../lib-1.2.3.tgz`, `~/pkg`, `/abs`, `C:\pkg`. */
+const LOCAL_PATH = /^(\.{1,2}[\\/]|~[\\/]|\/|[A-Za-z]:[\\/])|\.(tgz|tar\.gz|tar)$/i;
 
 /**
  * npm dist-tag: a single identifier, not a protocol and not a path.
@@ -24,13 +27,18 @@ export function isDistTag(range: string): boolean {
  */
 export function isRegistryRange(range: string): boolean {
   const t = range.trim();
-  if (!t || NON_REGISTRY.test(t)) {
+  if (!t || NON_REGISTRY.test(t) || LOCAL_PATH.test(t)) {
     return false;
   }
   if (/^catalog:/i.test(t)) {
     return true;
   }
-  return semver.validRange(t) != null || semver.coerce(t) != null || isDistTag(t);
+  // No `semver.coerce` fallback: it finds digits in anything, so GitHub shorthands like
+  // `me/lib#v1.2.3` counted as ranges and got rewritten to whatever npm publishes under that name.
+  if (t.includes('/') || t.includes('#')) {
+    return false;
+  }
+  return semver.validRange(t) != null || isDistTag(t);
 }
 
 /**

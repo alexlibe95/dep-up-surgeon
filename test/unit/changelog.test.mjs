@@ -348,6 +348,135 @@ test('fetchChangelog: tries scoped monorepo tag form first for @scope/pkg', asyn
 });
 
 // ---------------------------------------------------------------------------
+// GitHub quota / download size guards (global fetch stubbed — no network)
+// ---------------------------------------------------------------------------
+
+async function withStubbedFetch(handler, fn) {
+  const realFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push(String(url));
+    return handler(String(url), init);
+  };
+  try {
+    return await fn(calls);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+const noTarball = { extractChangelog: async () => undefined };
+
+test('fetchChangelog: a GitHub 403 rate limit stops GitHub calls for the rest of the run', async () => {
+  const rateLimited = () =>
+    new Response(
+      JSON.stringify({
+        message: 'API rate limit exceeded for 203.0.113.7. (But here\'s the good news: Authenticated requests get a higher rate limit.)',
+        documentation_url: 'https://docs.github.com/rest/overview/resources-in-the-rest-api#rate-limiting',
+      }),
+      {
+        status: 403,
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+          'x-ratelimit-limit': '60',
+          'x-ratelimit-remaining': '0',
+          'x-ratelimit-reset': '1726150000',
+        },
+      },
+    );
+  await withStubbedFetch(rateLimited, async (calls) => {
+    const cache = createChangelogCache();
+    const fetchers = { ...noTarball, getManifest: async () => ({ repository: 'git+https://github.com/o/r.git' }) };
+    for (const name of ['pkg-a', 'pkg-b', 'pkg-c']) {
+      const excerpt = await fetchChangelog({ packageName: name, toVersion: '1.0.0', cache, fetchers, githubToken: '' });
+      assert.strictEqual(excerpt, undefined);
+    }
+    assert.strictEqual(calls.length, 1, `expected one GitHub call, got:\n${calls.join('\n')}`);
+  });
+});
+
+test('fetchChangelog: one releases-list request per package, tag matched locally', async () => {
+  const releases = [
+    { tag_name: 'v1.8.0', name: 'v1.8.0', body: '## What\'s Changed\n- newer', html_url: 'https://github.com/axios/axios/releases/tag/v1.8.0' },
+    { tag_name: 'v1.7.2', name: 'v1.7.2', body: '### Bug Fixes\n- fetch: fix a thing', html_url: 'https://github.com/axios/axios/releases/tag/v1.7.2' },
+  ];
+  const handler = (url) =>
+    /\/repos\/axios\/axios\/releases\?per_page=100$/.test(url)
+      ? new Response(JSON.stringify(releases), { status: 200, headers: { 'x-ratelimit-remaining': '42' } })
+      : new Response('{"message":"Not Found"}', { status: 404 });
+  await withStubbedFetch(handler, async (calls) => {
+    const excerpt = await fetchChangelog({
+      packageName: 'axios',
+      toVersion: '1.7.2',
+      githubToken: '',
+      fetchers: { ...noTarball, getManifest: async () => ({ repository: { type: 'git', url: 'git+https://github.com/axios/axios.git' } }) },
+    });
+    assert.ok(excerpt);
+    assert.strictEqual(excerpt.source, 'github-release');
+    assert.match(excerpt.body, /fix a thing/);
+    assert.strictEqual(excerpt.url, 'https://github.com/axios/axios/releases/tag/v1.7.2');
+    assert.strictEqual(calls.length, 1, calls.join('\n'));
+  });
+});
+
+test('fetchChangelog: GitHub response bodies are read with a size cap', async () => {
+  const total = 64 * 1024 * 1024;
+  const chunk = new Uint8Array(1024 * 1024).fill(0x61);
+  let pulled = 0;
+  const handler = () =>
+    new Response(
+      new ReadableStream({
+        pull(controller) {
+          if (pulled >= total) return controller.close();
+          pulled += chunk.byteLength;
+          controller.enqueue(chunk);
+        },
+      }),
+      { status: 200 },
+    );
+  await withStubbedFetch(handler, async () => {
+    await fetchChangelog({
+      packageName: 'huge',
+      toVersion: '1.0.0',
+      githubToken: '',
+      fetchers: { ...noTarball, getManifest: async () => ({ repository: 'github:o/huge' }) },
+    });
+  });
+  assert.ok(pulled <= 16 * 1024 * 1024, `read ${pulled} bytes from a 64 MB body`);
+});
+
+test('fetchChangelog: legacy getGithubRelease seam stops probing once it reports a rate limit', async () => {
+  const tagsTried = [];
+  const cache = createChangelogCache();
+  const fetchers = {
+    ...noTarball,
+    getManifest: async () => ({ repository: 'github:o/r' }),
+    getGithubRelease: async (owner, repo, tag) => {
+      tagsTried.push(tag);
+      return { body: '', html_url: '', rateLimited: true };
+    },
+  };
+  await fetchChangelog({ packageName: 'a', toVersion: '1.0.0', cache, fetchers });
+  await fetchChangelog({ packageName: 'b', toVersion: '1.0.0', cache, fetchers });
+  assert.deepStrictEqual(tagsTried, ['v1.0.0']);
+});
+
+test('fetchChangelog: skips tarball extraction when dist.unpackedSize exceeds the cap', async () => {
+  let extracted = 0;
+  const fetchers = {
+    getManifest: async () => ({ dist: { unpackedSize: 136_512_345, fileCount: 7412 } }),
+    getGithubRelease: async () => undefined,
+    extractChangelog: async () => {
+      extracted++;
+      return undefined;
+    },
+  };
+  const excerpt = await fetchChangelog({ packageName: 'next', toVersion: '15.1.0', fetchers });
+  assert.strictEqual(excerpt, undefined);
+  assert.strictEqual(extracted, 0, 'a >20 MB tarball must not be downloaded for a changelog');
+});
+
+// ---------------------------------------------------------------------------
 // formatExcerptForCommit
 // ---------------------------------------------------------------------------
 

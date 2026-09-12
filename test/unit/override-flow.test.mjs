@@ -5,6 +5,8 @@
  *   - Validator failure → rollback wipes the nested pin AND re-runs install.
  *   - Advisory + manual pins coexist in a single run with independent outcomes.
  *   - Idempotent re-run: running the same pin twice does not re-install the second time.
+ *   - Rollback restores the original bytes (pre-existing pins, indentation, pnpm-workspace.yaml).
+ *   - Broad existing pins that can still resolve the vulnerable version are tightened, not skipped.
  *
  * Hermetic: we inject a fake `installer` so no network, no real npm/pnpm/yarn calls. The
  * validator is a deterministic function of package.json state written by the flow, so a
@@ -242,4 +244,108 @@ test('runOverrideFlow: advisory + manual pins coexist with independent outcomes'
   assert.deepEqual(pkg.overrides, { lodash: '4.17.21' }, 'only the accepted pin survives');
   // Installs: 1 for lodash, 1 for bad>pkg (pin attempt), 1 for rollback = 3.
   assert.equal(calls.length, 3);
+});
+
+const QS_ADVISORY = {
+  name: 'qs',
+  severity: 'high',
+  ids: ['GHSA-test'],
+  vulnerableRange: '<6.14.1',
+  recommendedVersion: '6.14.1',
+};
+
+test('runOverrideFlow: rollback restores a pre-existing pin and formatting byte-for-byte', async () => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'ovr-flow-'));
+  const pkgPath = path.join(cwd, 'package.json');
+  const original =
+    JSON.stringify(
+      { name: 'x', dependencies: { express: '^4.17.0' }, overrides: { qs: '6.7.2' } },
+      null,
+      4,
+    ) + '\n';
+  await fs.writeFile(pkgPath, original);
+  const { installer, calls } = makeInstaller();
+
+  const result = await runOverrideFlow({
+    cwd,
+    manager: 'npm',
+    advisories: [QS_ADVISORY],
+    upgradedNames: new Set(),
+    directDepNames: new Set(['express']),
+    installer,
+    runValidator: async () => ({ ok: false, message: 'tests failed' }),
+    json: true,
+  });
+
+  const rec = result.attempts[0];
+  assert.equal(rec.ok, false);
+  assert.equal(rec.previous, '6.7.2');
+  assert.equal(rec.rolledBack, true);
+  assert.equal(await fs.readFile(pkgPath, 'utf8'), original, 'user pin + 4-space indent restored');
+  assert.equal(calls.length, 2, 'install once after pin, once on rollback');
+});
+
+test('runOverrideFlow: broad existing pin that still allows the vulnerable version is tightened', async () => {
+  const cwd = await stageWorkspace({ name: 'x', overrides: { qs: '^6.7.0' } });
+  const { installer, calls } = makeInstaller();
+
+  const result = await runOverrideFlow({
+    cwd,
+    manager: 'npm',
+    advisories: [QS_ADVISORY],
+    upgradedNames: new Set(),
+    directDepNames: new Set(),
+    installer,
+    json: true,
+  });
+
+  const rec = result.attempts[0];
+  assert.equal(rec.skipped, false, '^6.7.0 must not be reported as already fixed');
+  assert.equal(rec.ok, true);
+  assert.equal(rec.previous, '^6.7.0');
+  assert.equal(rec.applied, '6.14.1');
+  assert.equal(calls.length, 1);
+  const pkg = JSON.parse(await fs.readFile(path.join(cwd, 'package.json'), 'utf8'));
+  assert.deepEqual(pkg.overrides, { qs: '6.14.1' });
+});
+
+test('runOverrideFlow (pnpm): pin lands in pnpm-workspace.yaml and rollback restores both files', async () => {
+  const cwd = await stageWorkspace({ name: 'x', private: true });
+  const pkgPath = path.join(cwd, 'package.json');
+  const yamlPath = path.join(cwd, 'pnpm-workspace.yaml');
+  const yaml = [
+    'packages:',
+    '  - packages/*',
+    '',
+    '# transitive security pins',
+    'overrides:',
+    '  qs: 6.7.2 # awaiting express bump',
+    '',
+  ].join('\n');
+  await fs.writeFile(yamlPath, yaml);
+  const pkgBefore = await fs.readFile(pkgPath, 'utf8');
+  const { installer } = makeInstaller();
+
+  let yamlDuringValidate = '';
+  const runValidator = async () => {
+    yamlDuringValidate = await fs.readFile(yamlPath, 'utf8');
+    return { ok: false, message: 'build broke' };
+  };
+
+  const result = await runOverrideFlow({
+    cwd,
+    manager: 'pnpm',
+    advisories: [QS_ADVISORY],
+    upgradedNames: new Set(),
+    directDepNames: new Set(),
+    installer,
+    runValidator,
+    json: true,
+  });
+
+  assert.match(yamlDuringValidate, /qs: 6\.14\.1/, 'pin written where the project keeps its overrides');
+  assert.equal(result.attempts[0].previous, '6.7.2');
+  assert.equal(result.attempts[0].rolledBack, true);
+  assert.equal(await fs.readFile(yamlPath, 'utf8'), yaml, 'pnpm-workspace.yaml restored');
+  assert.equal(await fs.readFile(pkgPath, 'utf8'), pkgBefore, 'package.json untouched');
 });

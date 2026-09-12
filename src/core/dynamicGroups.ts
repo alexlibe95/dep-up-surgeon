@@ -11,9 +11,11 @@ import { createManifestCache } from '../utils/registryCache.js';
  * Build linked upgrade groups from **registry metadata only** (no framework lists):
  *
  * 1. Apply **custom** `.dep-up-surgeonrc` `linkedGroups` first.
- * 2. Build a graph from root `package.json` + published **peerDependencies** only (runtime
- *    `dependencies` are not used for clustering — they over-connect via hubs like `typescript`).
- * 3. Link `@types/<name>` ↔ `<name>` when both are direct dependencies.
+ * 2. Build a graph from root `package.json` + published **required peerDependencies** only
+ *    (runtime `dependencies` and optional peers are not used for clustering — they over-connect
+ *    via hubs like `typescript` / `vite`).
+ * 3. Link `@types/<name>` ↔ `<name>` (`@types/<scope>__<name>` for scoped packages) when both
+ *    are direct dependencies.
  * 4. **Connected components** become one batch each; isolated packages stay singletons.
  * 5. Non-registry ranges (workspace/file/git) are always singletons.
  */

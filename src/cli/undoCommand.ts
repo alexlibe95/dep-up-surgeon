@@ -83,13 +83,18 @@ export async function runUndoCommand(argv: string[], version: string): Promise<v
     // Build a validator closure that mirrors the main flow's behavior: if the user passed a
     // command we shell that out; otherwise `validateProject` auto-detects test / build. This
     // keeps `--validate "my-cmd"` working identically across `upgrade`, `doctor`, and `undo`.
-    const runValidator = async () => {
+    // `manager` comes from runUndo: the --package-manager flag, else the recorded run's manager
+    // (a pnpm project must not be validated with `npm test`).
+    const runValidator = async ({
+      manager,
+    }: {
+      manager: import('../core/workspaces.js').PackageManager;
+    }) => {
       if (skipValidator) return { ok: true };
       try {
         const { validateProject } = await import('../core/validator.js');
         const fs = await import('fs-extra');
         const pkg = await fs.default.readJson(path.join(cwd, 'package.json'));
-        const manager = parsedPm === 'auto' ? 'npm' : parsedPm;
         const vr = await validateProject(cwd, pkg, {
           ...(validatorCommand ? { command: validatorCommand, source: 'cli' as const } : {}),
           manager,

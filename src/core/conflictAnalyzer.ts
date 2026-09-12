@@ -27,7 +27,11 @@ export function classifyConflict(c: Conflict): ConflictCategory {
   if (/eresolve|unable to resolve dependency tree|dependency tree.*not.*found/i.test(raw)) {
     return 'unresolvedTree';
   }
-  if (/not installed|missing|unmet peer|none is installed/i.test(raw)) {
+  // pnpm `✕ unmet peer react@^18: found 17.0.2` names an installed copy — a mismatch, not a missing peer.
+  if (c.installedVersion && /unmet peer/i.test(raw)) {
+    return 'peerDependencyMismatch';
+  }
+  if (/not installed|missing|unmet peer|none is installed|doesn't provide/i.test(raw)) {
     return 'missingDependency';
   }
   if (/incorrect peer|conflicting peer|peer dep/i.test(raw)) {
@@ -176,9 +180,24 @@ function npmOverrodePeersButInstallSucceeded(
 type PackageManager = 'npm' | 'yarn' | 'pnpm' | 'bun';
 
 /**
- * After a **successful** `npm install`, roll back if structured conflicts were detected (unless --force),
- * or when the install is truly suspect. npm-only: if the only issue is the usual `ERESOLVE overriding`
- * warning block and exit 0, we **do not** roll back.
+ * Peer warnings pnpm / yarn / bun print on installs that succeed — their counterpart of npm's
+ * `overriding peer dependency` block: pnpm's `✕ unmet|missing peer` tree, yarn classic
+ * `has unmet|incorrect peer dependency`, yarn berry YN0002 / YN0060 / YN0086, bun
+ * `warn: incorrect peer dependency`.
+ */
+const ADVISORY_PEER_WARNING =
+  /✕ (?:unmet|missing) peer |warning ".*" has (?:unmet|incorrect) peer dependency |\bYN00(?:02|60|86):|warn: incorrect peer dependency /i;
+
+/**
+ * After a **successful** install (exit 0), roll back if structured conflicts were detected (unless
+ * --force), or when the install is truly suspect. Rows that never justify undoing an install that
+ * exited 0 are set aside first (they stay in `classified` for the report, and still make a
+ * non-zero exit count as a peer failure):
+ *   - `incompatibleEngine`: npm prints EBADENGINE for *any* package in the tree whose `engines`
+ *     don't match, so one such package would otherwise block every upgrade.
+ *   - pnpm / yarn / bun peer warnings ({@link ADVISORY_PEER_WARNING}), unless pnpm's strict-mode
+ *     `ERR_PNPM_PEER_DEP_ISSUES` appears anyway.
+ * npm-only: if the only issue is the usual `ERESOLVE overriding` warning block, we **do not** roll back.
  */
 export function shouldRollbackAfterSuccessfulInstall(
   fullOutput: string,
@@ -186,7 +205,16 @@ export function shouldRollbackAfterSuccessfulInstall(
   force: boolean,
   manager: PackageManager = 'npm',
 ): boolean {
-  if (force || classified.length === 0) {
+  if (force) {
+    return false;
+  }
+  const peerWarningsAdvisory = !/ERR_PNPM_PEER_DEP_ISSUES/.test(fullOutput || '');
+  const blocking = classified.filter(
+    (c) =>
+      c.category !== 'incompatibleEngine' &&
+      !(peerWarningsAdvisory && ADVISORY_PEER_WARNING.test(c.rawMessage)),
+  );
+  if (blocking.length === 0) {
     return false;
   }
   if (manager === 'npm' && npmOverrodePeersButInstallSucceeded(fullOutput, classified)) {

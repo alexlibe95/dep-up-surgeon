@@ -33,16 +33,22 @@
  *     install, roll back on failure" loop lives in the caller (`cli/overrideFlow.ts`).
  *   - `decideOverride` is conservative: it refuses to downgrade an existing override (so a user
  *     who manually pinned `foo@5.x` never gets auto-bumped to `5.1.x` because audit happens to
- *     suggest it). Upgrades and brand-new entries are always safe.
+ *     suggest it). Upgrades and brand-new entries are always safe. An existing range only
+ *     counts as "already safe" when it cannot resolve to a vulnerable version — containing
+ *     the target is not enough (`^6.7.0` still lets the lockfile keep 6.7.2).
  *   - Writes preserve the original file's ordering for every untouched key, add the new block
- *     in a stable position (at the end of the object for fresh blocks), and keep 2-space
- *     indentation. We round-trip through `JSON.parse` + `JSON.stringify`, which loses comments;
- *     package.json files almost never have comments (JSON doesn't allow them), so this is fine.
+ *     in a stable position (at the end of the object for fresh blocks), and keep the file's
+ *     indentation, line endings and trailing newline. We round-trip through `JSON.parse` +
+ *     `JSON.stringify`, which loses comments; package.json files almost never have comments
+ *     (JSON doesn't allow them), so this is fine. pnpm-workspace.yaml is edited through the
+ *     `yaml` Document API so its comments survive.
  *   - Every function returns a structured result; nothing here throws on normal malformed
  *     input. Callers surface warnings, not fatal errors.
  */
+import path from 'node:path';
 import fs from 'fs-extra';
 import semver from 'semver';
+import YAML from 'yaml';
 import type { PackageManager } from '../core/workspaces.js';
 
 export type OverrideField = 'overrides' | 'pnpm.overrides' | 'resolutions';
@@ -127,6 +133,15 @@ export interface ApplyOverrideResult {
   reason?: string;
 }
 
+export interface ReadOverridesOptions {
+  /**
+   * Parsed `pnpm-workspace.yaml`. pnpm 10+ also reads a top-level `overrides` map from it
+   * (pnpm 11 reads only that one), so its pins are included, listed before the package.json
+   * ones. Ignored for other managers.
+   */
+  pnpmWorkspace?: unknown;
+}
+
 /**
  * Read the override block from a given `package.json` object (NOT from disk — caller owns the
  * I/O). Returns a normalized `{ present, entries, nested }` shape that works across managers
@@ -148,42 +163,51 @@ export interface ApplyOverrideResult {
 export function readOverrides(
   pkg: unknown,
   manager: PackageManager,
+  options: ReadOverridesOptions = {},
 ): ReadOverridesResult {
   const field = overrideFieldFor(manager);
-  const empty: ReadOverridesResult = { present: false, field, entries: [], nested: {} };
-  if (!pkg || typeof pkg !== 'object') return empty;
-  const obj = pkg as Record<string, unknown>;
+  const result: ReadOverridesResult = { present: false, field, entries: [], nested: {} };
 
-  let block: unknown;
-  if (field === 'pnpm.overrides') {
-    const pnpm = obj.pnpm;
-    if (!pnpm || typeof pnpm !== 'object') return empty;
-    block = (pnpm as Record<string, unknown>).overrides;
-  } else {
-    block = obj[field];
+  if (manager === 'pnpm' && isPlainObject(options.pnpmWorkspace)) {
+    collectOverrideBlock(options.pnpmWorkspace.overrides, manager, result);
   }
+  if (isPlainObject(pkg)) {
+    const block =
+      field === 'pnpm.overrides'
+        ? isPlainObject(pkg.pnpm)
+          ? pkg.pnpm.overrides
+          : undefined
+        : pkg[field];
+    collectOverrideBlock(block, manager, result);
+  }
+  return result;
+}
 
-  if (!block || typeof block !== 'object' || Array.isArray(block)) return empty;
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+}
 
-  const entries: OverrideEntryRead[] = [];
-  const nested: Record<string, unknown> = {};
-
-  for (const [k, v] of Object.entries(block as Record<string, unknown>)) {
+function collectOverrideBlock(
+  block: unknown,
+  manager: PackageManager,
+  into: ReadOverridesResult,
+): void {
+  if (!isPlainObject(block)) return;
+  into.present = true;
+  for (const [k, v] of Object.entries(block)) {
     if (typeof v === 'string') {
       // Leaf: a direct `name` OR a chain key for pnpm/yarn.
       const chain = parseChainKey(k, manager);
-      pushEntry(entries, chain, v);
-    } else if ((manager === 'npm' || manager === 'bun') && v && typeof v === 'object' && !Array.isArray(v)) {
+      pushEntry(into.entries, chain, v);
+    } else if ((manager === 'npm' || manager === 'bun') && isPlainObject(v)) {
       // npm nested object form. Walk it recursively so grandchildren (`foo>bar>baz` in npm
       // parlance = `{ foo: { bar: { baz: "X" } } }`) are flattened into a single chain.
-      walkNpmNested([k], v as Record<string, unknown>, entries);
+      walkNpmNested([k], v, into.entries);
     } else {
       // Anything we don't recognize — keep it so a rewrite doesn't lose data.
-      nested[k] = v;
+      into.nested[k] = v;
     }
   }
-
-  return { present: true, field, entries, nested };
 }
 
 /**
@@ -262,13 +286,15 @@ function walkNpmNested(
 
 /**
  * Decide whether an override change is needed. Returns:
- *   - `{ action: 'skip', reason }` when the existing pin already satisfies the target range
- *     (don't downgrade / don't churn the file).
- *   - `{ action: 'write', previous, applied }` when the existing pin is missing or lower than
- *     the target (safe to apply).
- *   - `{ action: 'conflict', previous, target }` when the existing pin is a range that does
- *     NOT satisfy the required safe version (e.g. user pinned `<1.0.0` but we need `>=2.0.0`).
- *     Callers must decide whether to overwrite or bail.
+ *   - `{ action: 'skip', reason }` when the existing pin cannot resolve to a vulnerable version:
+ *     it doesn't intersect `vulnerableRange` when that is known, otherwise its lowest version
+ *     is already >= the target (don't downgrade / don't churn the file). Merely containing the
+ *     target is not enough — `^6.7.0` still lets the lockfile keep a vulnerable 6.7.2.
+ *   - `{ action: 'write', previous, applied }` when the existing pin is missing or its floor is
+ *     not above the target (safe to apply; never lowers the floor).
+ *   - `{ action: 'conflict', previous, target }` when the specs can't be compared (e.g. a
+ *     user-typed "abc"), or the existing pin is still vulnerable but sits above the target so
+ *     writing it would downgrade. Callers must decide whether to overwrite or bail.
  */
 export type OverrideDecision =
   | { action: 'skip'; reason: string; previous: string }
@@ -278,6 +304,7 @@ export type OverrideDecision =
 export function decideOverride(
   existing: string | undefined,
   target: string,
+  vulnerableRange?: string,
 ): OverrideDecision {
   const cleanTarget = target.trim();
   if (!cleanTarget) {
@@ -296,14 +323,21 @@ export function decideOverride(
   // explicit user approval.
   const targetVersion = safeTargetVersion(cleanTarget);
   const prevMin = safeMinVersion(prev);
+  const vulnerable =
+    vulnerableRange && semver.validRange(vulnerableRange) ? vulnerableRange : undefined;
 
-  if (targetVersion && safeSatisfies(targetVersion, prev)) {
-    return { action: 'skip', reason: 'existing override already satisfies target', previous: prev };
-  }
-  if (prevMin && targetVersion) {
-    if (semver.gte(prevMin, targetVersion)) {
-      return { action: 'skip', reason: 'existing override is >= target', previous: prev };
+  if (vulnerable) {
+    if (safeIntersects(prev, vulnerable) === false) {
+      return {
+        action: 'skip',
+        reason: 'existing override cannot resolve to a vulnerable version',
+        previous: prev,
+      };
     }
+  } else if (prevMin && targetVersion && semver.gte(prevMin, targetVersion)) {
+    return { action: 'skip', reason: 'existing override is >= target', previous: prev };
+  }
+  if (prevMin && targetVersion && semver.lte(prevMin, targetVersion)) {
     return { action: 'write', previous: prev, applied: cleanTarget };
   }
   return { action: 'conflict', previous: prev, target: cleanTarget };
@@ -329,11 +363,12 @@ function safeMinVersion(s: string): string | undefined {
   }
 }
 
-function safeSatisfies(version: string, range: string): boolean {
+/** `undefined` when either spec doesn't parse, so "unknown" is never mistaken for "no". */
+function safeIntersects(a: string, b: string): boolean | undefined {
   try {
-    return semver.satisfies(version, range, { includePrerelease: true });
+    return semver.intersects(a, b);
   } catch {
-    return false;
+    return undefined;
   }
 }
 
@@ -559,11 +594,19 @@ export interface ApplyOverrideToFileOptions {
    * `{ ok: false, reason: 'conflict' }` and the file is untouched.
    */
   overwriteConflicts?: boolean;
+  /**
+   * Vulnerable range from the advisory (e.g. `<6.14.1`), when known. An existing broad pin is
+   * then kept only if it cannot resolve to a vulnerable version — see `decideOverride`.
+   */
+  vulnerableRange?: string;
 }
 
 /**
  * Disk-level convenience: read the package.json, compute the decision, write the new pin when
- * appropriate, and return a structured result. The file is read + written with 2-space JSON.
+ * appropriate, and return a structured result. Rewrites keep the file's indentation, line
+ * endings and trailing newline. For pnpm, when `pnpm-workspace.yaml` next to package.json has
+ * a top-level `overrides` key, the existing pin is read from (and the new pin written to) that
+ * file instead, with its comments preserved.
  */
 export async function applyOverrideToFile(
   opts: ApplyOverrideToFileOptions,
@@ -596,13 +639,26 @@ export async function applyOverrideToFile(
     };
   }
 
+  // pnpm 10+ also reads `overrides` from pnpm-workspace.yaml (pnpm 11 only from there). When the
+  // project keeps its pins there, that is where the existing pin lives and the new one belongs.
+  const workspace =
+    opts.manager === 'pnpm'
+      ? await readPnpmWorkspace(path.dirname(opts.packageJsonPath))
+      : undefined;
+  if (workspace && !workspace.ok) {
+    return { ok: false, written: false, field, reason: workspace.reason };
+  }
+  const yamlTarget = workspace?.holdsOverrides ? workspace : undefined;
+
   // Read existing pin so we can decide skip / write / conflict. Match on the EXACT chain,
   // not just the name — a flat `foo` pin and a parent-scoped `bar>foo` pin are separate
   // entries and don't interact (both can coexist; overwriting one must never touch the other).
-  const read = readOverrides(pkg, opts.manager);
+  const read = yamlTarget
+    ? readOverrides(undefined, opts.manager, { pnpmWorkspace: yamlTarget.doc.toJS() })
+    : readOverrides(pkg, opts.manager);
   const wantChain = [...(opts.entry.parentChain ?? []), opts.entry.name];
   const existing = read.entries.find((e) => chainsEqual(e.chain, wantChain));
-  const decision = decideOverride(existing?.range, opts.entry.range);
+  const decision = decideOverride(existing?.range, opts.entry.range, opts.vulnerableRange);
 
   if (decision.action === 'skip') {
     return {
@@ -625,14 +681,23 @@ export async function applyOverrideToFile(
     };
   }
 
-  const next = applyOverrideInMemory(pkg, opts.manager, opts.entry);
-  // Re-read the existing newline so our rewrite doesn't flip LF <> CRLF on Windows checkouts.
-  const eol = raw.includes('\r\n') ? '\r\n' : '\n';
-  const trailingNewline = raw.endsWith('\n') || raw.endsWith('\r\n') ? eol : '';
-  const serialized = JSON.stringify(next, null, 2) + trailingNewline;
-  const normalized = eol === '\r\n' ? serialized.replace(/\n/g, '\r\n') : serialized;
+  let file = opts.packageJsonPath;
+  let content: string;
+  if (yamlTarget) {
+    file = yamlTarget.file;
+    const key = encodeChainKey(wantChain, 'pnpm');
+    const block = yamlTarget.doc.get('overrides');
+    if (YAML.isMap(block)) {
+      block.set(key, opts.entry.range);
+    } else {
+      yamlTarget.doc.set('overrides', yamlTarget.doc.createNode({ [key]: opts.entry.range }));
+    }
+    content = withEolOf(yamlTarget.raw, String(yamlTarget.doc));
+  } else {
+    content = stringifyJsonLike(raw, applyOverrideInMemory(pkg, opts.manager, opts.entry));
+  }
   try {
-    await fs.writeFile(opts.packageJsonPath, normalized, 'utf8');
+    await fs.writeFile(file, content, 'utf8');
   } catch (e) {
     return {
       ok: false,
@@ -671,6 +736,23 @@ export async function removeOverrideFromFile(
     typeof target === 'string' ? [target] : [...target.chain];
   if (chain.length === 0) {
     return { ok: true, removed: false };
+  }
+
+  // pnpm: a pin kept in pnpm-workspace.yaml is removed there (comments kept); package.json is
+  // only consulted when the YAML doesn't hold this chain.
+  if (manager === 'pnpm') {
+    const workspace = await readPnpmWorkspace(path.dirname(packageJsonPath));
+    const key = encodeChainKey(chain, 'pnpm');
+    const block = workspace?.ok ? workspace.doc.get('overrides') : undefined;
+    if (workspace?.ok && YAML.isMap(block) && block.has(key)) {
+      block.delete(key);
+      try {
+        await fs.writeFile(workspace.file, withEolOf(workspace.raw, String(workspace.doc)), 'utf8');
+      } catch (e) {
+        return { ok: false, removed: false, reason: `write failed: ${e instanceof Error ? e.message : String(e)}` };
+      }
+      return { ok: true, removed: true };
+    }
   }
 
   let raw: string;
@@ -746,14 +828,62 @@ export async function removeOverrideFromFile(
     return { ok: true, removed: false };
   }
 
-  const eol = raw.includes('\r\n') ? '\r\n' : '\n';
-  const trailingNewline = raw.endsWith('\n') || raw.endsWith('\r\n') ? eol : '';
-  const serialized = JSON.stringify(pkg, null, 2) + trailingNewline;
-  const normalized = eol === '\r\n' ? serialized.replace(/\n/g, '\r\n') : serialized;
   try {
-    await fs.writeFile(packageJsonPath, normalized, 'utf8');
+    await fs.writeFile(packageJsonPath, stringifyJsonLike(raw, pkg), 'utf8');
   } catch (e) {
     return { ok: false, removed: false, reason: `write failed: ${e instanceof Error ? e.message : String(e)}` };
   }
   return { ok: true, removed: true };
+}
+
+type PnpmWorkspaceRead =
+  | {
+      ok: true;
+      file: string;
+      raw: string;
+      doc: ReturnType<typeof YAML.parseDocument>;
+      /** True when the file has a top-level `overrides` key, i.e. the project keeps pins here. */
+      holdsOverrides: boolean;
+    }
+  | { ok: false; reason: string };
+
+/** Read + parse `pnpm-workspace.yaml` in `dir`; `undefined` when the file doesn't exist. */
+async function readPnpmWorkspace(dir: string): Promise<PnpmWorkspaceRead | undefined> {
+  const file = path.join(dir, 'pnpm-workspace.yaml');
+  if (!(await fs.pathExists(file))) return undefined;
+  let raw: string;
+  try {
+    raw = await fs.readFile(file, 'utf8');
+  } catch (e) {
+    return { ok: false, reason: `pnpm-workspace.yaml read failed: ${e instanceof Error ? e.message : String(e)}` };
+  }
+  const doc = YAML.parseDocument(raw);
+  if (doc.errors.length > 0) {
+    // First line only: the rest is a code frame that would break one-line report reasons.
+    const message = doc.errors[0]!.message.split('\n')[0];
+    return { ok: false, reason: `pnpm-workspace.yaml parse failed: ${message}` };
+  }
+  const block = doc.get('overrides');
+  if (block != null && !YAML.isMap(block)) {
+    return { ok: false, reason: 'pnpm-workspace.yaml `overrides` must be a map' };
+  }
+  return { ok: true, file, raw, doc, holdsOverrides: doc.has('overrides') };
+}
+
+/**
+ * Serialize `value` in the style of `original`: npm's indentation rule (indent of the first line
+ * after the opening brace, two spaces for `{}`, compact for one-line JSON), the same line endings,
+ * and a trailing newline only when the original had one.
+ */
+function stringifyJsonLike(original: string, value: unknown): string {
+  const indent =
+    /^\s*[{[](?:\r?\n)+([ \t]*)/.exec(original)?.[1] ??
+    (/^\s*(?:\{\s*\}|\[\s*\])\s*$/.test(original) ? '  ' : '');
+  const text = JSON.stringify(value, null, indent) + (original.endsWith('\n') ? '\n' : '');
+  return withEolOf(original, text);
+}
+
+/** Re-apply the original file's CRLF line endings to freshly serialized LF text. */
+function withEolOf(original: string, text: string): string {
+  return original.includes('\r\n') ? text.replace(/\r?\n/g, '\r\n') : text;
 }

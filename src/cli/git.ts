@@ -81,22 +81,27 @@ export async function getCurrentBranch(cwd: string): Promise<string | undefined>
 }
 
 /**
- * Create-and-checkout `branch`. If the branch already exists, just checkout (no -b). Returns
- * the previous branch name for reporting, or `undefined` on first-commit-less repos.
+ * Create-and-switch to `branch`, or just switch when it already exists locally. Returns the
+ * previous branch name for reporting, or `undefined` on first-commit-less repos.
  */
 export async function checkoutBranch(cwd: string, branch: string): Promise<string | undefined> {
-  const previous = await getCurrentBranch(cwd);
-  // Try to create+switch first; if that fails because the branch exists, fall back to plain
-  // checkout. This avoids racing on `git rev-parse --verify` to detect existence.
-  const create = await execa('git', ['checkout', '-b', branch], { cwd, reject: false });
-  if (create.exitCode === 0) {
-    return previous;
+  // Reject invalid names up front (`yarn.lock`, `-f`, `a..b`) so they can never reach git as an
+  // option or be reinterpreted as a pathspec.
+  const valid = await execa('git', ['check-ref-format', '--branch', branch], { cwd, reject: false });
+  if (valid.exitCode !== 0) {
+    throw new Error(`--git-branch: "${branch}" is not a valid git branch name.`);
   }
-  const switchOnly = await execa('git', ['checkout', branch], { cwd, reject: false });
-  if (switchOnly.exitCode !== 0) {
-    throw new Error(
-      `git checkout ${branch} failed: ${(create.stderr || switchOnly.stderr).trim()}`,
-    );
+  const previous = await getCurrentBranch(cwd);
+  // `git switch` only ever changes branches. `git checkout <name>` falls back to restoring a
+  // FILE of that name from the index, which would silently discard the user's edits to it.
+  const exists = await execa('git', ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], {
+    cwd,
+    reject: false,
+  });
+  const args = exists.exitCode === 0 ? ['switch', branch] : ['switch', '-c', branch];
+  const r = await execa('git', args, { cwd, reject: false });
+  if (r.exitCode !== 0) {
+    throw new Error(`git ${args.join(' ')} failed: ${(r.stderr || r.stdout).trim()}`);
   }
   return previous;
 }
@@ -125,14 +130,42 @@ export async function gitAdd(opts: GitOptions, files: string[]): Promise<string[
   if (relative.length === 0) {
     return [];
   }
-  const r = await execa('git', ['add', '--', ...relative], {
+  // `git add` exits 1 when ANY pathspec is gitignored (e.g. a library that ignores its lockfile),
+  // after staging the rest. Drop ignored paths up front so the commit still lands. Tracked files
+  // are never reported by `check-ignore`, so a force-added lockfile is still staged.
+  const ignoredCheck = await execa('git', ['check-ignore', '-z', '--stdin'], {
+    cwd: repoRootReal,
+    input: relative.join('\0'),
+    reject: false,
+  });
+  const ignored = new Set(
+    ignoredCheck.exitCode === 0 ? ignoredCheck.stdout.split('\0').filter(Boolean) : [],
+  );
+  const toStage = relative.filter((p) => !ignored.has(p));
+  if (toStage.length === 0) {
+    return [];
+  }
+  const r = await execa('git', ['add', '--', ...toStage], {
     cwd: repoRootReal,
     reject: false,
   });
   if (r.exitCode !== 0) {
     throw new Error(`git add failed: ${r.stderr.trim() || r.stdout.trim()}`);
   }
-  return relative;
+  return toStage;
+}
+
+/**
+ * Unstage repo-root-relative `files` (best-effort). Used after a refused commit so the next
+ * commit doesn't silently include them under the wrong subject.
+ */
+export async function gitUnstage(opts: Pick<GitOptions, 'cwd'>, files: string[]): Promise<void> {
+  if (files.length === 0) {
+    return;
+  }
+  const repoRoot = (await getRepoRoot(opts.cwd)) ?? opts.cwd;
+  const repoRootReal = await fs.realpath(repoRoot).catch(() => repoRoot);
+  await execa('git', ['reset', '-q', '--', ...files], { cwd: repoRootReal, reject: false });
 }
 
 /**
@@ -212,6 +245,21 @@ export function lockfileBasenameFor(manager: PackageManager): string {
     case 'npm':
     default:
       return 'package-lock.json';
+  }
+}
+
+/**
+ * Every lockfile the manager may own (`bun.lockb` next to the text `bun.lock`, npm's
+ * `npm-shrinkwrap.json`). Callers stage whichever exist — `gitAdd` drops missing paths.
+ */
+export function lockfileBasenamesFor(manager: PackageManager): string[] {
+  switch (manager) {
+    case 'bun':
+      return ['bun.lock', 'bun.lockb'];
+    case 'npm':
+      return ['package-lock.json', 'npm-shrinkwrap.json'];
+    default:
+      return [lockfileBasenameFor(manager)];
   }
 }
 

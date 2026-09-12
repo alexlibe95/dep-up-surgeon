@@ -41,6 +41,7 @@ import {
   applyOverrideInMemory,
   type OverrideEntry,
 } from '../utils/overrides.js';
+import { writeJsonLike } from '../utils/jsonFile.js';
 import { runInstall } from '../utils/npm.js';
 import { log } from '../utils/logger.js';
 import type { PersistedLastRun } from './lastRun.js';
@@ -109,8 +110,13 @@ export interface UndoOptions {
   manager?: PackageManager;
   /** Skip the post-reverse install (useful for dry runs / tests). */
   skipInstall?: boolean;
-  /** Custom validator. When omitted, the default `validateProject` runs. */
-  runValidator?: () => Promise<{ ok: boolean; command?: string; lastLines?: string }>;
+  /**
+   * Custom validator. When omitted, the default `validateProject` runs. Receives the manager undo
+   * resolved (explicit option, else the recorded run's) so `<manager> test` matches the install.
+   */
+  runValidator?: (ctx: {
+    manager: PackageManager;
+  }) => Promise<{ ok: boolean; command?: string; lastLines?: string }>;
   /** Skip the validator entirely. */
   skipValidator?: boolean;
   /** Test hook: override the installer (must match `runInstall` signature). */
@@ -206,7 +212,7 @@ export async function runUndo(opts: UndoOptions): Promise<UndoResult> {
     });
     if (revert.ok && !opts.planOnly) {
       if (!revert.catalogOnly && revert.pkg) {
-        await fs.writeJson(target.packageJson, revert.pkg, { spaces: 2 });
+        await writeJsonLike(target.packageJson, revert.pkg);
       }
       editedTargets.add(target.cwd);
     }
@@ -251,7 +257,7 @@ export async function runUndo(opts: UndoOptions): Promise<UndoResult> {
         // whole point. We call `applyOverrideInMemory` directly and write the result.
         const pkg = (await fs.readJson(pkgJson)) as Record<string, unknown>;
         const next = applyOverrideInMemory(pkg, manager, entry);
-        await fs.writeJson(pkgJson, next, { spaces: 2 });
+        await writeJsonLike(pkgJson, next);
         editedTargets.add(opts.cwd);
         result = {
           name: att.name,
@@ -323,7 +329,7 @@ export async function runUndo(opts: UndoOptions): Promise<UndoResult> {
   let validation: UndoResult['validation'];
   if (!opts.planOnly && !opts.skipValidator && installs.every((r) => r.ok)) {
     if (opts.runValidator) {
-      validation = await opts.runValidator();
+      validation = await opts.runValidator({ manager });
     }
   }
 
@@ -534,7 +540,18 @@ export async function checkOverridesStillPresent(
   const pkgJson = path.join(cwd, 'package.json');
   if (!(await fs.pathExists(pkgJson))) return { present: 0, missing: 0 };
   const pkg = (await fs.readJson(pkgJson)) as Record<string, unknown>;
-  const read = readOverrides(pkg, manager);
+  // pnpm 10+ can keep pins in pnpm-workspace.yaml; without reading it they'd all count as missing.
+  let pnpmWorkspace: unknown;
+  if (manager === 'pnpm') {
+    try {
+      const { default: YAML } = await import('yaml');
+      const raw = await fs.readFile(path.join(cwd, 'pnpm-workspace.yaml'), 'utf8');
+      pnpmWorkspace = YAML.parse(raw, { logLevel: 'error' });
+    } catch {
+      // no (readable) workspace file: package.json pins only
+    }
+  }
+  const read = readOverrides(pkg, manager, { pnpmWorkspace });
   let present = 0;
   let missing = 0;
   for (const att of persisted.overrides?.attempts ?? []) {

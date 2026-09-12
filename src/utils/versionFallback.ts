@@ -21,14 +21,21 @@ export function buildLineFallbackOrder(
   mode: FallbackLineMode,
   maxLines = DEFAULT_MAX_FALLBACK_LINES,
 ): string[] {
-  const cur = semver.coerce(currentVersion);
+  // Keep a prerelease current as-is: `coerce('2.0.0-beta.3')` is `2.0.0`, which would hide the
+  // stable 2.0.0 release as "not newer" and leave no candidates at all.
+  const cur = semver.valid(currentVersion)
+    ? semver.parse(currentVersion)
+    : semver.coerce(currentVersion);
   if (!cur) {
     return semver.valid(registryLatest) ? [registryLatest] : [];
   }
 
+  const latestValid = semver.valid(registryLatest);
   const stable = allPublishedVersions
     .filter((v) => semver.valid(v))
-    .filter((v) => !semver.prerelease(v));
+    .filter((v) => !semver.prerelease(v))
+    // Nothing above the `latest` dist-tag: a major staged under `next` isn't released yet.
+    .filter((v) => !latestValid || semver.lte(v, registryLatest));
 
   const newerThanCurrent = stable
     .filter((v) => semver.gt(v, cur))

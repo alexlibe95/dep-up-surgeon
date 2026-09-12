@@ -83,6 +83,69 @@ test('audit: parseNpmLikeAudit on the canned blob reproduces the same set as run
   assert.deepStrictEqual(bySev, { axios: 'high', lodash: 'moderate', minimist: 'low' });
 });
 
+// Verbatim `npm audit --json` from npm 11.19.0 on express@4.17.1 + compression@1.7.4 +
+// lodash@4.17.20 + minimist@1.2.5 (see the fixture README).
+const NPM11_AUDIT_JSON = await fs.readFile(
+  path.join(fixtureDir, 'audit-npm11-express.json'),
+  'utf8',
+);
+
+async function auditNpm11() {
+  return runAudit({
+    manager: 'npm',
+    cwd: fixtureDir,
+    exec: async () => ({ stdout: NPM11_AUDIT_JSON, exitCode: 1 }),
+    // No registry and no lockfile: recommendations must come from the audit data alone.
+    fetchVersions: async () => [],
+    lockfileVersions: new Map(),
+  });
+}
+
+test('audit (npm 11): a direct dep vulnerable only via a transitive stays in the restrict set', async () => {
+  const result = await auditNpm11();
+  assert.strictEqual(result.error, undefined, `unexpected error: ${result.error}`);
+  const restrictToNames = new Set(
+    filterAdvisoriesBySeverity(result.advisories, 'low').map((a) => a.name),
+  );
+  // compression@1.7.4 has via: ["on-headers"] only. Dropping it leaves just the non-direct
+  // on-headers in the set, so --security-only would upgrade nothing.
+  assert.ok(restrictToNames.has('compression'), `restrict=${JSON.stringify([...restrictToNames])}`);
+  const compression = result.advisories.find((a) => a.name === 'compression');
+  assert.strictEqual(compression.severity, 'low');
+  assert.strictEqual(compression.vulnerableRange, '1.0.3 - 1.8.0');
+  assert.strictEqual(compression.recommendedVersion, '1.8.2');
+  assert.ok(compression.ids.includes('GHSA-76c9-3jph-rj3q'), `ids=${JSON.stringify(compression.ids)}`);
+});
+
+test('audit (npm 11): transitive rows never take the parent package fixAvailable version', async () => {
+  const { advisories } = await auditNpm11();
+  const recommended = Object.fromEntries(advisories.map((a) => [a.name, a.recommendedVersion]));
+  assert.deepStrictEqual(recommended, {
+    // fixAvailable.name matches the row → npm's own fix version.
+    compression: '1.8.2',
+    express: '4.22.2',
+    lodash: '4.18.1',
+    minimist: '1.2.8',
+    // fixAvailable names express/compression → derived from the row's own ranges instead.
+    'body-parser': '1.20.6',
+    cookie: '0.7.0',
+    'on-headers': '1.1.0',
+    'path-to-regexp': '0.1.13',
+    qs: '6.16.0',
+    send: '0.19.0',
+    // `<=1.16.0` has no provable fix without the published version list.
+    'serve-static': undefined,
+  });
+});
+
+test('audit (npm 11): GHSA ids are recovered from the advisory URL', async () => {
+  const { advisories } = await auditNpm11();
+  const express = advisories.find((a) => a.name === 'express');
+  assert.strictEqual(express.ids[0], 'GHSA-qw6h-vgh9-j6wx');
+  assert.ok(express.ids.includes('GHSA-rv95-896h-c2vc'));
+  assert.ok(express.ids.includes('advisory-1100530'), 'numeric npm ids are kept');
+});
+
 // ---------------------------------------------------------------------------
 // Phase 2: --min-severity filter
 // ---------------------------------------------------------------------------

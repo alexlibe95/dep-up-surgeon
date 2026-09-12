@@ -33,12 +33,15 @@
  */
 import semver from 'semver';
 import type { ClassifiedConflict } from './conflictAnalyzer.js';
+import { parsePackageSpec } from './conflictParser.js';
 import type { RegistryCache } from '../utils/concurrency.js';
+import type { LockfileVersionTree } from '../utils/installedVersion.js';
 import type { PackageJson, ScannedPackage } from '../types.js';
 import { fetchVersionPeers, fetchLatestVersion } from '../utils/npm.js';
 import {
   buildDomain,
   describeResolution,
+  installedVersionFor,
   resolvePeerRanges,
   type CandidateDomain,
   type ResolvedTuple,
@@ -57,6 +60,18 @@ export interface AdHocResolveInput {
   registryCache?: RegistryCache;
   /** Upper bound on ad-hoc group size including the primary. Default 6. */
   maxAdHocMembers?: number;
+  /**
+   * Names this run must not touch (`--ignore`, policy freezes, `--security-only`). They never
+   * join the ad-hoc group, but still constrain it as installed externals.
+   */
+  isFrozen?: (name: string) => boolean;
+  /** Let blockers declared only in `peerDependencies` move (`--include-peers`). Default `false`. */
+  includePeers?: boolean;
+  /**
+   * Installed versions (lockfile). Floors the primary's domain (needed for `catalog:` ranges) and
+   * checks peers on packages outside the group against what's installed, not the range floor.
+   */
+  lockfileVersions?: LockfileVersionTree;
 }
 
 export interface AdHocResolveResult {
@@ -84,7 +99,7 @@ type DepSection = 'dependencies' | 'devDependencies' | 'peerDependencies' | 'opt
 export async function tryResolveAdHocPeerConflict(
   input: AdHocResolveInput,
 ): Promise<AdHocResolveResult | undefined> {
-  const { primary, primaryTarget, classified, pkg, registryCache } = input;
+  const { primary, primaryTarget, classified, pkg, registryCache, lockfileVersions } = input;
   const maxMembers = input.maxAdHocMembers ?? 6;
 
   const directDeps = indexDirectDeps(pkg);
@@ -93,22 +108,27 @@ export async function tryResolveAdHocPeerConflict(
   // "blocker" — the package we might need to downgrade to match the primary's peer
   // expectations — is usually the DEPENDER (it's the one at a version that doesn't satisfy
   // the primary's peer requirement). We include BOTH fields in the candidate set and let
-  // the `directDeps` filter drop whichever isn't a direct dep.
+  // the `directDeps` filter drop whichever isn't a direct dep. Parsers print dependers as
+  // `<name>@<version>` (`@angular/build@21.2.8`) while direct deps are keyed by bare name.
   const blockerNames = new Set<string>();
   for (const c of classified) {
     if (c.category !== 'peerDependencyMismatch' && c.category !== 'missingDependency') continue;
-    if (c.depender && c.depender !== 'unknown' && c.depender !== primary.name) {
-      blockerNames.add(c.depender);
-    }
-    if (c.dependency && c.dependency !== 'unknown' && c.dependency !== primary.name) {
-      blockerNames.add(c.dependency);
+    for (const field of [c.depender, c.dependency]) {
+      if (!field || field === 'unknown') continue;
+      const name = parsePackageSpec(field).name;
+      if (name !== primary.name) blockerNames.add(name);
     }
   }
 
   const blockers: DirectDep[] = [];
   for (const name of blockerNames) {
     const hit = directDeps.get(name);
-    if (hit) blockers.push(hit);
+    if (!hit) continue;
+    // Frozen packages and consumer-facing peer ranges stay put; as externals they still
+    // constrain the primary.
+    if (input.isFrozen?.(name)) continue;
+    if (hit.section === 'peerDependencies' && !input.includePeers) continue;
+    blockers.push(hit);
   }
   if (blockers.length === 0) {
     return undefined;
@@ -123,11 +143,13 @@ export async function tryResolveAdHocPeerConflict(
   // Assemble resolver inputs: primary + each blocker. For blockers we use the newest
   // version **compatible with the existing range** as the upper bound — we never silently
   // upgrade a blocker past what the user pinned.
+  const primaryInstalled = installedVersionFor(primary.name, primary.currentRange, lockfileVersions);
   const inputs: ResolverInput[] = [
     {
       name: primary.name,
       currentRange: primary.currentRange,
       requestedTarget: primaryTarget,
+      ...(primaryInstalled ? { installedVersion: primaryInstalled } : {}),
     },
   ];
   for (const b of capped) {
@@ -159,7 +181,10 @@ export async function tryResolveAdHocPeerConflict(
   }
 
   const requested = new Map(inputs.map((i) => [i.name, i.requestedTarget]));
-  const resolved = resolvePeerRanges(domains, requested, { externalInstalled });
+  const resolved = resolvePeerRanges(domains, requested, {
+    externalInstalled,
+    ...(lockfileVersions ? { lockfileVersions } : {}),
+  });
   if (!resolved) return undefined;
 
   // Build the `bumps` list. A blocker whose resolved version EQUALS the value already in

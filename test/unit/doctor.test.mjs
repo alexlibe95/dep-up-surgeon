@@ -14,7 +14,7 @@ import os from 'node:os';
 import fs from 'node:fs/promises';
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const { runDoctor } = await import(path.join(root, 'dist/cli/doctor.js'));
+const { runDoctor, peerScanCommandFor } = await import(path.join(root, 'dist/cli/doctor.js'));
 const { doctorExitCode, renderDoctorHuman } = await import(
   path.join(root, 'dist/cli/doctorRenderer.js')
 );
@@ -118,6 +118,65 @@ test('doctor: ambiguous lockfiles → manager yellow with issues list', async ()
   const mgr = pick(report, 'manager');
   assert.strictEqual(mgr.status, 'yellow');
   assert.match(mgr.message, /2 lockfiles present/);
+});
+
+test('doctor: bun.lock / npm-shrinkwrap.json count toward ambiguous lockfiles', async () => {
+  const bunAndNpm = await mkProject({
+    'package.json': JSON.stringify({ name: 'demo', version: '1.0.0' }),
+    'package-lock.json': '{"lockfileVersion":3,"packages":{}}',
+    'bun.lock': '{ "lockfileVersion": 1, "workspaces": { "": { "name": "demo" } }, "packages": {} }\n',
+  });
+  const r1 = await runDoctor({ cwd: bunAndNpm, toolVersion: 'x', ...ALL_SKIPS });
+  assert.match(pick(r1, 'manager').message, /2 lockfiles present/);
+
+  const shrinkwrap = await mkProject({
+    'package.json': JSON.stringify({ name: 'demo', version: '1.0.0' }),
+    'package-lock.json': '{"lockfileVersion":3,"packages":{}}',
+    'npm-shrinkwrap.json': '{"lockfileVersion":3,"packages":{}}',
+  });
+  const r2 = await runDoctor({ cwd: shrinkwrap, toolVersion: 'x', ...ALL_SKIPS });
+  assert.match(pick(r2, 'manager').message, /2 lockfiles present/);
+});
+
+test('doctor: --package-manager override reaches project detection', async () => {
+  const dir = await mkProject({
+    'package.json': JSON.stringify({ name: 'demo', version: '1.0.0' }),
+    'package-lock.json': JSON.stringify({
+      lockfileVersion: 3,
+      packages: { '': { name: 'demo' }, 'node_modules/axios': { version: '1.6.4' } },
+    }),
+  });
+  const report = await runDoctor({ cwd: dir, toolVersion: 'x', manager: 'pnpm', ...ALL_SKIPS });
+  const mgr = pick(report, 'manager');
+  assert.strictEqual(mgr.data.manager, 'pnpm');
+  assert.strictEqual(mgr.data.source, 'cli');
+  const lock = pick(report, 'lockfile');
+  assert.strictEqual(lock.status, 'yellow');
+  assert.match(lock.message, /package-lock\.json.*pnpm/);
+});
+
+test('peerScanCommandFor: never runs an install that can touch node_modules or run scripts', () => {
+  assert.deepStrictEqual(peerScanCommandFor('npm'), { bin: 'npm', args: ['ls', '--all', '--parseable'] });
+  const pnpm = peerScanCommandFor('pnpm');
+  assert.strictEqual(pnpm.bin, 'pnpm');
+  for (const flag of ['--frozen-lockfile', '--lockfile-only', '--ignore-scripts']) {
+    assert.ok(pnpm.args.includes(flag), `pnpm peer scan missing ${flag}: ${pnpm.args.join(' ')}`);
+  }
+  assert.deepStrictEqual(peerScanCommandFor('yarn', 1), { bin: 'yarn', args: ['check'] });
+  assert.match(peerScanCommandFor('yarn', 4).skipped, /read-only/);
+  assert.match(peerScanCommandFor('bun').skipped, /read-only/);
+});
+
+test('doctor: bun peer scan is reported as skipped instead of running `bun install`', async () => {
+  const dir = await mkProject({
+    'package.json': JSON.stringify({ name: 'demo', version: '1.0.0' }),
+    'bun.lock': '{ "lockfileVersion": 1, "workspaces": { "": { "name": "demo" } }, "packages": {} }\n',
+  });
+  const report = await runDoctor({ cwd: dir, toolVersion: 'x', ...ALL_SKIPS, skipPeerScan: false });
+  const peers = pick(report, 'peer-deps');
+  assert.strictEqual(peers.status, 'green');
+  assert.match(peers.message, /skipped/i);
+  assert.match(peers.message, /read-only/);
 });
 
 test('doctor: workspace-coherence red when a declared member has no package.json', async () => {

@@ -59,7 +59,7 @@ export interface DepUpSurgeonRc {
    * overrides always take precedence over the committed policy.
    */
   overrides?: RcOverrideEntry[];
-  /** Parse warnings from loading the rc. Populated on malformed sections; never fatal. */
+  /** Warnings from loading the rc (unreadable / unparseable file, malformed sections). Never fatal. */
   warnings?: string[];
 }
 
@@ -67,74 +67,114 @@ const CONFIG_FILENAME = '.dep-up-surgeonrc';
 
 /**
  * Load `.dep-up-surgeonrc` from the project root (JSON).
- * Missing or invalid files yield an empty config (no throw).
+ * A missing file yields an empty config. Nothing here throws: an unreadable or unparseable
+ * file, or a malformed section, is reported in `warnings`, and every other section is still
+ * normalized on its own.
  */
 export async function loadConfig(cwd: string): Promise<DepUpSurgeonRc> {
   const file = path.join(cwd, CONFIG_FILENAME);
   if (!(await fs.pathExists(file))) {
     return {};
   }
+  let raw: string;
   try {
-    const raw = await fs.readFile(file, 'utf8');
-    const parsed = JSON.parse(raw) as DepUpSurgeonRc;
-    if (!parsed || typeof parsed !== 'object') {
-      return {};
-    }
-    if (parsed.ignore !== undefined && !Array.isArray(parsed.ignore)) {
-      return { ...parsed, ignore: [] };
-    }
-    let linkedGroups = parsed.linkedGroups;
-    if (linkedGroups !== undefined) {
-      if (!Array.isArray(linkedGroups)) {
-        linkedGroups = [];
-      } else {
-        linkedGroups = linkedGroups
-          .filter((g) => g && typeof g === 'object' && typeof (g as { id?: string }).id === 'string')
-          .map((g) => ({
-            id: String((g as { id: string }).id),
-            packages: Array.isArray((g as { packages?: unknown }).packages)
-              ? (g as { packages: string[] }).packages.map(String)
-              : [],
-          }));
-      }
-    }
-    let validate: DepUpSurgeonRc['validate'] = undefined;
-    if (typeof parsed.validate === 'string') {
-      const trimmed = parsed.validate.trim();
-      if (trimmed) {
-        validate = trimmed;
-      }
-    } else if (parsed.validate && typeof parsed.validate === 'object') {
-      const v = parsed.validate as { command?: unknown; skip?: unknown };
-      const out: { command?: string; skip?: boolean } = {};
-      if (typeof v.command === 'string' && v.command.trim()) {
-        out.command = v.command.trim();
-      }
-      if (typeof v.skip === 'boolean') {
-        out.skip = v.skip;
-      }
-      if (out.command || out.skip !== undefined) {
-        validate = out;
-      }
-    }
-
-    const warnings: string[] = [];
-    const overrides = normalizeRcOverrides(
-      (parsed as { overrides?: unknown }).overrides,
-      warnings,
-    );
-
-    const out: DepUpSurgeonRc = {
-      ignore: parsed.ignore?.map(String) ?? [],
-      linkedGroups: linkedGroups ?? [],
-      ...(validate !== undefined ? { validate } : {}),
-    };
-    if (overrides.length > 0) out.overrides = overrides;
-    if (warnings.length > 0) out.warnings = warnings;
-    return out;
-  } catch {
+    raw = await fs.readFile(file, 'utf8');
+  } catch (e) {
+    return { warnings: [`failed to read ${file}: ${errorMessage(e)}`] };
+  }
+  if (!raw.trim()) {
     return {};
   }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    // A silent `{}` here would un-ignore packages and drop the custom validator.
+    return {
+      warnings: [
+        `failed to parse ${file}: ${errorMessage(e)}. None of its settings (ignore, linkedGroups, validate, overrides) are applied.`,
+      ],
+    };
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { warnings: [`${file} must contain a JSON object; ignoring it`] };
+  }
+  const obj = parsed as Record<string, unknown>;
+  const warnings: string[] = [];
+
+  const ignore = normalizeIgnore(obj.ignore, warnings);
+
+  let linkedGroups: NonNullable<DepUpSurgeonRc['linkedGroups']> = [];
+  if (Array.isArray(obj.linkedGroups)) {
+    linkedGroups = obj.linkedGroups
+      .filter((g) => g && typeof g === 'object' && typeof (g as { id?: string }).id === 'string')
+      .map((g) => ({
+        id: String((g as { id: string }).id),
+        packages: Array.isArray((g as { packages?: unknown }).packages)
+          ? (g as { packages: string[] }).packages.map(String)
+          : [],
+      }));
+  }
+
+  let validate: DepUpSurgeonRc['validate'] = undefined;
+  if (typeof obj.validate === 'string') {
+    const trimmed = obj.validate.trim();
+    if (trimmed) {
+      validate = trimmed;
+    }
+  } else if (obj.validate && typeof obj.validate === 'object') {
+    const v = obj.validate as { command?: unknown; skip?: unknown };
+    const out: { command?: string; skip?: boolean } = {};
+    if (typeof v.command === 'string' && v.command.trim()) {
+      out.command = v.command.trim();
+    }
+    if (typeof v.skip === 'boolean') {
+      out.skip = v.skip;
+    }
+    if (out.command || out.skip !== undefined) {
+      validate = out;
+    }
+  }
+
+  const overrides = normalizeRcOverrides(obj.overrides, warnings);
+
+  const out: DepUpSurgeonRc = {
+    ignore,
+    linkedGroups,
+    ...(validate !== undefined ? { validate } : {}),
+  };
+  if (overrides.length > 0) out.overrides = overrides;
+  if (warnings.length > 0) out.warnings = warnings;
+  return out;
+}
+
+/**
+ * Normalize the rc `ignore` list. A bare string is a common slip (`"ignore": "react"`) whose
+ * intent is clear, so it is coerced; anything else that isn't a string is dropped.
+ */
+function normalizeIgnore(raw: unknown, warnings: string[]): string[] {
+  if (raw === undefined || raw === null) return [];
+  if (typeof raw === 'string') {
+    warnings.push(`rc \`ignore\` should be an array of package names; treating "${raw}" as ["${raw}"]`);
+    return raw.trim() ? [raw.trim()] : [];
+  }
+  if (!Array.isArray(raw)) {
+    warnings.push('rc `ignore` must be an array of package names; ignoring it');
+    return [];
+  }
+  const out: string[] = [];
+  raw.forEach((entry: unknown, i) => {
+    if (typeof entry === 'string') {
+      out.push(entry);
+    } else {
+      warnings.push(`rc ignore[${i}] must be a package name string; skipping ${JSON.stringify(entry)}`);
+    }
+  });
+  return out;
+}
+
+function errorMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 /**
@@ -386,18 +426,35 @@ export function mergeIgnoreLists(
 
 /**
  * Append package names to `.dep-up-surgeonrc` ignore list (creates or merges file).
+ * Throws instead of writing when the existing rc can't be merged safely (invalid JSON, a
+ * non-object root, or an `ignore` that isn't a list): rewriting it from scratch would destroy
+ * `linkedGroups` / `validate` / `overrides`.
  */
 export async function appendIgnoreToRc(cwd: string, ...packageNames: string[]): Promise<void> {
   const rcPath = path.join(cwd, CONFIG_FILENAME);
-  let data: DepUpSurgeonRc = {};
+  let data: Record<string, unknown> = {};
   if (await fs.pathExists(rcPath)) {
-    try {
-      data = (await fs.readJson(rcPath)) as DepUpSurgeonRc;
-    } catch {
-      data = {};
+    const raw = await fs.readFile(rcPath, 'utf8');
+    if (raw.trim()) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (e) {
+        throw new Error(
+          `refusing to update ${rcPath}: it is not valid JSON (${errorMessage(e)}). Fix the file, then add ${packageNames.join(', ')} to "ignore".`,
+        );
+      }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error(`refusing to update ${rcPath}: it must contain a JSON object`);
+      }
+      data = parsed as Record<string, unknown>;
     }
   }
-  const ignore = new Set(data.ignore ?? []);
+  const current = data.ignore;
+  if (current !== undefined && current !== null && typeof current !== 'string' && !Array.isArray(current)) {
+    throw new Error(`refusing to update ${rcPath}: "ignore" must be an array of package names`);
+  }
+  const ignore = new Set(normalizeIgnore(current, []));
   for (const name of packageNames) {
     ignore.add(name);
   }

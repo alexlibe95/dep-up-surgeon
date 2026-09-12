@@ -1,5 +1,6 @@
 import pacote from 'pacote';
 import type { Manifest } from 'pacote';
+import { registryOptions } from './npmConfig.js';
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000;
 
@@ -25,7 +26,10 @@ export function createManifestCache(ttlMs: number = DEFAULT_TTL_MS): {
         return hit.manifest;
       }
       try {
-        const manifest = await pacote.manifest(`${packageName}@latest`, { fullMetadata: false });
+        const manifest = await pacote.manifest(`${packageName}@latest`, {
+          ...registryOptions(),
+          fullMetadata: false,
+        });
         store.set(packageName, { manifest, expires: now + ttlMs });
         return manifest;
       } catch {

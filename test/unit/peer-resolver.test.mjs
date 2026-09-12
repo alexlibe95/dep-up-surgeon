@@ -185,9 +185,9 @@ test('resolvePeerRanges: rejects tuple when external installed package violates 
   assert.equal(r.downgradedFrom.get('react-dom'), '19.0.0');
 });
 
-test('resolvePeerRanges: optional peer is ignored (not a hard constraint)', () => {
-  // react-dom@20 peers on `fictional-peer: "^2"` but it's MARKED OPTIONAL. Even with the
-  // external at "^1" (which would violate a hard peer) the resolver picks 20.
+test('resolvePeerRanges: optional peer that is not installed is ignored', () => {
+  // react-dom@20 peers on `fictional-peer: "^2"` but it's MARKED OPTIONAL and nothing in the
+  // workspace provides it → not a constraint, the resolver picks 20.
   const reactDom = makeDomain(
     'react-dom',
     {
@@ -206,10 +206,158 @@ test('resolvePeerRanges: optional peer is ignored (not a hard constraint)', () =
   const r = resolvePeerRanges(
     [reactDom, react],
     new Map([['react-dom', '20.0.0'], ['react', '20.0.0']]),
-    { externalInstalled: new Map([['fictional-peer', '^1.0.0']]) },
+    { externalInstalled: new Map([['unrelated', '^1.0.0']]) },
   );
   assert.ok(r);
   assert.equal(r.versions.get('react-dom'), '20.0.0');
+});
+
+test('resolvePeerRanges: optional peer that IS installed outside the group is enforced', () => {
+  // npm only waives an optional peer when it's absent; an installed copy must satisfy the range.
+  const reactDom = makeDomain(
+    'react-dom',
+    {
+      '20.0.0': {
+        peerDependencies: { 'fictional-peer': '^2' },
+        peerDependenciesMeta: { 'fictional-peer': { optional: true } },
+      },
+      '19.0.0': {
+        peerDependencies: { 'fictional-peer': '^1' },
+        peerDependenciesMeta: { 'fictional-peer': { optional: true } },
+      },
+    },
+    ['20.0.0', '19.0.0'],
+  );
+  const react = makeDomain('react', { '20.0.0': { peerDependencies: {} } }, ['20.0.0']);
+  for (const satThreshold of [Infinity, 0]) {
+    const r = resolvePeerRanges(
+      [reactDom, react],
+      new Map([['react-dom', '20.0.0'], ['react', '20.0.0']]),
+      { externalInstalled: new Map([['fictional-peer', '^1.0.0']]), satThreshold },
+    );
+    assert.ok(r, `satThreshold=${satThreshold}`);
+    assert.equal(r.versions.get('react-dom'), '19.0.0');
+  }
+});
+
+test('resolvePeerRanges: optional peer on another linked member is enforced', () => {
+  // ts-jest declares babel-jest as an OPTIONAL peer. Once babel-jest is part of the batch it is
+  // installed, so npm enforces `^29.0.0` and babel-jest@30 would ERESOLVE.
+  const tsJest = makeDomain(
+    'ts-jest',
+    {
+      '29.2.5': {
+        peerDependencies: { 'babel-jest': '^29.0.0', jest: '^29.0.0', typescript: '>=4.3 <6' },
+        peerDependenciesMeta: { 'babel-jest': { optional: true } },
+      },
+    },
+    ['29.2.5'],
+  );
+  const babelJest = makeDomain(
+    'babel-jest',
+    {
+      '30.0.0': { peerDependencies: { '@babel/core': '^7.11.0' } },
+      '29.7.0': { peerDependencies: { '@babel/core': '^7.8.0' } },
+    },
+    ['30.0.0', '29.7.0'],
+  );
+  for (const satThreshold of [Infinity, 0]) {
+    const r = resolvePeerRanges(
+      [tsJest, babelJest],
+      new Map([['ts-jest', '29.2.5'], ['babel-jest', '30.0.0']]),
+      { externalInstalled: new Map(), satThreshold },
+    );
+    assert.ok(r, `satThreshold=${satThreshold}`);
+    assert.equal(r.versions.get('babel-jest'), '29.7.0');
+    assert.equal(r.downgradedFrom.get('babel-jest'), '30.0.0');
+  }
+});
+
+test('buildDomain: installedVersion is the floor (catalog:, latest, and ranges below it)', () => {
+  const peers = new Map([
+    ['17.0.2', { peerDependencies: {} }],
+    ['18.2.0', { peerDependencies: {} }],
+    ['18.3.1', { peerDependencies: {} }],
+    ['19.0.0', { peerDependencies: {} }],
+    ['19.1.0', { peerDependencies: {} }],
+  ]);
+  for (const currentRange of ['catalog:', 'latest', '^18.0.0']) {
+    const d = buildDomain(
+      { name: 'react', currentRange, requestedTarget: '19.1.0', installedVersion: '18.3.1' },
+      peers,
+    );
+    assert.deepEqual(d.versions, ['19.1.0', '19.0.0', '18.3.1'], currentRange);
+  }
+});
+
+test('buildDomain: a `-` in a non-prerelease range does not enable prereleases', () => {
+  const peers = new Map([
+    ['19.0.0', { peerDependencies: {} }],
+    ['19.1.0', { peerDependencies: {} }],
+    ['19.2.0-canary-a1b2c3d4-20250601', { peerDependencies: {} }],
+    ['19.2.0', { peerDependencies: {} }],
+  ]);
+  // Named pnpm catalog.
+  const catalog = buildDomain(
+    { name: 'react', currentRange: 'catalog:react-19', requestedTarget: '19.2.0', installedVersion: '19.1.0' },
+    peers,
+  );
+  assert.deepEqual(catalog.versions, ['19.2.0', '19.1.0']);
+  // Hyphen range syntax.
+  const hyphen = buildDomain(
+    { name: 'react', currentRange: '19.0.0 - 19.2.0', requestedTarget: '19.2.0' },
+    peers,
+  );
+  assert.deepEqual(hyphen.versions, ['19.2.0', '19.1.0', '19.0.0']);
+});
+
+test('buildDomain: a prerelease floor still admits prereleases', () => {
+  const peers = new Map([
+    ['19.0.0-rc.1', { peerDependencies: {} }],
+    ['19.0.0', { peerDependencies: {} }],
+  ]);
+  const d = buildDomain(
+    { name: 'react', currentRange: '^19.0.0-rc.0', requestedTarget: '19.0.0' },
+    peers,
+  );
+  assert.deepEqual(d.versions, ['19.0.0', '19.0.0-rc.1']);
+});
+
+test('resolvePeerRanges: external peers are checked against the lockfile version, not the range floor', () => {
+  // package.json still says `typescript: "^5.5.0"` but the lockfile has 5.9.3 (plus an old
+  // nested 4.9.5). Checking the 5.5.0 floor rejects Angular 21 and forces a needless downgrade.
+  const build = makeDomain(
+    '@angular/build',
+    {
+      '21.0.0': { peerDependencies: { '@angular/compiler-cli': '^21.0.0', typescript: '>=5.9 <6.0' } },
+      '19.2.0': { peerDependencies: { '@angular/compiler-cli': '^19.0.0', typescript: '>=5.5 <5.9' } },
+    },
+    ['21.0.0', '19.2.0'],
+  );
+  const compilerCli = makeDomain(
+    '@angular/compiler-cli',
+    {
+      '21.0.0': { peerDependencies: { typescript: '>=5.9 <6.0' } },
+      '19.2.0': { peerDependencies: { typescript: '>=5.5 <5.9' } },
+    },
+    ['21.0.0', '19.2.0'],
+  );
+  const requested = new Map([['@angular/build', '21.0.0'], ['@angular/compiler-cli', '21.0.0']]);
+  const externalInstalled = new Map([['typescript', '^5.5.0']]);
+  const lockfileVersions = new Map([['typescript', new Set(['4.9.5', '5.9.3'])]]);
+  for (const satThreshold of [Infinity, 0]) {
+    const floorOnly = resolvePeerRanges([build, compilerCli], requested, { externalInstalled, satThreshold });
+    assert.equal(floorOnly?.versions.get('@angular/build'), '19.2.0', 'without lockfile: range floor');
+    const r = resolvePeerRanges([build, compilerCli], requested, {
+      externalInstalled,
+      lockfileVersions,
+      satThreshold,
+    });
+    assert.ok(r, `satThreshold=${satThreshold}`);
+    assert.equal(r.versions.get('@angular/build'), '21.0.0');
+    assert.equal(r.versions.get('@angular/compiler-cli'), '21.0.0');
+    assert.equal(r.downgradedFrom.size, 0);
+  }
 });
 
 test('resolvePeerRanges: no satisfiable tuple returns undefined', () => {

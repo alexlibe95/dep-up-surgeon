@@ -23,6 +23,7 @@
  *   7. **peer-deps**              — scan installed tree for existing peer-dep warnings via a
  *                                   `<mgr> ls --all` (npm) or equivalent — catches "already
  *                                   broken before you asked me to upgrade anything" cases.
+ *                                   Managers without a read-only check are reported as skipped.
  *   8. **audit**                  — `<mgr> audit` dry-run + severity breakdown. Treated as
  *                                   YELLOW for low/moderate, RED for high/critical.
  *   9. **stale-transitives**      — reuses `scanStaleTransitives` from `lockfileFix.ts` to flag
@@ -114,7 +115,7 @@ export async function runDoctor(opts: RunDoctorOptions): Promise<DoctorReport> {
   //    structured output rather than an exception.
   let info: ProjectInfo | undefined;
   try {
-    info = await detectProjectInfo(cwd);
+    info = await detectProjectInfo(cwd, opts.manager);
   } catch (e) {
     checks.push({
       id: 'manager',
@@ -227,17 +228,26 @@ function managerCheck(info: ProjectInfo): DoctorCheck {
   };
 }
 
-/** Count how many of the three lockfile kinds exist alongside the detected one. */
+const LOCKFILES_BY_MANAGER: Record<PackageManager, readonly string[]> = {
+  npm: ['package-lock.json', 'npm-shrinkwrap.json'],
+  pnpm: ['pnpm-lock.yaml'],
+  yarn: ['yarn.lock'],
+  bun: ['bun.lock', 'bun.lockb'],
+};
+
+/** Count every lockfile at the project root, whichever manager wrote it. */
 function countLockfileKinds(info: ProjectInfo): number {
   const { cwd } = info;
   let n = 0;
-  for (const name of ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock']) {
+  for (const name of Object.values(LOCKFILES_BY_MANAGER).flat()) {
     if (fs.existsSync(path.join(cwd, name))) n++;
   }
   return n;
 }
 
-async function lockfileCheck(cwd: string, info: ProjectInfo): Promise<DoctorCheck> {
+async function lockfileCheck(cwd: string, projectInfo: ProjectInfo): Promise<DoctorCheck> {
+  // `lockfileName` also covers `npm-shrinkwrap.json`, which `lockfile` can't represent.
+  const info = { ...projectInfo, lockfile: projectInfo.lockfileName ?? projectInfo.lockfile };
   if (!info.lockfile) {
     return {
       id: 'lockfile',
@@ -245,6 +255,18 @@ async function lockfileCheck(cwd: string, info: ProjectInfo): Promise<DoctorChec
       status: 'yellow',
       message: 'No lockfile on disk.',
       hint: `Run \`${info.manager} install\` once before the upgrade flow so rollbacks have a reference state.`,
+    };
+  }
+  // Reachable via `--package-manager` / `packageManager`; parsing another manager's lockfile
+  // would just report "0 packages" with a misleading hint.
+  if (!LOCKFILES_BY_MANAGER[info.manager].includes(info.lockfile)) {
+    return {
+      id: 'lockfile',
+      label: 'Lockfile',
+      status: 'yellow',
+      message: `\`${info.lockfile}\` does not belong to the selected package manager (${info.manager}).`,
+      hint: `Run \`${info.manager} install\` to create its lockfile, or drop the package-manager override.`,
+      data: { lockfile: info.lockfile, manager: info.manager },
     };
   }
   const abs = path.join(cwd, info.lockfile);
@@ -428,12 +450,12 @@ async function peerDepsCheck(
     };
   }
   const command = peerScanCommandFor(info.manager, info.yarnMajorVersion);
-  if (!command) {
+  if ('skipped' in command) {
     return {
       id: 'peer-deps',
       label: 'Peer dependencies',
       status: 'green',
-      message: `Peer scan not implemented for ${info.manager}; skipping.`,
+      message: `Skipped: ${command.skipped}.`,
     };
   }
   try {
@@ -467,30 +489,39 @@ async function peerDepsCheck(
   }
 }
 
-function peerScanCommandFor(
+/**
+ * Peer-scan command per manager. Doctor must never write node_modules or run lifecycle
+ * scripts, so managers that can only surface peer problems through a real install get
+ * `{ skipped: reason }` instead of a command.
+ */
+export function peerScanCommandFor(
   manager: PackageManager,
   yarnMajorVersion?: number,
-): { bin: string; args: string[] } | undefined {
+): { bin: string; args: string[] } | { skipped: string } {
   switch (manager) {
     case 'npm':
       return { bin: 'npm', args: ['ls', '--all', '--parseable'] };
     case 'pnpm':
-      // `pnpm why` is too targeted; `pnpm list -r --depth Infinity` works but is slow. We
-      // instead rely on `pnpm install --frozen-lockfile --offline` reporting peer warnings in
-      // stderr WITHOUT mutating anything — the `--offline --frozen-lockfile` combo prevents
-      // both registry hits and lockfile mutations.
-      return { bin: 'pnpm', args: ['install', '--frozen-lockfile', '--offline', '--prefer-offline'] };
+      // `pnpm why` is too targeted; `pnpm list` doesn't report peer issues. Re-resolving prints
+      // them: `--lockfile-only` never writes node_modules, `--frozen-lockfile` refuses to change
+      // the lockfile, `--ignore-scripts` rules out lifecycle hooks.
+      return {
+        bin: 'pnpm',
+        args: ['install', '--frozen-lockfile', '--lockfile-only', '--ignore-scripts'],
+      };
     case 'yarn':
-      // yarn classic (v1): `yarn check`. Berry (v2+) has no `yarn check`; use an immutable
-      // install that surfaces peer warnings without mutating the lockfile.
+      // yarn classic (v1): `yarn check` only reads. Berry (v2+) has no `yarn check`, and
+      // `yarn install --immutable` still relinks node_modules / PnP.
       if (yarnMajorVersion !== undefined && yarnMajorVersion >= 2) {
-        return { bin: 'yarn', args: ['install', '--immutable', '--mode=skip-build'] };
+        return { skipped: 'yarn berry has no read-only peer check (`yarn install` relinks node_modules)' };
       }
       return { bin: 'yarn', args: ['check'] };
     case 'bun':
-      return { bin: 'bun', args: ['install', '--frozen-lockfile'] };
+      return {
+        skipped: 'bun has no read-only peer check (`bun install` rewrites node_modules and runs lifecycle scripts)',
+      };
     default:
-      return undefined;
+      return { skipped: `no read-only peer check for ${manager}` };
   }
 }
 
@@ -523,7 +554,14 @@ async function auditCheck(
     };
   }
   try {
-    const r = await runAudit({ manager: info.manager, cwd });
+    // Doctor only counts severities, so skip the per-package registry lookups audit makes to
+    // pick a recommended fix version.
+    const r = await runAudit({
+      manager: info.manager,
+      cwd,
+      fetchVersions: async () => [],
+      ...(info.yarnMajorVersion !== undefined ? { yarnMajorVersion: info.yarnMajorVersion } : {}),
+    });
     if (r.error) {
       return {
         id: 'audit',
@@ -652,7 +690,8 @@ async function staleTransitiveCheck(
       message: 'Skipped via `--skip-stale-scan`.',
     };
   }
-  if (!info.lockfile) {
+  const lockfile = info.lockfileName ?? info.lockfile;
+  if (!lockfile) {
     return {
       id: 'stale-transitives',
       label: 'Stale transitives',
@@ -661,7 +700,7 @@ async function staleTransitiveCheck(
     };
   }
   try {
-    const raw = await fs.readFile(path.join(cwd, info.lockfile), 'utf8');
+    const raw = await fs.readFile(path.join(cwd, lockfile), 'utf8');
     const tree = parseLockfileInstalledVersions(raw, info.manager);
     if (tree.size === 0) {
       return {

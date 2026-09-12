@@ -137,10 +137,32 @@ test('decideOverride: identical pin → skip', () => {
   assert.equal(d.action, 'skip');
 });
 
-test('decideOverride: existing range already covers target → skip', () => {
-  const d = decideOverride('^1.0.0', '1.2.3');
+test('decideOverride: existing range whose floor is already >= target → skip', () => {
+  const d = decideOverride('^1.2.3', '1.2.3');
   assert.equal(d.action, 'skip');
-  assert.match(d.reason, /already satisfies|already pinned/);
+  assert.match(d.reason, />= target/);
+});
+
+test('decideOverride: broad existing range that can still resolve below target → write', () => {
+  // `^6.7.0` and `*` both "contain" 6.14.1, yet the lockfile can keep resolving the vulnerable
+  // 6.7.2 under them, so they must not count as already fixed.
+  for (const existing of ['^6.7.0', '*']) {
+    const d = decideOverride(existing, '6.14.1');
+    assert.equal(d.action, 'write', existing);
+    assert.equal(d.previous, existing);
+    assert.equal(d.applied, '6.14.1');
+  }
+});
+
+test('decideOverride: a known vulnerable range decides skip / write / conflict', () => {
+  const vuln = '<6.14.1';
+  assert.equal(decideOverride('>=6.14.1', '6.14.1', vuln).action, 'skip');
+  assert.equal(decideOverride('^6.7.0', '6.14.1', vuln).action, 'write');
+  // Floor >= target is not enough when the spec still reaches a second vulnerable window.
+  const twoWindows = '<6.14.1 || >=7.0.0 <7.0.2';
+  assert.equal(decideOverride('>=6.14.1', '6.14.1', twoWindows).action, 'write');
+  // Still vulnerable, but writing the target would be a downgrade → needs explicit approval.
+  assert.equal(decideOverride('7.0.1', '6.14.1', twoWindows).action, 'conflict');
 });
 
 test('decideOverride: existing pin is lower than target → write (bumps)', () => {
@@ -203,7 +225,7 @@ test('applyOverrideToFile: writes a new override and preserves trailing newline 
 test('applyOverrideToFile: no-op when existing override already satisfies', async () => {
   const { file } = await tmpPkg({
     name: 'x',
-    overrides: { lodash: '^4.17.0' },
+    overrides: { lodash: '^4.17.21' },
   });
   const before = await fs.readFile(file, 'utf8');
   const result = await applyOverrideToFile({
@@ -215,6 +237,56 @@ test('applyOverrideToFile: no-op when existing override already satisfies', asyn
   assert.equal(result.written, false);
   const after = await fs.readFile(file, 'utf8');
   assert.equal(after, before, 'file untouched');
+});
+
+test('applyOverrideToFile: broad existing pin is tightened to the fixed version', async () => {
+  const { file } = await tmpPkg({ name: 'x', overrides: { qs: '^6.7.0' } });
+  const result = await applyOverrideToFile({
+    packageJsonPath: file,
+    manager: 'npm',
+    entry: { name: 'qs', range: '6.14.1' },
+    vulnerableRange: '<6.14.1',
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.written, true);
+  assert.equal(result.previous, '^6.7.0');
+  const pkg = JSON.parse(await fs.readFile(file, 'utf8'));
+  assert.deepEqual(pkg.overrides, { qs: '6.14.1' });
+});
+
+test('applyOverrideToFile: keeps tab indentation, CRLF endings and a missing trailing newline', async () => {
+  const { file } = await tmpPkg('{\r\n\t"name": "x",\r\n\t"overrides": {\r\n\t\t"keep": "1.0.0"\r\n\t}\r\n}');
+  const result = await applyOverrideToFile({
+    packageJsonPath: file,
+    manager: 'npm',
+    entry: { name: 'qs', range: '6.14.1' },
+  });
+  assert.equal(result.written, true);
+  assert.equal(
+    await fs.readFile(file, 'utf8'),
+    '{\r\n\t"name": "x",\r\n\t"overrides": {\r\n\t\t"keep": "1.0.0",\r\n\t\t"qs": "6.14.1"\r\n\t}\r\n}',
+  );
+});
+
+test('applyOverrideToFile + removeOverrideFromFile: 4-space file round-trips byte-for-byte', async () => {
+  const original = JSON.stringify({ name: 'x', dependencies: { express: '^4.17.0' } }, null, 4) + '\n';
+  const { file } = await tmpPkg(original);
+  await applyOverrideToFile({
+    packageJsonPath: file,
+    manager: 'npm',
+    entry: { name: 'qs', range: '6.14.1' },
+  });
+  assert.equal(
+    await fs.readFile(file, 'utf8'),
+    JSON.stringify(
+      { name: 'x', dependencies: { express: '^4.17.0' }, overrides: { qs: '6.14.1' } },
+      null,
+      4,
+    ) + '\n',
+  );
+  const r = await removeOverrideFromFile(file, 'npm', 'qs');
+  assert.equal(r.removed, true);
+  assert.equal(await fs.readFile(file, 'utf8'), original);
 });
 
 test('applyOverrideToFile: writes pnpm.overrides nested block', async () => {
@@ -500,4 +572,92 @@ test('applyOverrideToFile: chain write then name-only remove does NOT delete the
   assert.equal(r.removed, false, 'legacy name-only remove refuses to touch the nested pin');
   const pkg = JSON.parse(await fs.readFile(file, 'utf8'));
   assert.deepEqual(pkg.overrides, { foo: { bar: '1.2.3' } }, 'nested pin still present');
+});
+
+// --- pnpm-workspace.yaml overrides ------------------------------------------------------
+// pnpm 10+ reads `overrides` from pnpm-workspace.yaml (pnpm 11 only from there). Existing pins
+// there must be visible, and projects that keep their pins there get new pins written there.
+
+async function tmpPnpmWorkspace(pkg, yaml) {
+  const { dir, file } = await tmpPkg(pkg);
+  const yamlFile = path.join(dir, 'pnpm-workspace.yaml');
+  await fs.writeFile(yamlFile, yaml);
+  return { dir, file, yamlFile };
+}
+
+test('readOverrides (pnpm): includes entries from pnpm-workspace.yaml', () => {
+  const r = readOverrides({ name: 'x' }, 'pnpm', {
+    pnpmWorkspace: { packages: ['packages/*'], overrides: { qs: '6.7.2', 'foo>bar': '1.0.0' } },
+  });
+  assert.equal(r.present, true);
+  const bySig = Object.fromEntries(r.entries.map((e) => [e.chain.join('>'), e]));
+  assert.equal(bySig.qs.range, '6.7.2');
+  assert.deepEqual(bySig['foo>bar'].chain, ['foo', 'bar']);
+});
+
+test('applyOverrideToFile (pnpm): a safe pin in pnpm-workspace.yaml is respected', async () => {
+  const yaml = 'packages:\n  - packages/*\n\noverrides:\n  qs: ">=6.14.1"\n';
+  const { file, yamlFile } = await tmpPnpmWorkspace({ name: 'x' }, yaml);
+  const pkgBefore = await fs.readFile(file, 'utf8');
+  const r = await applyOverrideToFile({
+    packageJsonPath: file,
+    manager: 'pnpm',
+    entry: { name: 'qs', range: '6.14.1' },
+    vulnerableRange: '<6.14.1',
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.written, false);
+  assert.equal(r.previous, '>=6.14.1');
+  assert.equal(await fs.readFile(file, 'utf8'), pkgBefore, 'package.json untouched');
+  assert.equal(await fs.readFile(yamlFile, 'utf8'), yaml, 'pnpm-workspace.yaml untouched');
+});
+
+test('applyOverrideToFile (pnpm): pins go to pnpm-workspace.yaml when it holds the overrides', async () => {
+  const yaml = [
+    '# workspace layout',
+    'packages:',
+    '  - packages/*',
+    '',
+    '# security pins, keep sorted',
+    'overrides:',
+    '  lodash: 4.17.21 # CVE-2021-23337',
+    '  qs: 6.7.2',
+    '',
+  ].join('\n');
+  const { file, yamlFile } = await tmpPnpmWorkspace({ name: 'x' }, yaml);
+  const pkgBefore = await fs.readFile(file, 'utf8');
+
+  const bump = await applyOverrideToFile({
+    packageJsonPath: file,
+    manager: 'pnpm',
+    entry: { name: 'qs', range: '6.14.1' },
+  });
+  assert.equal(bump.written, true);
+  assert.equal(bump.previous, '6.7.2');
+  const scoped = await applyOverrideToFile({
+    packageJsonPath: file,
+    manager: 'pnpm',
+    entry: { name: 'bar', range: '2.0.0', parentChain: ['foo'] },
+  });
+  assert.equal(scoped.written, true);
+
+  assert.equal(await fs.readFile(file, 'utf8'), pkgBefore, 'package.json untouched');
+  const out = await fs.readFile(yamlFile, 'utf8');
+  assert.match(out, /# workspace layout/);
+  assert.match(out, /# security pins, keep sorted/);
+  assert.match(out, /lodash: 4\.17\.21 # CVE-2021-23337/);
+  assert.match(out, /qs: 6\.14\.1/);
+  assert.match(out, /foo>bar: 2\.0\.0/);
+});
+
+test('removeOverrideFromFile (pnpm): drops a pin from pnpm-workspace.yaml and keeps comments', async () => {
+  const yaml = 'overrides:\n  # pinned for CVE-2022-24999\n  qs: 6.14.1\n  foo>bar: 2.0.0\n';
+  const { file, yamlFile } = await tmpPnpmWorkspace({ name: 'x' }, yaml);
+  const r = await removeOverrideFromFile(file, 'pnpm', { chain: ['foo', 'bar'] });
+  assert.equal(r.ok, true);
+  assert.equal(r.removed, true);
+  assert.equal(
+    await fs.readFile(yamlFile, 'utf8'),
+    'overrides:\n  # pinned for CVE-2022-24999\n  qs: 6.14.1\n',
+  );
 });

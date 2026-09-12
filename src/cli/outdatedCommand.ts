@@ -1,12 +1,13 @@
 /**
  * Dedicated entry point for `dep-up-surgeon outdated`. Read-only report of installed vs
- * registry latest — no mutations. Exit 1 when any package is outdated (CI-friendly).
+ * registry latest — no mutations. Exit 1 when any package is outdated (CI-friendly), 2 when
+ * nothing could be checked (see `outdatedExitCode`).
  */
 import path from 'node:path';
 import { Command } from 'commander';
 import { parsePackageManagerOption } from '../core/workspaces.js';
 import { log } from '../utils/logger.js';
-import { renderOutdatedHuman, runOutdated } from './outdated.js';
+import { outdatedExitCode, renderOutdatedHuman, runOutdated } from './outdated.js';
 
 export async function runOutdatedCommand(argv: string[], version: string): Promise<void> {
   const cmd = new Command();
@@ -14,7 +15,8 @@ export async function runOutdatedCommand(argv: string[], version: string): Promi
     .name('dep-up-surgeon outdated')
     .description(
       'Report which direct dependencies are behind registry @latest (installed version from ' +
-        'the lockfile when available). Read-only. Exits 1 if any package is outdated, 0 otherwise. ' +
+        'the lockfile when available). Read-only. Exits 1 if any package is outdated, 2 if no ' +
+        'package could be checked (every registry lookup failed), 0 otherwise. ' +
         'Use before an upgrade run, or in CI as a soft gate.',
     )
     .version(version)
@@ -57,7 +59,7 @@ export async function runOutdatedCommand(argv: string[], version: string): Promi
     } else {
       process.stdout.write(`${renderOutdatedHuman(report)}\n`);
     }
-    process.exitCode = report.summary.outdated > 0 ? 1 : 0;
+    process.exitCode = outdatedExitCode(report);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     if (opts.json) {

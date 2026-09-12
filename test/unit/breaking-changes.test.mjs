@@ -76,6 +76,33 @@ test('scanForBreakingChanges: non-breaking prose is NOT flagged', () => {
   assert.equal(r.hasBreaking, false, 'false positive on feature prose');
 });
 
+test('scanForBreakingChanges: negated, internal-only and CI-only mentions are NOT flagged', () => {
+  for (const body of [
+    'No breaking changes',
+    'This release contains no breaking changes.',
+    '- Non-breaking: `parse()` accepts an optional second argument',
+    '### Breaking Changes: none',
+    '- Remove unused dev dependency',
+    '- Renamed internal helper to `normalizePath`',
+    'Tests now require Node 20 in CI',
+    '- Drop Node 18 from the CI matrix',
+  ]) {
+    const r = scanForBreakingChanges(body);
+    assert.equal(r.hasBreaking, false, `false positive on "${body}" (${r.reasons.join(', ')})`);
+  }
+});
+
+test('scanForBreakingChanges: public-API removals and support drops are still flagged', () => {
+  const r1 = scanForBreakingChanges('- Removed support for Node 16');
+  assert.equal(r1.hasBreaking, true);
+  const r2 = scanForBreakingChanges('- Remove the `legacyHeaders` option');
+  assert.equal(r2.hasBreaking, true);
+  assert.equal(r2.reasons[0], 'removed API');
+  const r3 = scanForBreakingChanges('- The `engines.node` field now requires Node >= 20');
+  assert.equal(r3.hasBreaking, true);
+  assert.equal(r3.reasons[0], 'raises minimum Node');
+});
+
 test('scanForBreakingChanges: caps at 10 matches + dedupes identical lines', () => {
   const repeated = Array.from({ length: 20 }, () => 'BREAKING CHANGE: foo is gone').join('\n');
   const r = scanForBreakingChanges(repeated);
