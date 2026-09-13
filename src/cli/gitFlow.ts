@@ -42,7 +42,7 @@ import {
   type GitCommitMode,
   type UpgradeChange,
 } from './git.js';
-import { LAST_RUN_FILENAME } from './lastRun.js';
+import { isToolArtifact } from './sideEffects.js';
 
 export interface GitFlowConfig {
   enabled: boolean;
@@ -446,16 +446,6 @@ export async function createGitFlow(
       commits,
     },
   };
-}
-
-/** Files dep-up-surgeon itself writes into the project (report, summary, rollback backups). */
-function isToolArtifact(file: string): boolean {
-  const base = path.basename(file);
-  return (
-    base === LAST_RUN_FILENAME ||
-    /^dep-up-surgeon-summary\.(md|html)$/.test(base) ||
-    base.endsWith('.dep-up-surgeon.bak')
-  );
 }
 
 function firstLine(s: string): string {

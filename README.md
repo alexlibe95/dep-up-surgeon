@@ -36,6 +36,14 @@ npm run build
 npx dep-up-surgeon --help
 ```
 
+## Upgrading from 3.x
+
+4.0 changes a few defaults — check these if you run dep-up-surgeon in CI:
+
+- **Run state moved** from `.dep-up-surgeon.last-run.json` in the project root to `node_modules/.cache/dep-up-surgeon/` (`last-run.json` + `last-run.<lockfile>`), so a run leaves only `package.json` and the lockfile changed. Root reports from older versions are still read by `undo` / `--retry-failed`; cache or upload the new directory instead of the old file.
+- **Validation is stricter.** The default validator also runs your `lint` / `typecheck` / `type-check` scripts (see **Pre-flight check**), and every install is followed by a peer-range check between installed direct dependencies (see **Conflict detection**). Expect rollbacks — and exit `1` — where 3.x kept an upgrade that broke linting or left the tree uninstallable.
+- **Files the run rewrites are restored.** Tracked files other than dependency files that change during the run (e.g. `tsconfig.json` rewritten by `next build`) are checked out again at the end.
+
 ## Usage
 
 From your project root (where `package.json` lives):
@@ -58,7 +66,7 @@ dep-up-surgeon outdated [options]
 | `--json` | Machine-readable report on stdout (see **JSON report**). Progress, warnings and errors go to stderr, so stdout is always valid JSON. |
 | `--fallback-strategy <mode>` | `major-lines` (**default**), `minor-lines`, or `none`. After `@latest` fails, **`major-lines`** tries the best stable version per **major** (e.g. `9.x` → `8.x` → `7.x` …). **`minor-lines`** steps one **`major.minor` line** at a time. If npm output looks like **ESM vs CommonJS** (`ERR_REQUIRE_ESM`), further fallbacks for that package **stop**. `none` only attempts `@latest`. |
 | `--link-groups <mode>` | `auto` (**default**) or `none`. **`auto`** builds **linked batches** from the registry graph and optional **`linkedGroups`**. **`none`** upgrades one dependency per step. |
-| `--validate <cmd>` | Override the validator command run after every install. Defaults to `<manager> test` if a `test` script exists, else `<manager> run build` (yarn classic uses `yarn build`), else nothing. Useful in monorepos where the default build is heavy or fragile (e.g. `--validate "tsc -p tsconfig.json --noEmit"`). |
+| `--validate <cmd>` | Override the validator command run after every install. Defaults to `<manager> test` if a `test` script exists, else `<manager> run build` (yarn classic uses `yarn build`), else nothing — plus any `lint` / `typecheck` / `type-check` script, guarded by its pre-flight exit code (see **Pre-flight check**). Useful in monorepos where the default build is heavy or fragile (e.g. `--validate "tsc -p tsconfig.json --noEmit"`). |
 | `--no-validate` | Skip validation entirely. Upgrades are kept regardless of test/build outcome. Different from `--force`: `--force` runs the validator and only keeps the bump when it fails, `--no-validate` doesn’t run a validator at all. |
 | `--package-manager <mgr>` | `auto` (**default**), `npm`, `pnpm`, `yarn`, or `bun`. `auto` reads the `packageManager` field, then falls back to lockfile detection (`pnpm-lock.yaml` → pnpm, `yarn.lock` → yarn, `bun.lock` / `bun.lockb` → bun, `package-lock.json` → npm), then `pnpm-workspace.yaml`, then `npm`. The chosen manager drives both the **install** command (`<mgr> install`) and the **default validator** (`<mgr> test` / `<mgr> run build`; bun uses `bun run test` / `bun run build`). |
 | `--cwd <path>` | Run against this directory instead of `process.cwd()`. Default is still the current working directory, so scripts that `cd` first keep working. Same flag as `doctor` / `undo` / `outdated`. |
@@ -71,8 +79,8 @@ dep-up-surgeon outdated [options]
 | `--install-mode <mode>` | Workspace install strategy. **`root`** (default) always runs `<mgr> install` from the workspace root after every mutation — the safest option, supported by every package manager. **`filtered`** rewrites per-child installs to their workspace-scoped form: **npm 7+** uses `npm install --workspace <name>`, **pnpm** / **bun** use `<mgr> install --filter <name>`, **yarn berry (v2+) with `@yarnpkg/plugin-workspace-tools`** uses `yarn workspaces focus <name>`, and **yarn classic / berry without the plugin** falls back to a full root install with a one-time warning explaining the upgrade path. The capability is auto-detected at startup (yarn version + plugin probe) and reported as `project.yarnMajorVersion` + `project.yarnSupportsFocus` in `--json`. Only meaningful with `--workspaces` / `--workspaces-only` / `--workspace <names>`. |
 | `--concurrency <n>` | Maximum number of workspace targets to traverse in parallel (1–16; default `1`). Higher values overlap registry **scan + plan** phases across targets while a shared mutex keeps **install + validation strictly serialized** — the workspace lockfile is shared, so concurrent installs would corrupt it. The default in-process registry cache also deduplicates `pacote.manifest` / `pacote.packument` calls across targets, so even at concurrency `1` you get a speedup when the same dep appears in many workspaces. **Requires `--json`** so per-target log lines don't interleave; non-JSON mode silently downgrades to `1` with a warning. In an **isolated-lockfile** monorepo (pnpm `shared-workspace-lockfile=false`, or every workspace member shipping its own lockfile) installs + validation are ALSO run in parallel — see **Parallel installs** below. |
 | `--no-parallel-installs` | Force installs + validation to stay serialized even when an isolated-lockfile monorepo is detected. Useful when debugging a flaky install step (parallel installs mask the ordering) or when a per-workspace postinstall script touches shared state outside its workspace. |
-| `--retry-failed` | Resume the previous run from `.dep-up-surgeon.last-run.json`: freeze last-run successes and terminal failures (`peer`, `validation-script`) **per workspace**, and re-attempt only non-terminal residue (`install`, `validation-conflicts`, `versions`, `unknown`). User `--ignore` / rc lists stay global. See **Retry-failed mode** below. |
-| `--no-persist-report` | Do **not** write `.dep-up-surgeon.last-run.json` after the run. By default the structured report is written next to the workspace root for `--retry-failed` and CI consumers. |
+| `--retry-failed` | Resume the previous run from its last-run report (`node_modules/.cache/dep-up-surgeon/last-run.json`): freeze last-run successes and terminal failures (`peer`, `validation-script`) **per workspace**, and re-attempt only non-terminal residue (`install`, `validation-conflicts`, `versions`, `unknown`). User `--ignore` / rc lists stay global. See **Retry-failed mode** below. |
+| `--no-persist-report` | Do **not** write the last-run report after the run. By default it is written to `node_modules/.cache/dep-up-surgeon/last-run.json` (with pre-run lockfile backups) for `undo`, `--retry-failed` and CI consumers. |
 | `--summary <format>` | Write a human-friendly summary of the run as `md` (default) or `html`. Destination is `$GITHUB_STEP_SUMMARY` if set (appended), otherwise `--summary-file <path>`, otherwise `./dep-up-surgeon-summary.<ext>`. |
 | `--summary-file <path>` | Override the destination for `--summary`. Wins over `$GITHUB_STEP_SUMMARY`. |
 | `--ci` | Convenience flag for CI / bot use. Disables `--interactive`, auto-enables `--summary md` (great with `$GITHUB_STEP_SUMMARY`), and **exits `0` even when individual upgrades fail** (only pre-flight failures and fatal errors exit `1`) so per-package conflicts surface in the PR description instead of failing the job. |
@@ -107,23 +115,30 @@ Before mutating any dependency, the CLI runs the resolved validator command **on
 - If it **fails**, the run aborts immediately with an error containing the validator command, exit code, and last ~40 lines of output. This prevents the common failure mode where every per-group rollback looks identical because the project build was already broken before the run.
 - To proceed anyway, use `--validate "<cmd>"` to swap the validator, `--no-validate` to skip it, or `--force` to ignore the pre-flight failure.
 
-The pre-flight outcome is also surfaced under `preflight` / `preflightAborted` in `--json` output.
+**Extra check scripts.** A build alone can pass while an upgrade breaks linting — TypeScript 7, for example, drops the JS API that `typescript-eslint` loads, so `next build` succeeds and `npm run lint` crashes. With the default validator, pre-flight therefore also runs each `lint`, `typecheck` and `type-check` script the project defines:
+
+- scripts that **pass** on the unchanged tree run after `test` / `build` on every upgrade (`Pre-flight ok: \`npm run build && npm run lint\``), and a failure there rolls the upgrade back;
+- scripts that **already fail** don't block the run (a warning says so) but still run after every upgrade, compared by **exit code**: the upgrade is rolled back only when the script exits differently than on the unchanged tree. Existing lint errors (ESLint exit 1) are tolerated; a crash the upgrade causes (ESLint exit 2) is not; an upgrade that fixes the script (exit 0) is fine.
+
+An explicit `--validate "<cmd>"` / rc `validate` or `--no-validate` is used exactly as given. The CRA-style watch-mode trap is handled too: the `test` script runs with `CI=true` (unless you already set `CI`), so `react-scripts test` runs once instead of waiting forever.
+
+The pre-flight outcome is also surfaced under `preflight` / `preflightAborted` in `--json` output (`preflight.extraScripts` lists the extra checks, `preflight.failingScripts` the ones that already failed, with their exit code). A run that aborts at pre-flight changed nothing, so it does not overwrite the last-run report.
 
 ### Persisted last-run report
 
-After every CLI run that changes the project the structured report is written to `.dep-up-surgeon.last-run.json` next to the workspace root (set `--no-persist-report` to opt out). `--dry-run` never writes it, so a dry run can't overwrite the record `undo` and `--retry-failed` rely on. The file mirrors the `--json` output and adds a small header (`finishedAt`, `toolVersion`, `cwd`, `dryRun`) so CI dashboards / bots can pick it up without re-running the tool. Each `upgraded` / `failed` row carries a `workspace` field when more than one target was traversed — `--retry-failed` uses that label so a freeze in one member does not skip the same package name in another. Add the file to your `.gitignore` if you don't want it tracked.
+After every CLI run that changes the project the structured report is written to `node_modules/.cache/dep-up-surgeon/last-run.json` under the workspace root (set `--no-persist-report` to opt out). Like the Nx / Babel / Vite caches it lives in `node_modules/.cache`, and the directory carries its own `.gitignore`, so **a run leaves only `package.json` and the lockfile changed in `git status`**. Deleting `node_modules` (e.g. `npm ci`) deletes the record too — run `undo` before that. Reports older versions wrote to the project root (`.dep-up-surgeon.last-run.json`) are still read; you can delete those files. `--dry-run` never writes it, so a dry run can't overwrite the record `undo` and `--retry-failed` rely on. The file mirrors the `--json` output and adds a small header (`finishedAt`, `toolVersion`, `cwd`, `dryRun`) so CI dashboards / bots can pick it up without re-running the tool. Each `upgraded` / `failed` row carries a `workspace` field when more than one target was traversed — `--retry-failed` uses that label so a freeze in one member does not skip the same package name in another. When the run changed a lockfile, its pre-run bytes are saved alongside as `last-run.<lockfile>` (e.g. `last-run.bun.lock`) for `undo`.
 
 ### Retry-failed mode (`--retry-failed`)
 
 Pass `--retry-failed` to **resume** the previous run instead of starting from scratch:
 
-- `dep-up-surgeon` reads `.dep-up-surgeon.last-run.json` and **freezes** every package that either:
+- `dep-up-surgeon` reads the last-run report and **freezes** every package that either:
   - **succeeded** in the last run (no need to redo work), **or**
   - failed for a **terminal** reason: `peer` (real peer-dep conflict; bumping the same package alone almost always fails the same way) or `validation-script` (the project's own test/build script crashed; re-running won't help without a code change).
 - Freezes are **per workspace**, keyed as `workspace::name` (for example `@org/web::lodash`). A success or terminal failure in `@org/web` does **not** skip the same package in `@org/api`. Bare `--ignore` / `.dep-up-surgeonrc` ignore entries remain global (the name is skipped in every workspace). Rows from root-only runs or older reports without a `workspace` field still freeze the bare name everywhere (same as before).
 - It then **re-attempts** only the residue: failures classified as `install`, `validation-conflicts`, `versions`, or `unknown`. These are the cases where another dependency move during the new run can plausibly unblock them.
 - Linked-group failures (`name === '[group:<id>]'`) are expanded to **every member of the group** via the persisted `groups` field, scoped to the workspace that owned the group, so freezing a peer-failed group correctly freezes every package in it without leaking to other members.
-- If `.dep-up-surgeon.last-run.json` is missing the CLI exits `1` with a friendly message; pass `--retry-failed` only after at least one prior run.
+- If the last-run report is missing the CLI exits `1` with a friendly message; pass `--retry-failed` only after at least one prior run.
 
 Typical workflow:
 
@@ -171,7 +186,7 @@ Typical GitHub Actions step:
   run: npx dep-up-surgeon --workspaces --ci
 ```
 
-The job stays green; the **Summary** tab shows the upgraded / failed tables; `.dep-up-surgeon.last-run.json` is committed (or uploaded as an artifact) so a follow-up `--retry-failed` job can resume the residue.
+The job stays green; the **Summary** tab shows the upgraded / failed tables; `node_modules/.cache/dep-up-surgeon/` is cached or uploaded as an artifact (restore it into the next job's `node_modules/.cache`) so a follow-up `--retry-failed` job can resume the residue.
 
 ### Git integration (`--git-commit`)
 
@@ -335,6 +350,7 @@ Guard rails that keep it safe:
 
 - **Bounded search** — capped at 400 tuples explored per batch (small graphs) or `400 × members` tuples for the SAT path's DFS phase. Past that the resolver gives up silently instead of hanging the run on pathological inputs.
 - **Optional peers** (`peerDependenciesMeta[name].optional === true`) are ignored. An unsatisfied optional peer isn't a hard conflict.
+- **Installed direct deps outside the batch still bound it** — each member's candidates are narrowed to versions that satisfy the peer ranges declared by the installed direct dependencies that aren't being bumped (a package already at latest never joins the batch, but its peers still count).
 - **Deprecated versions** never appear in the domain. We'd rather fail to find a solution than auto-suggest a known-bad version.
 - **Ad-hoc group size cap** — default 6 members (primary + up to 5 direct-dep blockers). Prevents registry fetch storms on pathological peer graphs.
 - **Ad-hoc never adds dependencies** — a peer on a transitive that isn't already a direct dep is ignored rather than introduced.
@@ -438,16 +454,17 @@ npx dep-up-surgeon --override "lodash@4.17.21" --summary md
 
 ### Disaster recovery (`dep-up-surgeon undo`)
 
-Every run writes `.dep-up-surgeon.last-run.json` — a structured record of what the tool did (previous ranges, `to` values, every override attempt with `applied`/`previous`, workspace targets). `dep-up-surgeon undo` replays that record **in reverse**:
+Every run writes a last-run report (`node_modules/.cache/dep-up-surgeon/last-run.json`) — a structured record of what the tool did (previous ranges, `to` values, every override attempt with `applied`/`previous`, workspace targets). `dep-up-surgeon undo` replays that record **in reverse**:
 
 1. For every successful upgrade row, write the recorded `from` back to `package.json` (in whatever section currently holds the dep, across the root and every workspace target).
 2. For every successful override attempt, drop the pin we added — or, when the attempt recorded a `previous` value (the run replaced an existing pin), restore that previous value.
-3. Run `<manager> install` once per edited target so the lockfile re-converges to the reverted `package.json`.
+3. Put back the pre-run bytes of every root lockfile the run changed (the run saved them next to the report as `last-run.<lockfile>`), then run `<manager> install` once per edited target. Reinstalling alone isn't enough: a reverted `^16.3.1` still allows the `16.3.5` the run installed, so without the backup those versions would stay.
 4. Run the validator so you see green/red before you commit the revert.
 
 Drift protection:
 
 - If the current `package.json` value for a dep **doesn't match** the `to` the run landed on (another run, or a human edit, moved it), the row is **skipped** with `reason: 'drifted'`. Undo never rewrites state we don't recognize.
+- The lockfile backup is only restored when **every** row reverted and the lockfile still hashes to what the run left behind; otherwise undo says why (`lockfile bun.lock: not restored (…)`) and falls back to reinstalling from the reverted ranges.
 - When the recorded run was `--dry-run`, undo is a **no-op**.
 - Missing / unparseable run report → the command exits with status 2 and a clear error message.
 
@@ -468,7 +485,7 @@ npx dep-up-surgeon undo --no-validate
 
 | Option | Description |
 |--------|-------------|
-| `--file <path>` | Replay a specific last-run report instead of `.dep-up-surgeon.last-run.json`. |
+| `--file <path>` | Replay a specific last-run report instead of `node_modules/.cache/dep-up-surgeon/last-run.json`. |
 | `--json` | Emit the structured `UndoResult` on stdout. |
 | `--dry-run` | Print the reverse plan without touching disk. |
 | `--no-validate` / `--validate <cmd>` | Skip or override the post-reverse validator. |
@@ -515,12 +532,13 @@ What it checks, in order (stable IDs for `--json` consumers):
 1. **`node-version`** — current Node satisfies `engines.node` (if set). Red when a mismatched Node would tear down peer-dep resolution in ways that look like CVE-driven failures later.
 2. **`manager`** — a single package manager was resolved cleanly. Yellow when multiple lockfiles coexist or the tool had to fall back to the `npm` default without any signal.
 3. **`lockfile`** — the lockfile is parseable. Yellow on npm v1 shape (upgrades to v2 recommended); red on unreadable / corrupt files.
-4. **`workspace-coherence`** — declared workspace members resolve on disk with their own `package.json`.
-5. **`policy`** — `.dep-up-surgeon.policy.{yaml,json}` (when present) parses without warnings.
-6. **`preflight-validator`** — your `<mgr> test` / `<mgr> run build` (or `--validate <cmd>`) passes right now, before any upgrade. Red here means the project is broken **before** the upgrade loop — fix that first or every failure downstream will look like a regression.
-7. **`peer-deps`** — existing peer / missing dep warnings (via `npm ls --all`, `pnpm install --frozen-lockfile --offline`, or `yarn check`). Catches "already broken before you touched it" cases.
-8. **`audit`** — `<mgr> audit` dry-run with severity breakdown. Red on any high/critical advisory, yellow on low/moderate.
-9. **`stale-transitives`** — up to 100 transitives scanned against registry `latest`; yellow when any are more than a minor or a full major behind. Informational (never red); run `--fix-lockfile` to clean up the easy ones.
+4. **`dependencies-installed`** — declared dependencies are actually installed (`node_modules`, or Yarn Plug'n'Play). Red when they aren't, with a `<mgr> install` hint — otherwise the validator and peer scan below fail for that reason alone and bury the real cause.
+5. **`workspace-coherence`** — declared workspace members resolve on disk with their own `package.json`.
+6. **`policy`** — `.dep-up-surgeon.policy.{yaml,json}` (when present) parses without warnings.
+7. **`preflight-validator`** — your `<mgr> test` / `<mgr> run build` (or `--validate <cmd>`) passes right now, before any upgrade. Red here means the project is broken **before** the upgrade loop — fix that first or every failure downstream will look like a regression.
+8. **`peer-deps`** — existing peer / missing dep warnings (via `npm ls --all`, `pnpm install --frozen-lockfile --offline`, or `yarn check`). Catches "already broken before you touched it" cases.
+9. **`audit`** — `<mgr> audit` dry-run with severity breakdown. Red on any high/critical advisory, yellow on low/moderate.
+10. **`stale-transitives`** — up to 100 transitives scanned against registry `latest`; yellow when any are more than a minor or a full major behind. Informational (never red); run `--fix-lockfile` to clean up the easy ones.
 
 Exit codes:
 
@@ -652,6 +670,8 @@ There are **no framework-specific lists**. Groups are derived from your **direct
 
 After each `npm install`, output is passed through a **generic conflict parser** (regex-based, no hardcoded package names). Lines that only refer to the **root** `package.json` **`name`** (for example npm’s `While resolving: my-app@0.0.0`) are filtered out so they do not appear as fake registry-package conflicts. Structured conflicts are **classified** (e.g. peer mismatch, missing peer, version range, engine, unresolved tree). If **`npm install` exits successfully** but conflicts are still detected in the log, the tool **rolls back** the bump (unless **`--force`**). Failed runs also attach parsed conflicts to the report where possible.
 
+**Installed peer ranges.** A clean install exit code isn't proof the tree is consistent: npm keeps an already-locked tree without re-checking the peers of packages it didn't touch, and bun never enforces peers. So bumping `react` to 19.3.0 can "succeed" while `@react-three/fiber@9.7.0` (already at latest, so never part of the batch) still demands `react <19.3` — and the next clean install fails with `ERESOLVE`. After every install the tool therefore reads the installed `node_modules/<dep>/package.json` of each direct dependency and checks their non-optional peer ranges against each other. A violation that wasn't there before the install rolls the attempt back as a `peer` failure (`react@19.3.0 is outside the peer range ">=19 <19.3" of @react-three/fiber@9.7.0`) and hands it to the peer resolvers, which can then pick a compatible version (e.g. `react@19.2.8`). Violations that already existed are left alone. `--force` skips the check.
+
 ### Why not only “latest”?
 
 `latest` may not be adoptable yet (e.g. **ESM-only** majors, or a **TypeScript** major that breaks your build). The default strategy tries **`@latest` first**, then walks older **release lines** when fallbacks are enabled.
@@ -751,6 +771,8 @@ Use this for CI or tooling that needs structured results.
 
 - Before the first real change, the tool copies `package.json` to `package.json.dep-up-surgeon.bak`; the copy is removed when the run ends.
 - Every install attempt first snapshots `package.json`, the lockfile and any catalog file. A failed attempt, an uncaught error, or Ctrl+C / `SIGTERM` puts those files back byte-for-byte: upgrades that already passed validation stay, the one in progress is undone. After an interruption, run your package manager's install to resync `node_modules`.
+- **Only dependency files are left changed.** In a git repo, any tracked file that was clean before the run and got rewritten during it — typically by the validator (Next 16's `next build` rewrites `tsconfig.json`) or an install script — is checked out again at the end, and listed (`Restored files the run changed besides dependencies: …`, `restoredFiles` in `--json`). `package.json`, lockfiles, `pnpm-workspace.yaml` and `.dep-up-surgeonrc` are kept; files you had already edited are never touched; new untracked files are only reported, never deleted. `undo` follows the same rule.
+- If the reinstall that follows a rollback **itself fails**, `node_modules` no longer matches the restored lockfile and every later attempt would fail the same way. The run stops there (`Stopped early: …`), across all workspace targets, instead of attempting — and failing — every remaining package; run your package manager's install, then re-run.
 
 **Supply chain & registry trust**
 
@@ -798,7 +820,7 @@ The `⠹` / `⠇` / `⠸` style glyphs are an animated spinner on a TTY; in CI l
 | `cli/interactive.ts` | `prompts`-based choices for failed packages and failed linked groups. |
 | `cli/report.ts` | Structured `--json` report builder + on-screen summary printer. |
 | `cli/summary.ts` | `--summary md\|html` writer; appends to `$GITHUB_STEP_SUMMARY` when present. |
-| `cli/lastRun.ts` | Persist `.dep-up-surgeon.last-run.json` after every run + read it back for `--retry-failed` (terminal-vs-retryable failure classification; per-workspace `workspace::name` ignore keys). |
+| `cli/lastRun.ts` | Persist the last-run report + pre-run lockfile backups to `node_modules/.cache/dep-up-surgeon` after every run + read them back for `undo` / `--retry-failed` (terminal-vs-retryable failure classification; per-workspace `workspace::name` ignore keys). |
 | `utils/ignoreMatch.ts` | Shared ignore-key helpers: `workspace::name` retry keys + per-target materialization so a freeze in one member cannot leak. |
 | `cli/git.ts` | Low-level git wrappers (`isGitRepo`, `gitAdd`, `gitCommit`, branch helpers) + commit message formatters for the three commit modes. |
 | `cli/gitFlow.ts` | `--git-commit` controller: pre-flight checks (clean tree, branch checkout), buffers per-target / per-run changes, dispatches commits via the engine's `onUpgradeApplied` / `onTargetComplete` hooks under the install lock. |

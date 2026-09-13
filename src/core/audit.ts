@@ -63,7 +63,11 @@ export interface RunAuditOptions {
    * Inject the actual command execution. Used in tests to pass canned JSON blobs without
    * shelling out. Receives the chosen `bin` and argv and must return `{ stdout, exitCode }`.
    */
-  exec?: (bin: string, args: string[], cwd: string) => Promise<{ stdout: string; exitCode: number }>;
+  exec?: (
+    bin: string,
+    args: string[],
+    cwd: string,
+  ) => Promise<{ stdout: string; exitCode: number; timedOut?: boolean }>;
   /**
    * Major version of the project's yarn (1 = classic, 2+ = berry). Berry has no `yarn audit`, so
    * this picks the command. Probed with `yarn --version` when omitted.
@@ -99,6 +103,12 @@ export async function runAudit(opts: RunAuditOptions): Promise<AuditResult> {
   try {
     const r = await exec(command.bin, command.args, opts.cwd);
     stdout = r.stdout;
+    if (r.timedOut) {
+      return {
+        advisories: [],
+        error: `${command.bin} ${command.args.join(' ')} timed out after ${AUDIT_TIMEOUT_MS / 1000}s`,
+      };
+    }
     // Non-zero exits are normal when vulns are found — we still parse.
     // Only treat a zero-length stdout + non-zero exit as a real error.
     if (!stdout && r.exitCode !== 0) {
@@ -126,13 +136,19 @@ export async function runAudit(opts: RunAuditOptions): Promise<AuditResult> {
   return { advisories: toAdvisories(parsed.entries) };
 }
 
+/**
+ * Big trees (e.g. Gatsby, ~2k packages) take well over a minute for `npm audit` to answer; a
+ * 60s cap killed it and surfaced as a confusing "exited -1 with no output".
+ */
+const AUDIT_TIMEOUT_MS = 180_000;
+
 async function defaultExec(
   bin: string,
   args: string[],
   cwd: string,
-): Promise<{ stdout: string; exitCode: number }> {
-  const r = await execa(bin, args, { cwd, reject: false, timeout: 60_000 });
-  return { stdout: r.stdout ?? '', exitCode: r.exitCode ?? -1 };
+): Promise<{ stdout: string; exitCode: number; timedOut: boolean }> {
+  const r = await execa(bin, args, { cwd, reject: false, timeout: AUDIT_TIMEOUT_MS });
+  return { stdout: r.stdout ?? '', exitCode: r.exitCode ?? -1, timedOut: Boolean(r.timedOut) };
 }
 
 async function detectYarnMajor(opts: RunAuditOptions, exec: ExecFn): Promise<number | undefined> {

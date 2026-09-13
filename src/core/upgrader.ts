@@ -11,11 +11,19 @@ import type {
   InstallDiagnostic,
   ScannedPackage,
   UpgradeRecord,
+  PreflightDiagnostic,
   ValidationDiagnostic,
 } from '../types.js';
 import type { PackageJson } from '../types.js';
 import { addFailure, addUpgrade, createEmptyReport } from './conflict.js';
-import { validateProject, type ValidationOptions, type ValidationResult } from './validator.js';
+import {
+  detectExtraCheckScripts,
+  runPackageScript,
+  validateProject,
+  type ExtraCheck,
+  type ValidationOptions,
+  type ValidationResult,
+} from './validator.js';
 import { createSpinner, log, type Spinner } from '../utils/logger.js';
 import {
   detectEsmCommonJsBlockage,
@@ -27,8 +35,21 @@ import {
   type InstallOptions,
   type InstallResult,
 } from '../utils/npm.js';
-import { detectProjectInfo, type PackageManager, type ProjectInfo } from './workspaces.js';
+import {
+  describeRootLockfiles,
+  detectProjectInfo,
+  type PackageManager,
+  type ProjectInfo,
+} from './workspaces.js';
 import { tailLines } from '../utils/output.js';
+import {
+  describePeerViolation,
+  findDirectPeerViolations,
+  peerRangesOn,
+  peerViolationKey,
+  peerViolationToConflict,
+  type PeerViolation,
+} from './installedPeers.js';
 import { materializeIgnoreForTarget } from '../utils/ignoreMatch.js';
 import {
   KeyedMutex,
@@ -169,6 +190,12 @@ export interface UpgradeEngineOptions {
    * multiple targets in one flow — pre-flight only makes sense once per workspace root).
    */
   skipPreflight?: boolean;
+  /**
+   * Shared by every engine of one run: set when a rollback reinstall fails. The tree no longer
+   * matches the restored lockfile, so every later attempt would start from a broken install —
+   * the run stops instead.
+   */
+  abortState?: { reason?: string };
   /**
    * Workspace install strategy. `'root'` (default) always runs `<mgr> install` from the
    * workspace root — the safest choice and what every package manager supports unconditionally.
@@ -810,15 +837,26 @@ export interface PreflightCheckResult {
   exitCode?: number;
   source?: ValidationResult['source'];
   lastLines?: string;
+  /** Extra check scripts (`lint`, `typecheck`, …) with their exit code on the unchanged tree. */
+  extraChecks?: ExtraCheck[];
+  /** The extra check scripts that already fail on the unchanged tree. */
+  failingScripts?: Array<{ command: string; exitCode: number }>;
 }
 
+/**
+ * With the default validator, each extra check script (`lint`, `typecheck`, `type-check`) is also
+ * run and its exit code recorded, so it can guard every upgrade. A script that already fails
+ * doesn't block the run: it only fails an upgrade that changes its exit code. An explicit
+ * `--validate` / rc command or `--no-validate` is used as-is.
+ */
 export async function preflightValidate(
   cwd: string,
   pkgJson: PackageJson,
   validate: ValidationOptions | undefined,
 ): Promise<PreflightCheckResult> {
-  const v = await validateProject(cwd, pkgJson, validate ?? {});
-  return {
+  const options = validate ?? {};
+  const v = await validateProject(cwd, pkgJson, { ...options, extraChecks: undefined });
+  const result: PreflightCheckResult = {
     ok: v.ok,
     skipped: Boolean(v.skipped),
     command: v.command,
@@ -826,6 +864,73 @@ export async function preflightValidate(
     source: v.source,
     lastLines: v.output,
   };
+  // A failing primary validator aborts the run anyway; no point timing the extra checks.
+  if (options.skip || options.command?.trim() || !v.ok) {
+    return result;
+  }
+
+  const extraChecks: ExtraCheck[] = [];
+  const failingScripts: NonNullable<PreflightCheckResult['failingScripts']> = [];
+  const commands = v.skipped ? [] : [v.command];
+  for (const script of detectExtraCheckScripts(pkgJson)) {
+    const r = await runPackageScript(cwd, script, options.manager, options.onResolved);
+    // A script that never produced an exit code (e.g. killed) has no baseline to compare against.
+    if (r.exitCode === undefined) {
+      continue;
+    }
+    extraChecks.push({ script, baselineExitCode: r.exitCode });
+    commands.push(r.command);
+    if (!r.ok) {
+      failingScripts.push({ command: r.command, exitCode: r.exitCode });
+    }
+  }
+  if (extraChecks.length > 0) {
+    result.extraChecks = extraChecks;
+    result.ok = true;
+    result.skipped = false;
+    result.command = commands.join(' && ');
+    result.source = v.skipped ? 'package.json:script' : v.source;
+  }
+  if (failingScripts.length > 0) {
+    result.failingScripts = failingScripts;
+  }
+  return result;
+}
+
+/** Report shape of a pre-flight run. */
+function preflightRecord(pre: PreflightCheckResult): PreflightDiagnostic {
+  return {
+    ok: pre.ok,
+    skipped: pre.skipped,
+    command: pre.command,
+    exitCode: pre.exitCode,
+    lastLines: pre.lastLines,
+    source: pre.source,
+    ...(pre.extraChecks ? { extraScripts: pre.extraChecks.map((c) => c.script) } : {}),
+    ...(pre.failingScripts ? { failingScripts: pre.failingScripts } : {}),
+  };
+}
+
+/**
+ * Validator options for the rest of the run: adds the extra check scripts from pre-flight, and
+ * explains how the ones that already fail are still used.
+ */
+function withPreflightExtras<T extends ValidationOptions>(
+  validate: T | undefined,
+  pre: PreflightCheckResult,
+  jsonOutput: boolean,
+): T | undefined {
+  if (!jsonOutput) {
+    for (const failing of pre.failingScripts ?? []) {
+      log.warn(
+        `Pre-flight: \`${failing.command}\` already fails on the unchanged tree (exit ${failing.exitCode}); it only rolls an upgrade back if the script then exits differently (e.g. crashes).`,
+      );
+    }
+  }
+  if (!pre.extraChecks?.length) {
+    return validate;
+  }
+  return { ...(validate ?? ({} as T)), extraChecks: pre.extraChecks };
 }
 
 /** Per-attempt state shared with `rollbackAttempt`. */
@@ -854,13 +959,63 @@ async function rollbackAttempt(
   const back = await install$(opts.installCwd ?? cwd, manager, installFilterOptions(opts));
   if (!back.ok) {
     attempt.rollbackNote = ` Rollback install (\`${back.command}\`) also failed (exit ${back.exitCode}); run it manually to resync node_modules.`;
+    if (opts.abortState) {
+      opts.abortState.reason ??= `the rollback install (\`${back.command}\`) failed (exit ${back.exitCode})`;
+    }
   }
 }
 
 function withRollbackNote(result: AttemptResult, attempt: AttemptContext): AttemptResult {
   return attempt.rollbackNote
-    ? { ...result, message: `${result.message ?? ''}${attempt.rollbackNote}` }
+    ? { ...result, message: `${result.message ?? ''}${attempt.rollbackNote}`, abortFallbacks: true }
     : result;
+}
+
+/** Directories whose `node_modules` hold a target's deps: its own, then the install root. */
+function installedRoots(cwd: string, opts: UpgradeEngineOptions): string[] {
+  const installCwd = opts.installCwd ?? cwd;
+  return path.resolve(installCwd) === path.resolve(cwd) ? [cwd] : [cwd, installCwd];
+}
+
+async function directDependencyNames(cwd: string): Promise<string[]> {
+  return dedupeScannedByName(await scanProject(cwd)).map((p) => p.name);
+}
+
+/** Peer violations between the target's installed direct deps. */
+async function directPeerViolations(cwd: string, opts: UpgradeEngineOptions): Promise<PeerViolation[]> {
+  return findDirectPeerViolations(await directDependencyNames(cwd), installedRoots(cwd, opts));
+}
+
+/** Violations the attempt introduced; `before` is `undefined` when the check is off (`--force`). */
+async function newPeerViolations(
+  cwd: string,
+  opts: UpgradeEngineOptions,
+  before: PeerViolation[] | undefined,
+): Promise<PeerViolation[]> {
+  if (!before) {
+    return [];
+  }
+  const known = new Set(before.map(peerViolationKey));
+  return (await directPeerViolations(cwd, opts)).filter((v) => !known.has(peerViolationKey(v)));
+}
+
+/**
+ * The install exited 0 but left a direct dep outside another direct dep's peer range. Reported as a
+ * peer failure carrying the conflicts, so the peer resolvers can look for a compatible tuple.
+ */
+function peerViolationFailure(
+  violations: PeerViolation[],
+  install: InstallResult,
+  installDiag: InstallDiagnostic,
+): AttemptResult {
+  return {
+    ok: false,
+    kind: 'peer',
+    message: `${install.command} succeeded, but the installed tree breaks a peer dependency: ${violations.map(describePeerViolation).join('; ')}.`,
+    installOutput: install.output,
+    classified: violations.map(peerViolationToConflict),
+    install: installDiag,
+  };
 }
 
 /**
@@ -907,6 +1062,7 @@ async function attemptSingleUpgradeUnlocked(
     ? undefined
     : createSpinner(`Installing ${scanned.name}@${targetVersion} with ${manager}...`);
 
+  const peersBefore = force ? undefined : await directPeerViolations(cwd, opts);
   await applyUpgradeWrites(cwd, [{ scanned, targetVersion }], opts);
 
   const install = await install$(installCwd, manager, installOpts);
@@ -939,7 +1095,7 @@ async function attemptSingleUpgradeUnlocked(
       message: esm
         ? `${install.command} failed (exit ${install.exitCode}): ESM/CommonJS mismatch (e.g. ERR_REQUIRE_ESM). Newer releases may be ESM-only while this project is CommonJS — pin the package, migrate to ESM, or ignore it.`
         : peerLike
-          ? `${install.command} failed (exit ${install.exitCode}): peer dependency conflict — the resolver will try to find a compatible tuple`
+          ? `${install.command} failed (exit ${install.exitCode}): peer dependency conflict.`
           : `${install.command} failed (exit ${install.exitCode})`,
       abortFallbacks: esm,
       installOutput: install.output,
@@ -960,6 +1116,14 @@ async function attemptSingleUpgradeUnlocked(
       classified,
       install: installDiag,
     };
+  }
+
+  const brokenPeers = await newPeerViolations(cwd, opts, peersBefore);
+  if (brokenPeers.length > 0) {
+    spinner?.update(`Rolling back ${scanned.name}: ${describePeerViolation(brokenPeers[0]!)}...`);
+    await rollbackAttempt(cwd, [{ scanned }], new Map([[scanned.name, previous]]), attempt, opts);
+    spinner?.stop();
+    return peerViolationFailure(brokenPeers, install, installDiag);
   }
 
   // Validator runs against the install root (where the actual node_modules live), but it reads
@@ -1073,6 +1237,7 @@ async function attemptBatchUpgradeUnlocked(
     ? undefined
     : createSpinner(`Installing batch (${bumps.length} pkgs) with ${manager}: ${batchLabel}...`);
 
+  const peersBefore = force ? undefined : await directPeerViolations(cwd, opts);
   await applyUpgradeWrites(cwd, bumps, opts);
 
   const install = await install$(installCwd, manager, installOpts);
@@ -1106,7 +1271,7 @@ async function attemptBatchUpgradeUnlocked(
       message: esm
         ? `${install.command} failed (exit ${install.exitCode}): ESM/CommonJS mismatch (e.g. ERR_REQUIRE_ESM). Newer releases may be ESM-only while this project is CommonJS — pin the package, migrate to ESM, or ignore it.`
         : peerLike
-          ? `${install.command} failed (exit ${install.exitCode}): peer dependency conflict — the resolver will try to find a compatible tuple`
+          ? `${install.command} failed (exit ${install.exitCode}): peer dependency conflict.`
           : `${install.command} failed (exit ${install.exitCode})`,
       abortFallbacks: esm,
       installOutput: install.output,
@@ -1127,6 +1292,14 @@ async function attemptBatchUpgradeUnlocked(
       classified,
       install: installDiag,
     };
+  }
+
+  const brokenPeers = await newPeerViolations(cwd, opts, peersBefore);
+  if (brokenPeers.length > 0) {
+    spinner?.update(`Rolling back batch: ${describePeerViolation(brokenPeers[0]!)}...`);
+    await rollbackAll();
+    spinner?.stop();
+    return peerViolationFailure(brokenPeers, install, installDiag);
   }
 
   spinner?.update(`Validating batch (${bumps.length} pkgs): resolving validator...`);
@@ -1640,7 +1813,13 @@ async function runSinglePackageUpgrade(
   let adHocResolved:
     | { bumps: Array<{ name: string; from: string; to: string; isPrimary: boolean }>; reason: string; tuplesExplored: number; method: ResolvedTuple['method'] }
     | undefined;
-  if (!result.ok && result.kind === 'peer' && opts.resolvePeers !== false && !opts.force) {
+  if (
+    !result.ok &&
+    result.kind === 'peer' &&
+    opts.resolvePeers !== false &&
+    !opts.force &&
+    !opts.abortState?.reason
+  ) {
     const classified = result.classified ?? classifyInstallOutput(result.installOutput, opts);
     if (classified.length > 0) {
       try {
@@ -1917,6 +2096,21 @@ async function tryResolvePeerIntersection(
   }
 
   const memberNames = new Set(inputs.map((i) => i.name));
+  // Installed direct deps outside the batch bound it too: `@react-three/fiber` already at latest
+  // never joins the bumps, yet still demands `react <19.3`.
+  const outsideRanges = await peerRangesOn(
+    memberNames,
+    await directDependencyNames(cwd),
+    installedRoots(cwd, opts),
+  );
+  for (const domain of domains) {
+    const ranges = outsideRanges.get(domain.name);
+    if (!ranges) continue;
+    domain.versions = domain.versions.filter((v) =>
+      ranges.every((range) => semver.satisfies(v, range, { includePrerelease: true })),
+    );
+    if (domain.versions.length === 0) return undefined;
+  }
   const externalInstalled = await collectExternalInstalledRanges(cwd, memberNames);
   const requested = new Map(inputs.map((i) => [i.name, i.requestedTarget]));
 
@@ -2182,7 +2376,8 @@ async function runLinkedGroupUpgrade(
       !peerResolverTried &&
       result.kind === 'peer' &&
       opts.resolvePeers !== false &&
-      !forceAttempt
+      !forceAttempt &&
+      !opts.abortState?.reason
     ) {
       peerResolverTried = true;
       const resolved = await tryResolvePeerIntersection(cwd, bumps, opts);
@@ -2234,6 +2429,7 @@ async function runLinkedGroupUpgrade(
     if (
       !result.ok &&
       !forceAttempt &&
+      !opts.abortState?.reason &&
       (opts.fallbackStrategy === 'major-lines' || opts.fallbackStrategy === 'minor-lines')
     ) {
       const coordinated = await tryCoordinatedGroupFallback(cwd, bumps, opts, gid, jsonOutput);
@@ -2243,7 +2439,7 @@ async function runLinkedGroupUpgrade(
       }
     }
 
-    if (!interactive) {
+    if (!interactive || opts.abortState?.reason) {
       break;
     }
     const choice = await promptGroupConflictChoice({
@@ -2290,10 +2486,29 @@ async function runLinkedGroupUpgrade(
     const groupRows: UpgradeRecord[] = [];
     for (const b of bumps) {
       const writtenTo = formatWrittenRange(b.scanned, b.targetVersion, opts.pinExact, opts.catalog);
+      const from = b.reportFrom ?? catalogStyleRange(opts.catalog, b.scanned.name, b.scanned.currentRange);
+      // The peer resolver can settle a member back on its current range (e.g. `react` kept at
+      // ^19.2.8 for a peer): package.json didn't change, so it isn't an upgrade (or a commit).
+      if (writtenTo === from) {
+        addUpgrade(report, {
+          name: b.scanned.name,
+          success: true,
+          skipped: true,
+          from,
+          to: writtenTo,
+          reason: 'skipped',
+          detail: `no change: the peer-range resolver kept ${b.targetVersion} for linked group [${gid}]`,
+          linkedGroupId: gid,
+        });
+        if (!jsonOutput) {
+          log.dim(`${b.scanned.name} unchanged in group ${gid} (peer-range resolver kept ${b.targetVersion})`);
+        }
+        continue;
+      }
       const row: UpgradeRecord = {
         name: b.scanned.name,
         success: true,
-        from: b.reportFrom ?? catalogStyleRange(opts.catalog, b.scanned.name, b.scanned.currentRange),
+        from,
         to: writtenTo,
         // `requestedLatest` should still reflect what the user ASKED for (registry latest),
         // even when the peer resolver nudged us to a slightly older version. That way the
@@ -2470,6 +2685,7 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
   const pkgJson = await readPackageJson(cwd);
   const engineOpts: UpgradeEngineOptions = {
     ...opts,
+    abortState: opts.abortState ?? {},
     rootPackageName: typeof pkgJson.name === 'string' ? pkgJson.name : undefined,
     projectInfo,
     installCwd,
@@ -2493,6 +2709,11 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
     });
     if (pre.skipped) {
       preflightSpinner?.stop('Pre-flight: no validator available (skipped)');
+      if (!jsonOutput && !opts.validate?.skip) {
+        log.warn(
+          'No test, build, lint or typecheck script to validate with: every upgrade will be kept without any check. Pass --validate "<cmd>" to verify them.',
+        );
+      }
     } else if (pre.ok) {
       preflightSpinner?.succeed(`Pre-flight ok: \`${pre.command}\``);
     } else {
@@ -2500,15 +2721,9 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
         `Pre-flight failed: \`${pre.command}\` exited ${pre.exitCode ?? '?'}`,
       );
     }
+    engineOpts.validate = withPreflightExtras(engineOpts.validate, pre, jsonOutput);
     if (!pre.skipped) {
-      report.preflight = {
-        ok: pre.ok,
-        skipped: pre.skipped,
-        command: pre.command,
-        exitCode: pre.exitCode,
-        lastLines: pre.lastLines,
-        source: pre.source,
-      };
+      report.preflight = preflightRecord(pre);
       if (!pre.ok) {
         if (!jsonOutput) {
           log.warn(
@@ -2548,6 +2763,9 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
   report.groupPlan = groups.map((g) => ({ id: g.id, packages: [...g.names] }));
 
   for (const group of groups) {
+    if (engineOpts.abortState?.reason) {
+      break;
+    }
     const fresh = dedupeScannedByName(await scanProject(cwd));
     const byName = new Map(fresh.map((p) => [p.name, p]));
     const members = group.names.map((n) => byName.get(n)).filter(Boolean) as ScannedPackage[];
@@ -2725,6 +2943,14 @@ export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalRep
       ? ` (workspaces: ${projectInfo.workspaceMembers.length} member${projectInfo.workspaceMembers.length === 1 ? '' : 's'})`
       : '';
     log.dim(`Detected package manager: ${mgrLabel} via ${projectInfo.managerSource}${wsLabel}`);
+    const lockfiles = describeRootLockfiles(rootCwd, projectInfo.manager);
+    if (lockfiles.stale.length > 0) {
+      const stale = lockfiles.stale.map((f) => `\`${f}\``).join(', ');
+      const updated = lockfiles.updated.map((f) => `\`${f}\``).join(', ') || `the ${projectInfo.manager} lockfile`;
+      log.warn(
+        `Also found ${stale}: upgrades install with ${projectInfo.manager} and only update ${updated}, so ${stale} will go stale. A CI or host that installs from it won't get the validated versions — keep one lockfile and set "packageManager" in package.json.`,
+      );
+    }
     if (mode !== 'root-only') {
       log.info(
         `Workspace traversal: ${targets.length} target(s) → ${targets.map((t) => t.label).join(', ')}`,
@@ -2760,6 +2986,10 @@ export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalRep
       : {}),
   };
 
+  // Validator options for every target; pre-flight adds the extra check scripts that pass.
+  let validate = opts.validate;
+  // Set by any target's failed rollback install; stops the remaining targets too (shared tree).
+  const abortState: { reason?: string } = {};
   if (!dryRun) {
     const installRootPkg = await readPackageJson(rootCwd);
     const preflightSpinner = jsonOutput
@@ -2774,6 +3004,11 @@ export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalRep
     });
     if (pre.skipped) {
       preflightSpinner?.stop('Pre-flight: no validator available (skipped)');
+      if (!jsonOutput && !opts.validate?.skip) {
+        log.warn(
+          'No test, build, lint or typecheck script to validate with: every upgrade will be kept without any check. Pass --validate "<cmd>" to verify them.',
+        );
+      }
     } else if (pre.ok) {
       preflightSpinner?.succeed(`Pre-flight ok: \`${pre.command}\``);
     } else {
@@ -2781,15 +3016,9 @@ export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalRep
         `Pre-flight failed: \`${pre.command}\` exited ${pre.exitCode ?? '?'}`,
       );
     }
+    validate = withPreflightExtras(opts.validate, pre, jsonOutput);
     if (!pre.skipped) {
-      aggregate.preflight = {
-        ok: pre.ok,
-        skipped: pre.skipped,
-        command: pre.command,
-        exitCode: pre.exitCode,
-        lastLines: pre.lastLines,
-        source: pre.source,
-      };
+      aggregate.preflight = preflightRecord(pre);
       if (!pre.ok && !force) {
         if (!jsonOutput) {
           if (pre.lastLines) {
@@ -2891,6 +3120,8 @@ export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalRep
 
   const buildEngineOpts = (target: { label: string; cwd: string; packageJson: string }) => ({
     ...opts,
+    validate,
+    abortState,
     cwd: target.cwd,
     // In parallel-install mode each target installs into its OWN directory; otherwise we
     // install at the root as before. Either way, `withInstallLock` keys off this value, so
@@ -2917,7 +3148,18 @@ export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalRep
   // Helper that runs a single target's engine, fires `onTargetComplete` (used by the git
   // integration's per-target flush), and returns the sub-report. Centralized so both the
   // serial and parallel branches use identical semantics.
+  const reportStop = (): void => {
+    if (abortState.reason && !jsonOutput) {
+      log.error(
+        `Stopped early: ${abortState.reason}, so node_modules no longer matches the lockfile. Remaining upgrades were not attempted — run your package manager's install, then re-run.`,
+      );
+    }
+  };
+
   const runOneTarget = async (target: ResolvedTarget): Promise<FinalReport> => {
+    if (abortState.reason) {
+      return createEmptyReport();
+    }
     const subReport = await runUpgradeEngine(buildEngineOpts(target));
     if (opts.onTargetComplete) {
       try {
@@ -2941,12 +3183,16 @@ export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalRep
   if (effectiveConcurrency === 1) {
     // Serial path — exact pre-existing behavior. Header logs print before each target.
     for (const target of targets) {
+      if (abortState.reason) {
+        break;
+      }
       if (!jsonOutput && namespaceGroups) {
         log.title(`Target: ${target.label}`);
       }
       const subReport = await runOneTarget(target);
       aggregate = mergeSubReport(aggregate, subReport, target.label, namespaceGroups);
     }
+    reportStop();
     return aggregate;
   }
 
@@ -2960,6 +3206,7 @@ export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalRep
   for (let i = 0; i < targets.length; i++) {
     aggregate = mergeSubReport(aggregate, subReports[i], targets[i].label, namespaceGroups);
   }
+  reportStop();
   return aggregate;
 }
 

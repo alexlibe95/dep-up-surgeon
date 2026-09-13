@@ -14,19 +14,21 @@
  *   1. **node-version**           — current Node satisfies `engines.node`, if set.
  *   2. **manager**                — a package manager was resolved (lockfile + binary match).
  *   3. **lockfile**               — lockfile is present, parseable, and matches the manager.
- *   4. **workspace-coherence**    — detected workspace members resolve on disk + have `package.json`.
- *   5. **policy**                 — `.dep-up-surgeon.policy.{yaml,json}` (when present) parses
+ *   4. **dependencies-installed** — declared dependencies have an install on disk (`node_modules`
+ *                                   or Yarn PnP); without one, checks 6–7 fail for that reason alone.
+ *   5. **workspace-coherence**    — detected workspace members resolve on disk + have `package.json`.
+ *   6. **policy**                 — `.dep-up-surgeon.policy.{yaml,json}` (when present) parses
  *                                   without warnings.
- *   6. **preflight-validator**    — user's `--validate` / auto-detected `<mgr> test` passes RIGHT NOW,
+ *   7. **preflight-validator**    — user's `--validate` / auto-detected `<mgr> test` passes RIGHT NOW,
  *                                   before any upgrades. Skipped when `--no-validate` (doctor
  *                                   respects the same flag plumbing as the upgrade flow).
- *   7. **peer-deps**              — scan installed tree for existing peer-dep warnings via a
+ *   8. **peer-deps**              — scan installed tree for existing peer-dep warnings via a
  *                                   `<mgr> ls --all` (npm) or equivalent — catches "already
  *                                   broken before you asked me to upgrade anything" cases.
  *                                   Managers without a read-only check are reported as skipped.
- *   8. **audit**                  — `<mgr> audit` dry-run + severity breakdown. Treated as
+ *   9. **audit**                  — `<mgr> audit` dry-run + severity breakdown. Treated as
  *                                   YELLOW for low/moderate, RED for high/critical.
- *   9. **stale-transitives**      — reuses `scanStaleTransitives` from `lockfileFix.ts` to flag
+ *  10. **stale-transitives**      — reuses `scanStaleTransitives` from `lockfileFix.ts` to flag
  *                                   transitives > 1 minor or a full major behind registry latest.
  *                                   Informational (YELLOW); never blocks.
  *
@@ -41,7 +43,7 @@ import semver from 'semver';
 import { execa } from 'execa';
 import type { PackageJson } from '../types.js';
 import type { PackageManager, ProjectInfo } from '../core/workspaces.js';
-import { detectProjectInfo } from '../core/workspaces.js';
+import { describeRootLockfiles, detectProjectInfo } from '../core/workspaces.js';
 import { validateProject } from '../core/validator.js';
 import { runAudit, type SecurityAdvisory } from '../core/audit.js';
 import { tailLines } from '../utils/output.js';
@@ -129,6 +131,7 @@ export async function runDoctor(opts: RunDoctorOptions): Promise<DoctorReport> {
 
   checks.push(managerCheck(info));
   checks.push(await lockfileCheck(cwd, info));
+  checks.push(await dependenciesInstalledCheck(cwd, info));
   checks.push(workspaceCoherenceCheck(info));
   checks.push(await policyCheck(cwd));
   checks.push(await preflightValidatorCheck(cwd, info, opts));
@@ -237,12 +240,51 @@ const LOCKFILES_BY_MANAGER: Record<PackageManager, readonly string[]> = {
 
 /** Count every lockfile at the project root, whichever manager wrote it. */
 function countLockfileKinds(info: ProjectInfo): number {
-  const { cwd } = info;
-  let n = 0;
-  for (const name of Object.values(LOCKFILES_BY_MANAGER).flat()) {
-    if (fs.existsSync(path.join(cwd, name))) n++;
+  const { updated, stale } = describeRootLockfiles(info.cwd, info.manager);
+  return updated.length + stale.length;
+}
+
+/**
+ * Without installed dependencies the validator and peer scan fail for that reason alone
+ * (`next: command not found`, dozens of "missing" peers), which buries the real cause.
+ */
+async function dependenciesInstalledCheck(cwd: string, info: ProjectInfo): Promise<DoctorCheck> {
+  let pkg: Record<string, unknown> = {};
+  try {
+    pkg = (await fs.readJson(path.join(cwd, 'package.json'))) as Record<string, unknown>;
+  } catch {
+    // The manager check already reports an unreadable package.json.
   }
-  return n;
+  const declared = ['dependencies', 'devDependencies', 'optionalDependencies'].reduce((n, field) => {
+    const deps = pkg[field];
+    return n + (deps && typeof deps === 'object' ? Object.keys(deps).length : 0);
+  }, 0);
+  if (declared === 0) {
+    return {
+      id: 'dependencies-installed',
+      label: 'Dependencies installed',
+      status: 'green',
+      message: 'No dependencies declared — nothing to install.',
+    };
+  }
+  // Yarn Plug'n'Play installs without a node_modules folder.
+  const installed = ['node_modules', '.pnp.cjs', '.pnp.js'].some((f) => fs.existsSync(path.join(cwd, f)));
+  if (installed) {
+    return {
+      id: 'dependencies-installed',
+      label: 'Dependencies installed',
+      status: 'green',
+      message: `${declared} declared dependencies; install output present.`,
+    };
+  }
+  return {
+    id: 'dependencies-installed',
+    label: 'Dependencies installed',
+    status: 'red',
+    message: `\`node_modules\` is missing: ${declared} declared dependencies are not installed.`,
+    hint: `Run \`${info.manager} install\` first — until then the pre-flight validator and peer scan fail for that reason alone.`,
+    data: { declared },
+  };
 }
 
 async function lockfileCheck(cwd: string, projectInfo: ProjectInfo): Promise<DoctorCheck> {

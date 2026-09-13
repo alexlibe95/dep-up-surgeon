@@ -45,7 +45,20 @@ export interface ValidationDiagnostic {
   /** Last ~40 lines of stdout/stderr from the validator (already truncated). */
   lastLines?: string;
   /** Where the validator command came from. */
-  source?: 'cli' | 'config' | 'package.json:test' | 'package.json:build' | 'none';
+  source?: 'cli' | 'config' | 'package.json:test' | 'package.json:build' | 'package.json:script' | 'none';
+}
+
+/** The unchanged-tree validator run, plus which extra check scripts joined per-upgrade validation. */
+export interface PreflightDiagnostic extends ValidationDiagnostic {
+  ok: boolean;
+  skipped: boolean;
+  /** Extra check scripts (`lint`, `typecheck`, …) that run after every upgrade. */
+  extraScripts?: string[];
+  /**
+   * The extra check scripts that already failed on the unchanged tree. They still run, but only
+   * fail an upgrade that changes their exit code.
+   */
+  failingScripts?: Array<{ command: string; exitCode: number }>;
 }
 
 /**
@@ -239,12 +252,14 @@ export interface FinalReport {
    * Result of the **pre-flight** validator run (against the unchanged tree). Useful so JSON
    * consumers can tell that the project was already broken before any upgrade was attempted.
    */
-  preflight?: ValidationDiagnostic & { ok: boolean; skipped: boolean };
+  preflight?: PreflightDiagnostic;
   /**
    * Set to `true` when the run aborted early because the pre-flight validator failed and the
    * user did not pass `--force`. In that case `upgraded` and `failed` will be empty.
    */
   preflightAborted?: boolean;
+  /** Tracked files the run rewrote besides dependency files (e.g. tsconfig.json), restored at the end. */
+  restoredFiles?: string[];
   /**
    * Detected package manager + workspace topology. Workspace-internal deps (i.e. names matching
    * a local workspace package) are skipped automatically and recorded in `upgraded` with

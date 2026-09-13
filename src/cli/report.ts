@@ -3,8 +3,8 @@ import type {
   Conflict,
   GitCommitRecord,
   PolicyReport,
+  PreflightDiagnostic,
   ProjectInfoReport,
-  ValidationDiagnostic,
 } from '../types.js';
 import type { ConflictEntry, FinalReport, UpgradeRecord } from '../types.js';
 import { log } from '../utils/logger.js';
@@ -20,9 +20,11 @@ export interface StructuredReport {
   unresolved: ConflictEntry[];
   groups: Array<{ id: string; packages: string[] }>;
   /** Result of the unchanged-tree validator run (when not skipped). */
-  preflight?: ValidationDiagnostic & { ok: boolean; skipped: boolean };
+  preflight?: PreflightDiagnostic;
   /** True when the run aborted before any upgrade because pre-flight failed. */
   preflightAborted?: boolean;
+  /** Tracked files the run rewrote besides dependency files (e.g. tsconfig.json), restored at the end. */
+  restoredFiles?: string[];
   /** Detected package manager + workspace topology. */
   project?: ProjectInfoReport;
   /** Targets that were processed in this run (root and/or workspace members). */
@@ -76,6 +78,7 @@ export function buildStructuredReport(
     groups,
     ...(report.preflight ? { preflight: report.preflight } : {}),
     ...(report.preflightAborted ? { preflightAborted: true } : {}),
+    ...(report.restoredFiles?.length ? { restoredFiles: report.restoredFiles } : {}),
     ...(report.project ? { project: report.project } : {}),
     ...(report.targets ? { targets: report.targets } : {}),
     ...(report.ignored?.length ? { ignored: report.ignored } : {}),

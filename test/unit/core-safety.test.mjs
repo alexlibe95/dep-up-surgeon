@@ -24,7 +24,7 @@ const { createRegistryCache, runWithConcurrency } = await import(
   path.join(root, 'dist/utils/concurrency.js')
 );
 const { isRegistryRange } = await import(path.join(root, 'dist/core/scanner.js'));
-const { validateProject } = await import(path.join(root, 'dist/core/validator.js'));
+const { validateProject, testScriptEnv } = await import(path.join(root, 'dist/core/validator.js'));
 const { buildLineFallbackOrder } = await import(path.join(root, 'dist/utils/versionFallback.js'));
 const { dedupeScannedByName } = await import(path.join(root, 'dist/core/scannedDedup.js'));
 
@@ -97,6 +97,53 @@ test('rollback restores package.json and the lockfile byte-for-byte', async () =
   assert.strictEqual(report.failed[0]?.name, 'axios', JSON.stringify(report.failed));
   assert.strictEqual(await readText(dir), pkgText);
   assert.strictEqual(await readText(dir, 'package-lock.json'), lockText);
+});
+
+test("an install that breaks an installed direct dep's peer range is rolled back as a peer failure", async () => {
+  const pkgText = JSON.stringify({ name: 'app', dependencies: { react: '19.2.4', fiber: '^9.7.0' } }, null, 2);
+  const dir = await project(pkgText, {
+    'node_modules/react/package.json': JSON.stringify({ name: 'react', version: '19.2.4' }),
+    'node_modules/fiber/package.json': JSON.stringify({
+      name: 'fiber',
+      version: '9.7.0',
+      peerDependencies: { react: '>=19 <19.3' },
+    }),
+  });
+  // Installs what package.json asks for without checking peers, like npm with a lockfile or bun.
+  const installer = async (cwd) => {
+    const { dependencies } = JSON.parse(await fs.readFile(path.join(cwd, 'package.json'), 'utf8'));
+    await fs.writeFile(
+      path.join(cwd, 'node_modules/react/package.json'),
+      JSON.stringify({ name: 'react', version: dependencies.react }),
+    );
+    return OK_INSTALL;
+  };
+
+  const report = await upgrader.runUpgradeFlow(
+    flowOpts(dir, { installer, registryCache: cacheWithLatest({ react: '19.3.0', fiber: '9.7.0' }) }),
+  );
+
+  const failure = report.failed.find((f) => f.name === 'react');
+  assert.strictEqual(failure?.reason, 'peer', JSON.stringify(report.failed));
+  assert.match(failure.message, /react@19\.3\.0 is outside the peer range ">=19 <19\.3" of fiber@9\.7\.0/);
+  assert.strictEqual(await readText(dir), pkgText);
+});
+
+test('a failed rollback install stops the run instead of attempting every remaining package', async () => {
+  const dir = await project(JSON.stringify({ name: 'app', dependencies: { axios: '^1.0.0', lodash: '^4.0.0' } }));
+  let installs = 0;
+  const installer = async () => {
+    installs++;
+    return { ok: false, output: 'broken tree', exitCode: 1, command: 'npm install', filtered: false };
+  };
+
+  const report = await upgrader.runUpgradeFlow(
+    flowOpts(dir, { installer, registryCache: cacheWithLatest({ axios: '1.7.0', lodash: '4.17.21' }) }),
+  );
+
+  assert.strictEqual(installs, 2, 'the failed install and its failed rollback, then stop');
+  assert.deepStrictEqual(report.failed.map((f) => f.name), ['axios']);
+  assert.match(report.failed[0].message, /Rollback install .* also failed/);
 });
 
 test("a kept upgrade keeps the manifest's own indentation and line endings", async () => {
@@ -268,6 +315,79 @@ test("validateProject: npm init's placeholder test script is not a validator", a
   const withBuild = await validateProject(dir, { scripts }, { manager: 'npm' });
   assert.strictEqual(withBuild.ok, true, withBuild.output);
   assert.strictEqual(withBuild.source, 'package.json:build');
+});
+
+test('validateProject: the test script runs with CI set so watch-mode runners exit', async () => {
+  // `react-scripts test` (Jest) watches forever without CI; model it with a script that fails
+  // unless CI is set.
+  const scripts = { test: 'node -e "process.exit(process.env.CI ? 0 : 1)"' };
+  const dir = await project(JSON.stringify({ name: 'x', version: '1.0.0', scripts }));
+  const savedCI = process.env.CI;
+  delete process.env.CI;
+  try {
+    const r = await validateProject(dir, { scripts }, { manager: 'npm' });
+    assert.strictEqual(r.ok, true, r.output);
+  } finally {
+    if (savedCI !== undefined) process.env.CI = savedCI;
+  }
+  assert.deepStrictEqual(testScriptEnv({}), { CI: 'true' });
+  assert.deepStrictEqual(testScriptEnv({ CI: 'false' }), {}, 'a CI value the user exported wins');
+});
+
+test('preflightValidate: extra check scripts join validation with their pre-flight exit code', async () => {
+  const scripts = {
+    build: 'node -e "process.exit(0)"',
+    lint: 'node -e "process.exit(0)"',
+    typecheck: 'node -e "process.exit(2)"',
+  };
+  const dir = await project(JSON.stringify({ name: 'x', version: '1.0.0', scripts }));
+  const pre = await upgrader.preflightValidate(dir, { scripts }, { manager: 'npm' });
+  assert.strictEqual(pre.ok, true, 'an already-failing typecheck does not block the run');
+  assert.deepStrictEqual(pre.extraChecks, [
+    { script: 'lint', baselineExitCode: 0 },
+    { script: 'typecheck', baselineExitCode: 2 },
+  ]);
+  assert.deepStrictEqual(pre.failingScripts, [{ command: 'npm run typecheck', exitCode: 2 }]);
+  assert.strictEqual(pre.command, 'npm run build && npm run lint && npm run typecheck');
+
+  const custom = await upgrader.preflightValidate(dir, { scripts }, {
+    manager: 'npm',
+    command: 'node -e "process.exit(0)"',
+  });
+  assert.strictEqual(custom.extraChecks, undefined, 'an explicit --validate is never extended');
+
+  const lintOnly = { lint: 'node -e "process.exit(0)"' };
+  const lintDir = await project(JSON.stringify({ name: 'y', version: '1.0.0', scripts: lintOnly }));
+  const preLint = await upgrader.preflightValidate(lintDir, { scripts: lintOnly }, { manager: 'npm' });
+  assert.strictEqual(preLint.skipped, false, 'a passing lint script is a validator on its own');
+  assert.strictEqual(preLint.source, 'package.json:script');
+});
+
+test('validateProject: an extra check script fails validation when its exit code leaves the baseline', async () => {
+  // TypeScript 7 case: `next build` still passes, typescript-eslint (`lint`) crashes with exit 2.
+  const scripts = { build: 'node -e "process.exit(0)"', lint: 'node -e "process.exit(2)"' };
+  const dir = await project(JSON.stringify({ name: 'x', version: '1.0.0', scripts }));
+  const lint = (baselineExitCode) => ({ manager: 'npm', extraChecks: [{ script: 'lint', baselineExitCode }] });
+
+  const r = await validateProject(dir, { scripts }, lint(0));
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.command, 'npm run lint');
+  assert.strictEqual(r.source, 'package.json:script');
+
+  const sameFailure = await validateProject(dir, { scripts }, lint(2));
+  assert.strictEqual(sameFailure.ok, true, 'existing lint errors do not fail an upgrade');
+
+  const crashed = await validateProject(dir, { scripts }, lint(1));
+  assert.strictEqual(crashed.ok, false, 'lint errors (1) turning into a crash (2) fail the upgrade');
+  assert.match(crashed.output ?? '', /exit 2 differs from pre-flight \(exit 1 /);
+
+  const fixedScripts = { lint: 'node -e "process.exit(0)"' };
+  const fixedDir = await project(JSON.stringify({ name: 'y', version: '1.0.0', scripts: fixedScripts }));
+  const fixed = await validateProject(fixedDir, { scripts: fixedScripts }, lint(1));
+  assert.strictEqual(fixed.ok, true, 'an upgrade that fixes the script is fine');
+
+  const withoutExtras = await validateProject(dir, { scripts }, { manager: 'npm' });
+  assert.strictEqual(withoutExtras.ok, true, 'extras only run when pre-flight opted them in');
 });
 
 test('buildLineFallbackOrder: a prerelease current version still sees the stable release', () => {

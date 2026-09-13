@@ -227,6 +227,19 @@ test('doctor: skipValidator honored — no exec, green', async () => {
   assert.match(v.message, /Skipped via/);
 });
 
+test('doctor: declared dependencies without node_modules → red with an install hint', async () => {
+  const dir = await mkProject({
+    'package.json': JSON.stringify({ name: 'demo', version: '1.0.0', dependencies: { next: '16.0.0' } }),
+  });
+  const missing = pick(await runDoctor({ cwd: dir, toolVersion: 'x', ...ALL_SKIPS }), 'dependencies-installed');
+  assert.strictEqual(missing.status, 'red');
+  assert.match(missing.hint ?? '', /npm install/);
+
+  await fs.mkdir(path.join(dir, 'node_modules'));
+  const installed = pick(await runDoctor({ cwd: dir, toolVersion: 'x', ...ALL_SKIPS }), 'dependencies-installed');
+  assert.strictEqual(installed.status, 'green');
+});
+
 test('doctor: overall aggregation matches worst status', async () => {
   // yellow-only run (lockfile missing) → overall yellow.
   const dir = await mkProject({

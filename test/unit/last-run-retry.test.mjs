@@ -10,7 +10,8 @@ import fs from 'node:fs/promises';
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const {
-  LAST_RUN_FILENAME,
+  LEGACY_LAST_RUN_FILENAME,
+  lastRunReportPath,
   TERMINAL_RETRY_REASONS,
   computeRetryFailedIgnores,
   loadLastRunReport,
@@ -47,7 +48,10 @@ test('persist + load round-trip', async () => {
     toolVersion: '9.9.9',
     dryRun: false,
   });
-  assert.strictEqual(written, path.join(dir, LAST_RUN_FILENAME));
+  assert.strictEqual(written, lastRunReportPath(dir));
+  assert.ok(written.includes(path.join('node_modules', '.cache', 'dep-up-surgeon')));
+  assert.deepStrictEqual(await fs.readdir(dir), ['node_modules'], 'nothing is written to the project root');
+  assert.strictEqual(await fs.readFile(path.join(path.dirname(written), '.gitignore'), 'utf8'), '*\n');
 
   const loaded = await loadLastRunReport(dir);
   assert.ok(loaded);
@@ -56,6 +60,36 @@ test('persist + load round-trip', async () => {
   assert.strictEqual(loaded.cwd, dir);
   assert.strictEqual(loaded.upgraded[0].name, 'axios');
   assert.match(loaded.finishedAt, /^\d{4}-\d{2}-\d{2}T/);
+});
+
+test('a pre-flight abort never overwrites the record of the last run that changed things', async () => {
+  const dir = await makeTmp('preflight-abort');
+  const changed = {
+    upgraded: [{ name: 'axios', success: true, from: '1.0.0', to: '1.6.0' }],
+    skipped: [],
+    failed: [],
+    conflicts: [],
+    unresolved: [],
+    groups: [],
+  };
+  await persistLastRunReport(changed, { cwd: dir, toolVersion: '9.9.9', dryRun: false });
+
+  const aborted = { ...changed, upgraded: [], preflightAborted: true };
+  const written = await persistLastRunReport(aborted, { cwd: dir, toolVersion: '9.9.9', dryRun: false });
+  assert.strictEqual(written, undefined);
+
+  const loaded = await loadLastRunReport(dir);
+  assert.strictEqual(loaded.upgraded[0]?.name, 'axios', 'undo must still see the upgrade run');
+});
+
+test('a report an older version wrote to the project root is still loaded', async () => {
+  const dir = await makeTmp('legacy');
+  await fs.writeFile(
+    path.join(dir, LEGACY_LAST_RUN_FILENAME),
+    JSON.stringify({ upgraded: [{ name: 'axios', success: true }], toolVersion: '3.0.0' }),
+  );
+  const loaded = await loadLastRunReport(dir);
+  assert.strictEqual(loaded?.toolVersion, '3.0.0');
 });
 
 test('load returns undefined when file is missing', async () => {

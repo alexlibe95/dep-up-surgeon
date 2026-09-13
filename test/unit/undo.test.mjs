@@ -45,9 +45,55 @@ function makeInstaller() {
   };
 }
 
+/** A run that moved `next` from ^16.3.1 to ^16.3.5 — a range the old one still satisfies. */
+async function recordBunRun(dir) {
+  const lastRun = await import(path.join(root, 'dist/cli/lastRun.js'));
+  const pkg = (range) => JSON.stringify({ name: 'app', dependencies: { next: range } }, null, 2);
+  await fs.writeFile(path.join(dir, 'package.json'), pkg('^16.3.1'));
+  await fs.writeFile(path.join(dir, 'bun.lock'), 'next@16.3.1\n');
+  const lockfilesBefore = await lastRun.captureRootLockfiles(dir);
+
+  await fs.writeFile(path.join(dir, 'package.json'), pkg('^16.3.5'));
+  await fs.writeFile(path.join(dir, 'bun.lock'), 'next@16.3.5\n');
+  const structured = {
+    upgraded: [{ name: 'next', success: true, from: '^16.3.1', to: '^16.3.5' }],
+    skipped: [],
+    failed: [],
+    conflicts: [],
+    unresolved: [],
+    groups: [],
+    project: { manager: 'bun', managerSource: 'lockfile', hasWorkspaces: false, workspaceGlobs: [], workspaceMembers: [] },
+  };
+  await lastRun.persistLastRunReport(structured, { cwd: dir, toolVersion: 'test', dryRun: false, lockfilesBefore });
+}
+
+test('undo: restores the pre-run lockfile bytes, so versions the old range still allows revert too', async () => {
+  await withTempDir(async (dir) => {
+    await recordBunRun(dir);
+    const { installer, calls } = makeInstaller();
+    const result = await runUndo({ cwd: dir, installer, skipValidator: true });
+    assert.deepStrictEqual(result.lockfiles, [{ file: 'bun.lock', restored: true }]);
+    assert.strictEqual(await fs.readFile(path.join(dir, 'bun.lock'), 'utf8'), 'next@16.3.1\n');
+    assert.strictEqual(calls.length, 1, 'install still runs so node_modules follows the lockfile');
+  });
+});
+
+test('undo: a lockfile edited after the run is left alone', async () => {
+  await withTempDir(async (dir) => {
+    await recordBunRun(dir);
+    await fs.writeFile(path.join(dir, 'bun.lock'), 'next@16.4.0\n');
+    const { installer } = makeInstaller();
+    const result = await runUndo({ cwd: dir, installer, skipValidator: true });
+    assert.strictEqual(result.lockfiles?.[0]?.restored, false);
+    assert.match(result.lockfiles[0].detail, /changed since the run/);
+    assert.strictEqual(await fs.readFile(path.join(dir, 'bun.lock'), 'utf8'), 'next@16.4.0\n');
+  });
+});
+
 async function writeLastRun(cwd, report) {
+  await fs.mkdir(path.join(cwd, 'node_modules', '.cache', 'dep-up-surgeon'), { recursive: true });
   await fs.writeFile(
-    path.join(cwd, '.dep-up-surgeon.last-run.json'),
+    path.join(cwd, 'node_modules', '.cache', 'dep-up-surgeon', 'last-run.json'),
     JSON.stringify(
       {
         upgraded: [],

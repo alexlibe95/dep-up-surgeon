@@ -113,7 +113,7 @@ export function defaultPrTitle(report: FinalReport): string {
 /**
  * Default body when `--open-pr` is set but no summary is available (e.g. `--no-summary`
  * wasn't passed but rendering failed). Minimal — just enough to link back to the structured
- * report so the reviewer can inspect `.dep-up-surgeon.last-run.json`.
+ * report so the reviewer can inspect the run's `--json` report.
  */
 export function defaultPrBody(report: FinalReport): string {
   const upgraded = report.upgraded.filter((r) => r.success && !r.skipped);
@@ -157,7 +157,7 @@ export function truncatePrBody(body: string, max = MAX_PR_BODY_CHARS): string {
   for (let i = 0; i < openDetails; i++) {
     head += '\n\n</details>';
   }
-  return `${head}\n\n_…truncated: the full report exceeds GitHub's PR description limit. See the job summary or \`.dep-up-surgeon.last-run.json\` for the rest._\n`;
+  return `${head}\n\n_…truncated: the full report exceeds GitHub's PR description limit. See the job summary or the run's \`--json\` report for the rest._\n`;
 }
 
 /**

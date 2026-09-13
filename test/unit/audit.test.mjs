@@ -253,6 +253,16 @@ test('runAudit (npm): an { error } payload is reported, not treated as a clean a
   assert.match(result.error ?? '', /ENOLOCK: This command requires an existing lockfile/);
 });
 
+test('runAudit (npm): a timed-out audit says so instead of "exited -1 with no output"', async () => {
+  const result = await runAudit({
+    manager: 'npm',
+    cwd: '/tmp',
+    exec: async () => ({ stdout: '', exitCode: -1, timedOut: true }),
+  });
+  assert.deepStrictEqual(result.advisories, []);
+  assert.match(result.error ?? '', /npm audit --json timed out after \d+s/);
+});
+
 test('runAudit (npm): a clean report is a success with no advisories', async () => {
   const clean = JSON.stringify(
     {

@@ -10,7 +10,7 @@ import fs from 'node:fs/promises';
 import fssync from 'node:fs';
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const { detectProjectInfo, parsePackageManagerOption, isPackageManager } = await import(
+const { describeRootLockfiles, detectProjectInfo, parsePackageManagerOption, isPackageManager } = await import(
   path.join(root, 'dist/core/workspaces.js')
 );
 
@@ -394,6 +394,15 @@ test('detectProjectInfo: devEngines.packageManager array uses the first entry; p
   const withField = await detectProjectInfo(dir);
   assert.strictEqual(withField.manager, 'npm');
   assert.strictEqual(withField.managerVersion, '11.0.0');
+});
+
+test("describeRootLockfiles: another manager's lockfile is reported as stale", async () => {
+  const dir = await makeTmp('two-lockfiles');
+  await writeJson(path.join(dir, 'package.json'), { name: 'app', version: '1.0.0' });
+  await fs.writeFile(path.join(dir, 'bun.lock'), '{}');
+  await writeJson(path.join(dir, 'package-lock.json'), { lockfileVersion: 3 });
+  assert.deepStrictEqual(describeRootLockfiles(dir, 'bun'), { updated: ['bun.lock'], stale: ['package-lock.json'] });
+  assert.deepStrictEqual(describeRootLockfiles(dir, 'npm'), { updated: ['package-lock.json'], stale: ['bun.lock'] });
 });
 
 test('detectProjectInfo: npm-shrinkwrap.json is an npm lockfile; lockfile precedence is kept', async () => {

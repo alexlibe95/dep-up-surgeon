@@ -151,6 +151,28 @@ const ROOT_LOCKFILES: ReadonlyArray<readonly [RootLockfile, PackageManager]> = [
   ['package-lock.json', 'npm'],
 ];
 
+/** Every lockfile name a supported manager writes at the project root, in detection order. */
+export const ROOT_LOCKFILE_NAMES: readonly RootLockfile[] = ROOT_LOCKFILES.map(([file]) => file);
+
+/**
+ * Root lockfiles on disk, split by whether installing with `manager` rewrites them. Another
+ * manager's lockfile (e.g. `package-lock.json` next to `bun.lock`) is never touched by an upgrade
+ * run, so it drifts from package.json while CI or a host may still install from it.
+ */
+export function describeRootLockfiles(
+  cwd: string,
+  manager: PackageManager,
+): { updated: RootLockfile[]; stale: RootLockfile[] } {
+  const updated: RootLockfile[] = [];
+  const stale: RootLockfile[] = [];
+  for (const [file, owner] of ROOT_LOCKFILES) {
+    if (fs.existsSync(path.join(cwd, file))) {
+      (owner === manager ? updated : stale).push(file);
+    }
+  }
+  return { updated, stale };
+}
+
 function detectFromLockfile(cwd: string): { manager?: PackageManager; lockfileName?: RootLockfile } {
   for (const [file, manager] of ROOT_LOCKFILES) {
     if (fs.existsSync(path.join(cwd, file))) {

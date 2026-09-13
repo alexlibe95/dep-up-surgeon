@@ -14,12 +14,14 @@ import {
 } from './config/loadConfig.js';
 import { buildStructuredReport, printStructuredCliSummary } from './cli/report.js';
 import {
+  captureRootLockfiles,
   computeRetryFailedIgnores,
-  LAST_RUN_FILENAME,
+  lastRunReportPath,
   loadLastRunReport,
   persistLastRunReport,
 } from './cli/lastRun.js';
 import { resolveSummaryDestination, writeSummary, type SummaryFormat } from './cli/summary.js';
+import { captureWorktree, restoreSideEffects } from './cli/sideEffects.js';
 import { checkoutBranch, getCurrentBranch, type GitCommitMode } from './cli/git.js';
 import { createGitFlow, type GitFlowController } from './cli/gitFlow.js';
 import {
@@ -193,7 +195,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  // `undo` reads `.dep-up-surgeon.last-run.json` and reverses the last run (dep ranges +
+  // `undo` reads the last-run report and reverses the last run (dep ranges +
   // overrides + reinstall + validate). Same early-dispatch pattern as `doctor` so the
   // subcommand doesn't inherit the upgrade flow's 70+ options.
   if (process.argv[2] === 'undo') {
@@ -291,11 +293,11 @@ async function main(): Promise<void> {
     )
     .option(
       '--no-persist-report',
-      `Do not write the structured report to ${LAST_RUN_FILENAME} after the run. By default the report is written next to the workspace root for inspection by CI / --retry-failed.`,
+      'Do not write the structured report after the run. By default it is written to node_modules/.cache/dep-up-surgeon/last-run.json (with pre-run lockfile backups) for undo / --retry-failed / CI.',
     )
     .option(
       '--retry-failed',
-      `Read ${LAST_RUN_FILENAME} from the previous run and only reattempt entries that failed for non-terminal reasons (i.e. NOT 'peer' or 'validation-script'). Successful upgrades + terminal failures from the last run are frozen per workspace (workspace::name) so a result in one member does not skip the same package in another.`,
+      `Read the previous run's report (node_modules/.cache/dep-up-surgeon/last-run.json) and only reattempt entries that failed for non-terminal reasons (i.e. NOT 'peer' or 'validation-script'). Successful upgrades + terminal failures from the last run are frozen per workspace (workspace::name) so a result in one member does not skip the same package in another.`,
       false,
     )
     .option(
@@ -569,7 +571,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
     const last = await loadLastRunReport(cwd);
     if (!last) {
       log.error(
-        `--retry-failed: no previous run found at ${path.join(cwd, LAST_RUN_FILENAME)}. ` +
+        `--retry-failed: no previous run found at ${lastRunReportPath(cwd)}. ` +
           'Run dep-up-surgeon at least once first (and don’t pass --no-persist-report).',
       );
       process.exitCode = 1;
@@ -583,7 +585,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
       const ageMs = Date.now() - new Date(last.finishedAt).getTime();
       const ageMin = Math.max(1, Math.round(ageMs / 60000));
       log.info(
-        `--retry-failed: loaded last run from ${path.relative(cwd, path.join(cwd, LAST_RUN_FILENAME)) || LAST_RUN_FILENAME} (${ageMin}m ago, dep-up-surgeon ${last.toolVersion})`,
+        `--retry-failed: loaded last run from ${path.relative(cwd, lastRunReportPath(cwd))} (${ageMin}m ago, dep-up-surgeon ${last.toolVersion})`,
       );
       log.dim(
         `  freezing ${retry.succeededLastRun} previously-upgraded + ${retry.terminalFailuresLastRun} terminal failure(s); retrying ${retry.retryableLastRun.length} non-terminal failure(s): ${retry.retryableLastRun.join(', ') || '(none)'}`,
@@ -819,6 +821,10 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
     workspaceMode = 'all';
   }
 
+  // Pre-run lockfile bytes, persisted next to the report so `undo` can restore exact versions.
+  const lockfilesBefore = dryRun ? [] : await captureRootLockfiles(cwd);
+  // Which tracked files were already changed, so only the run's own side effects get restored.
+  const worktreeBefore = dryRun ? undefined : await captureWorktree(cwd);
   let report: FinalReport | null = null;
 
   try {
@@ -1230,6 +1236,21 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
       }
     }
 
+    // Tracked files the validator or install scripts rewrote (e.g. `next build` → tsconfig.json)
+    // go back, so the run only leaves dependency changes behind.
+    if (worktreeBefore) {
+      const sideEffects = await restoreSideEffects(worktreeBefore);
+      if (sideEffects.restored.length > 0) {
+        report!.restoredFiles = sideEffects.restored;
+        if (!jsonOutput) {
+          log.dim(`Restored files the run changed besides dependencies: ${sideEffects.restored.join(', ')}`);
+        }
+      }
+      if (sideEffects.untracked.length > 0 && !jsonOutput) {
+        log.warn(`New untracked files appeared during the run (left in place): ${sideEffects.untracked.join(', ')}`);
+      }
+    }
+
     const structuredFinal = buildStructuredReport(report!, {
       parsedConflicts: report!.parsedConflicts,
       groups: report!.groupPlan,
@@ -1260,9 +1281,10 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
         cwd,
         toolVersion: version,
         dryRun,
+        lockfilesBefore,
       });
       if (written && !jsonOutput) {
-        log.dim(`Wrote ${path.relative(cwd, written) || LAST_RUN_FILENAME} for --retry-failed / CI`);
+        log.dim(`Wrote ${path.relative(cwd, written)} for undo / --retry-failed / CI`);
       }
     }
 
@@ -1310,6 +1332,9 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
     // in the middle of, and upgrades that completed earlier were validated and match the lockfile.
     // Restoring the run-start package.json (or a stale backup from an older run) desynced the two.
     await removeCreatedBackups().catch(() => undefined);
+    if (worktreeBefore) {
+      await restoreSideEffects(worktreeBefore).catch(() => undefined);
+    }
     process.exitCode = 1;
   }
 }

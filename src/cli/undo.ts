@@ -1,7 +1,7 @@
 /**
  * Implementation of the `dep-up-surgeon undo` subcommand.
  *
- * Given a `.dep-up-surgeon.last-run.json` report (the one written next to every CLI run,
+ * Given the last-run report (`node_modules/.cache/dep-up-surgeon/last-run.json`, written after every CLI run,
  * unless `--no-persist-report`), this module computes a reverse pass that:
  *
  *   1. Reverts `package.json` dependency ranges back to the `from` values recorded for each
@@ -18,9 +18,10 @@
  *     range), we **skip** that row with `reason: 'drifted'`. We never rewrite a range the
  *     user moved out from under us.
  *   - If the recorded run was `dryRun`, there's nothing to undo — we return a no-op report.
- *   - The module does not know how to restore a lockfile snapshot; instead it asks the
- *     manager to reinstall from the reverted `package.json`, which is the guarantee we
- *     actually want. A future extension can layer on a lockfile-hash check.
+ *   - Lockfiles the run changed are restored from their pre-run backup before the reinstall,
+ *     but only when every row reverted and the lockfile still hashes to what the run left
+ *     behind. Otherwise the manager reinstalls from the reverted `package.json`, which keeps
+ *     any version the old range still allows (`^16.3.1` keeps `16.3.5`).
  *
  * Everything heavy (install, validator) is injected via `opts.installer` / `opts.runValidator`
  * so unit tests can exercise the reverse pass without network / process calls.
@@ -45,7 +46,7 @@ import { writeJsonLike } from '../utils/jsonFile.js';
 import { runInstall } from '../utils/npm.js';
 import { log } from '../utils/logger.js';
 import type { PersistedLastRun } from './lastRun.js';
-import { LAST_RUN_FILENAME, loadLastRunReport } from './lastRun.js';
+import { lastRunReportPath, loadLastRunReport, sha256 } from './lastRun.js';
 
 /** One slot in a `package.json` where dep ranges live. */
 type DepSection = 'dependencies' | 'devDependencies' | 'peerDependencies' | 'optionalDependencies';
@@ -87,6 +88,13 @@ export interface UndoOverrideRecord {
   detail?: string;
 }
 
+/** Restore of one root lockfile from the pre-run backup the recorded run wrote. */
+export interface UndoLockfileRecord {
+  file: string;
+  restored: boolean;
+  detail?: string;
+}
+
 export interface UndoResult {
   sourceFile: string;
   /** True when the persisted run was `--dry-run` — the reverse pass is a no-op. */
@@ -95,6 +103,8 @@ export interface UndoResult {
   reverts: UndoRevertRecord[];
   /** Per-override drop outcomes. */
   overrides: UndoOverrideRecord[];
+  /** Pre-run lockfile restores (only for runs that recorded lockfile backups). */
+  lockfiles?: UndoLockfileRecord[];
   /** Post-reverse install results, keyed by target cwd. */
   installs: Array<{ cwd: string; ok: boolean; command?: string; exitCode?: number; lastLines?: string }>;
   /** Post-reverse validator result, when not skipped. */
@@ -104,7 +114,7 @@ export interface UndoResult {
 export interface UndoOptions {
   /** Project root — where the CLI was invoked. */
   cwd: string;
-  /** Explicit persisted run file. Defaults to `<cwd>/.dep-up-surgeon.last-run.json`. */
+  /** Explicit persisted run file. Defaults to `<cwd>/node_modules/.cache/dep-up-surgeon/last-run.json`. */
   file?: string;
   /** Override manager detection (else the value from the persisted run's `project` block). */
   manager?: PackageManager;
@@ -133,14 +143,14 @@ export interface UndoOptions {
  * recoverable errors — skipped / failed items are recorded on the result.
  */
 export async function runUndo(opts: UndoOptions): Promise<UndoResult> {
-  const file = opts.file ? path.resolve(opts.cwd, opts.file) : path.join(opts.cwd, LAST_RUN_FILENAME);
+  const file = opts.file ? path.resolve(opts.cwd, opts.file) : lastRunReportPath(opts.cwd);
   const persisted = opts.file
     ? await readPersisted(file)
     : await loadLastRunReport(opts.cwd);
   if (!persisted) {
     throw new Error(
       `undo: no run report found at ${file}. Pass --file <path> to point at a specific ` +
-        `${LAST_RUN_FILENAME}, or re-run dep-up-surgeon so it writes one.`,
+        'last-run report, or re-run dep-up-surgeon so it writes one.',
     );
   }
 
@@ -308,7 +318,15 @@ export async function runUndo(opts: UndoOptions): Promise<UndoResult> {
     overrides.push(result);
   }
 
-  // ---- 3. Post-reverse install --------------------------------------------
+  // ---- 3. Restore pre-run lockfile bytes ----------------------------------
+  const rootCwd = persisted.cwd ?? opts.cwd;
+  const fullyReverted = reverts.every((r) => r.ok) && overrides.every((o) => o.ok);
+  const lockfiles = await restoreLockfiles(persisted, rootCwd, fullyReverted, Boolean(opts.planOnly));
+  if (!opts.planOnly && lockfiles.some((l) => l.restored)) {
+    editedTargets.add(rootCwd);
+  }
+
+  // ---- 4. Post-reverse install --------------------------------------------
   const installs: UndoResult['installs'] = [];
   if (!opts.planOnly && !opts.skipInstall && editedTargets.size > 0) {
     const installer = opts.installer ?? runInstall;
@@ -325,7 +343,7 @@ export async function runUndo(opts: UndoOptions): Promise<UndoResult> {
     }
   }
 
-  // ---- 4. Post-reverse validator ------------------------------------------
+  // ---- 5. Post-reverse validator ------------------------------------------
   let validation: UndoResult['validation'];
   if (!opts.planOnly && !opts.skipValidator && installs.every((r) => r.ok)) {
     if (opts.runValidator) {
@@ -338,9 +356,46 @@ export async function runUndo(opts: UndoOptions): Promise<UndoResult> {
     noop: false,
     reverts,
     overrides,
+    ...(lockfiles.length > 0 ? { lockfiles } : {}),
     installs,
     ...(validation ? { validation } : {}),
   };
+}
+
+/**
+ * Put back the pre-run bytes of each lockfile the recorded run changed. Skipped (with the reason)
+ * when a row wasn't reverted — the old lockfile would then disagree with package.json — or when
+ * the lockfile or its backup changed since the run.
+ */
+async function restoreLockfiles(
+  persisted: PersistedLastRun,
+  rootCwd: string,
+  fullyReverted: boolean,
+  planOnly: boolean,
+): Promise<UndoLockfileRecord[]> {
+  const records: UndoLockfileRecord[] = [];
+  for (const snap of persisted.lockfiles ?? []) {
+    const lockPath = path.join(rootCwd, snap.file);
+    const current = await fs.readFile(lockPath).catch(() => null);
+    const backup = await fs.readFile(path.join(rootCwd, snap.backup)).catch(() => null);
+    let detail: string | undefined;
+    if (!fullyReverted) {
+      detail = 'some rows were not reverted, so the pre-run lockfile no longer matches package.json';
+    } else if (!current || sha256(current) !== snap.afterSha256) {
+      detail = `${snap.file} changed since the run`;
+    } else if (!backup || sha256(backup) !== snap.beforeSha256) {
+      detail = `backup ${snap.backup} is missing or was modified`;
+    }
+    if (detail || !backup) {
+      records.push({ file: snap.file, restored: false, detail: detail ?? `backup ${snap.backup} is missing` });
+      continue;
+    }
+    if (!planOnly) {
+      await fs.writeFile(lockPath, backup);
+    }
+    records.push({ file: snap.file, restored: true, ...(planOnly ? { detail: 'would restore' } : {}) });
+  }
+  return records;
 }
 
 async function readPersisted(file: string): Promise<PersistedLastRun | undefined> {
@@ -501,6 +556,13 @@ export function renderUndoHuman(result: UndoResult): string {
     }
   }
 
+  for (const lock of result.lockfiles ?? []) {
+    lines.push(
+      lock.restored
+        ? `  lockfile ${lock.file}: restored to its pre-run state${lock.detail ? ` (${lock.detail})` : ''}`
+        : `  lockfile ${lock.file}: not restored (${lock.detail}) — versions the old ranges still allow stay installed`,
+    );
+  }
   for (const inst of result.installs) {
     lines.push(`  install @ ${inst.cwd}: ${inst.ok ? 'ok' : `failed (exit ${inst.exitCode ?? '?'})`}`);
   }

@@ -12,6 +12,7 @@ import path from 'node:path';
 import { Command } from 'commander';
 import { parsePackageManagerOption } from '../core/workspaces.js';
 import { log } from '../utils/logger.js';
+import { captureWorktree, restoreSideEffects } from './sideEffects.js';
 import { renderUndoHuman, runUndo, undoSucceeded } from './undo.js';
 
 export async function runUndoCommand(argv: string[], version: string): Promise<void> {
@@ -19,7 +20,7 @@ export async function runUndoCommand(argv: string[], version: string): Promise<v
   cmd
     .name('dep-up-surgeon undo')
     .description(
-      'Reverse the most recent `dep-up-surgeon` run using `.dep-up-surgeon.last-run.json`. ' +
+      'Reverse the most recent `dep-up-surgeon` run using its report in `node_modules/.cache/dep-up-surgeon`. ' +
         'Reverts `package.json` dep ranges to their `from` values, drops override pins this ' +
         'run added (or restores the previous pin when the run replaced an existing one), ' +
         'runs a fresh `<manager> install`, then runs the validator so you see green/red before ' +
@@ -30,7 +31,7 @@ export async function runUndoCommand(argv: string[], version: string): Promise<v
     .version(version)
     .option(
       '--file <path>',
-      'Use a specific run report instead of `.dep-up-surgeon.last-run.json` in cwd. Useful when ' +
+      'Use a specific run report instead of the one in `node_modules/.cache/dep-up-surgeon`. Useful when ' +
         'the directory has been cleaned up or you want to replay a report from a CI artifact.',
     )
     .option('--json', 'Emit the structured `UndoResult` as JSON on stdout instead of the human format.', false)
@@ -112,6 +113,8 @@ export async function runUndoCommand(argv: string[], version: string): Promise<v
       }
     };
 
+    // Same footprint rule as the upgrade run: the validator must not leave rewritten files behind.
+    const worktreeBefore = opts.dryRun ? undefined : await captureWorktree(cwd);
     const result = await runUndo({
       cwd,
       ...(opts.file ? { file: opts.file } : {}),
@@ -122,6 +125,12 @@ export async function runUndoCommand(argv: string[], version: string): Promise<v
       ...(skipValidator ? {} : { runValidator }),
       ...(opts.json ? { json: true } : {}),
     });
+    if (worktreeBefore) {
+      const { restored } = await restoreSideEffects(worktreeBefore);
+      if (restored.length > 0 && !opts.json) {
+        log.dim(`Restored files the undo changed besides dependencies: ${restored.join(', ')}`);
+      }
+    }
 
     if (opts.json) {
       process.stdout.write(JSON.stringify(result, null, 2) + '\n');
