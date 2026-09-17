@@ -39,6 +39,31 @@ test('renderSummaryMarkdown: a `|` in a failure message does not add table colum
   assert.ok(row.includes('^16.8.0 \\|\\| ^17.0.0'), row);
 });
 
+test('--json --progress: progress lines go to stderr, stdout is only the report', async () => {
+  const os = await import('node:os');
+  const fs = await import('node:fs/promises');
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dus-progress-'));
+  // No dependencies and no validator script: no registry access, and pre-flight has something to say.
+  await fs.writeFile(path.join(dir, 'package.json'), JSON.stringify({ name: 'app', version: '1.0.0' }));
+  const cli = path.join(root, 'dist/cli.js');
+  const run = (...flags) =>
+    spawnSync(process.execPath, [cli, '--cwd', dir, '--json', ...flags], {
+      encoding: 'utf8',
+      env: { ...process.env, NO_COLOR: '1' },
+    });
+
+  const quiet = run();
+  assert.strictEqual(quiet.status, 0, quiet.stderr);
+  assert.ok(JSON.parse(quiet.stdout).upgraded);
+  assert.doesNotMatch(quiet.stderr, /No test, build, lint or typecheck script/);
+
+  const progress = run('--progress');
+  assert.strictEqual(progress.status, 0, progress.stderr);
+  assert.ok(JSON.parse(progress.stdout).upgraded);
+  assert.match(progress.stderr, /No test, build, lint or typecheck script/);
+  assert.match(progress.stderr, /for undo \/ --retry-failed \/ CI/);
+});
+
 test('setLogToStderr: log lines go to stderr and stdout stays valid JSON', () => {
   const logger = pathToFileURL(path.join(root, 'dist/utils/logger.js')).href;
   const script = [

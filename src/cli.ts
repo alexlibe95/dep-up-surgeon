@@ -222,6 +222,11 @@ async function main(): Promise<void> {
     .option('--ignore <pkgs>', 'Comma-separated package names to skip (merged with .dep-up-surgeonrc)')
     .option('--json', 'Print machine-readable report to stdout', false)
     .option(
+      '--progress',
+      'With --json, still print progress (installs, validation, rollbacks) to stderr; stdout keeps only the JSON report. Parallel --concurrency drops to 1 so the lines stay readable.',
+      false,
+    )
+    .option(
       '--fallback-strategy <mode>',
       'When @latest fails: major-lines (default, one try per major), minor-lines (one per major.minor), or none',
       'major-lines',
@@ -442,6 +447,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
     force?: boolean;
     ignore?: string;
     json?: boolean;
+    progress?: boolean;
     fallbackStrategy?: string;
     linkGroups?: string;
     validate?: string | boolean;
@@ -495,6 +501,9 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
     // stdout is reserved for the JSON report; warnings, errors and progress go to stderr.
     setLogToStderr(true);
   }
+  // Human progress lines (installs, validation, rollbacks). Off with --json unless --progress,
+  // which keeps them on stderr for tools that show a live log next to the JSON report.
+  const quiet = jsonOutput && !opts.progress;
   // Registry lookups honor the project's / user's .npmrc (mirrors, scoped registries, auth).
   initRegistryOptions(cwd);
 
@@ -531,7 +540,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
   for (const w of config.warnings ?? []) {
     log.warn(`rc: ${w}`);
   }
-  if ((config.overrides?.length ?? 0) > 0 && !jsonOutput) {
+  if ((config.overrides?.length ?? 0) > 0 && !quiet) {
     log.info(
       `rc: loaded ${config.overrides!.length} override pin${config.overrides!.length === 1 ? '' : 's'} from .dep-up-surgeonrc (will run through the same install + validator + rollback cycle as --apply-overrides)`,
     );
@@ -541,7 +550,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
   const { loadPolicy } = await import('./config/policy.js');
   const policyResult = await loadPolicy(cwd);
   const policy = policyResult.policy;
-  if (policyResult.present && !jsonOutput) {
+  if (policyResult.present && !quiet) {
     const bits: string[] = [];
     if (policy.freeze.length) bits.push(`${policy.freeze.length} freeze`);
     if (policy.maxVersion.length) bits.push(`${policy.maxVersion.length} maxVersion`);
@@ -581,7 +590,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
     for (const name of retry.added) {
       ignore.add(name);
     }
-    if (!jsonOutput) {
+    if (!quiet) {
       const ageMs = Date.now() - new Date(last.finishedAt).getTime();
       const ageMin = Math.max(1, Math.round(ageMs / 60000));
       log.info(
@@ -712,7 +721,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
       }
     }
 
-    if (!jsonOutput) {
+    if (!quiet) {
       log.info(`--security-only: running ${auditManager} audit --json (min-severity: ${minSev})`);
     }
     auditResult = await runAudit({ manager: auditManager, cwd });
@@ -751,7 +760,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
         },
       ]),
     );
-    if (!jsonOutput) {
+    if (!quiet) {
       if (restrictToNames.size === 0) {
         log.success(`No advisories at "${minSev}+" severity — nothing to do.`);
       } else {
@@ -775,7 +784,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
         includeChangelog,
         securityAdvisories: securityAdvisoryMap,
       },
-      jsonOutput,
+      quiet,
       dryRun,
     );
     if (!setup.ok) {
@@ -791,7 +800,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
     if (gitFlow.enabled && typeof opts.gitBranch === 'string' && opts.gitBranch.trim()) {
       try {
         const previous = await checkoutBranch(cwd, opts.gitBranch.trim());
-        if (!jsonOutput) {
+        if (!quiet) {
           log.info(
             `git: switched to branch "${opts.gitBranch}"${previous ? ` (was on "${previous}")` : ''}`,
           );
@@ -803,7 +812,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
       }
     }
 
-    if (!jsonOutput && gitFlow.enabled) {
+    if (!quiet && gitFlow.enabled) {
       const branch = (await getCurrentBranch(cwd)) ?? '?';
       log.info(`git: ${gitCommitMode} commits will land on "${branch}"`);
     }
@@ -833,7 +842,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
       dryRun,
       interactive,
       force,
-      jsonOutput,
+      jsonOutput: quiet,
       ignore,
       fallbackStrategy,
       linkGroups,
@@ -962,7 +971,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
               files: hits.hits.map((h) => h.relativePath),
             };
           }
-          if (!jsonOutput) {
+          if (!quiet) {
             const touched = [...br.byPackage.values()].filter((h) => h.total > 0).length;
             log.dim(
               `blast radius: scanned ${br.filesScanned} source files (${touched}/${successfulNames.length} upgraded packages had direct imports)`,
@@ -1024,7 +1033,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
         (!opts.securityOnly || (securityAdvisories?.length ?? 0) === 0) &&
         !effectivelyHasManual
       ) {
-        if (!jsonOutput) {
+        if (!quiet) {
           log.warn(
             '--apply-overrides requires --security-only with at least one audit advisory; skipping.',
           );
@@ -1054,7 +1063,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
             upgradedNames,
             directDepNames,
             overwriteConflicts: Boolean(opts.overrideForce),
-            json: jsonOutput,
+            json: quiet,
             manualOverrides,
           });
           if (flowResult.attempts.length > 0) {
@@ -1065,7 +1074,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
             };
           }
         } catch (e) {
-          if (!jsonOutput) {
+          if (!quiet) {
             log.warn(
               `overrides: skipped due to error: ${e instanceof Error ? e.message : String(e)}`,
             );
@@ -1087,7 +1096,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
           cwd,
           manager: fixManager,
           ...(yarnMajorVersion !== undefined ? { yarnMajorVersion } : {}),
-          json: jsonOutput,
+          json: quiet,
           runValidator: async () => {
             if (validate.skip) return { ok: true };
             try {
@@ -1119,7 +1128,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
           },
         });
         report!.lockfileFix = fixRes.report;
-        if (!jsonOutput) {
+        if (!quiet) {
           const r = fixRes.report;
           if (r.status === 'ok') {
             const mergedOrUpdated = r.dedupeChanges.filter(
@@ -1141,7 +1150,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
           }
         }
       } catch (e) {
-        if (!jsonOutput) {
+        if (!quiet) {
           log.warn(
             `--fix-lockfile: skipped due to error: ${e instanceof Error ? e.message : String(e)}`,
           );
@@ -1172,7 +1181,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
       });
       if (written) {
         summaryFilePath = written;
-        if (!jsonOutput) {
+        if (!quiet) {
           const rel = path.relative(cwd, written) || written;
           log.dim(
             `Wrote ${summaryFormat.toUpperCase()} summary to ${rel}${dest.append ? ' (appended)' : ''}`,
@@ -1189,19 +1198,19 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
         typeof opts.gitBranch === 'string' && opts.gitBranch.trim() ? opts.gitBranch.trim() : undefined;
       const hadCommits = gitFlow?.enabled === true && (report!.commits ?? []).some((c) => c.ok);
       if (!gitFlow?.enabled) {
-        if (!jsonOutput) {
+        if (!quiet) {
           log.warn('--open-pr requires --git-commit; skipping.');
         }
       } else if (!branch) {
-        if (!jsonOutput) {
+        if (!quiet) {
           log.warn('--open-pr requires --git-branch <name>; skipping so we never push to the default branch.');
         }
       } else if (dryRun) {
-        if (!jsonOutput) {
+        if (!quiet) {
           log.warn('--open-pr: skipping in --dry-run (no commits were made).');
         }
       } else if (!hadCommits) {
-        if (!jsonOutput) {
+        if (!quiet) {
           log.dim('--open-pr: no successful commits on the branch — nothing to open a PR for.');
         }
       } else {
@@ -1225,7 +1234,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
         }
         const result = await openPullRequest(prCfg, report!);
         report!.pullRequest = result;
-        if (!jsonOutput) {
+        if (!quiet) {
           if (result.ok) {
             const tag = result.reused ? 'reused existing PR' : 'opened PR';
             log.success(`gh: ${tag}${result.url ? ` ${result.url}` : ''}`);
@@ -1242,11 +1251,11 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
       const sideEffects = await restoreSideEffects(worktreeBefore);
       if (sideEffects.restored.length > 0) {
         report!.restoredFiles = sideEffects.restored;
-        if (!jsonOutput) {
+        if (!quiet) {
           log.dim(`Restored files the run changed besides dependencies: ${sideEffects.restored.join(', ')}`);
         }
       }
-      if (sideEffects.untracked.length > 0 && !jsonOutput) {
+      if (sideEffects.untracked.length > 0 && !quiet) {
         log.warn(`New untracked files appeared during the run (left in place): ${sideEffects.untracked.join(', ')}`);
       }
     }
@@ -1283,7 +1292,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
         dryRun,
         lockfilesBefore,
       });
-      if (written && !jsonOutput) {
+      if (written && !quiet) {
         log.dim(`Wrote ${path.relative(cwd, written)} for undo / --retry-failed / CI`);
       }
     }
@@ -1312,7 +1321,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
     let exitCode: number;
     if (ciMode) {
       exitCode = preflightFailed ? 1 : 0;
-      if (!jsonOutput && report!.failed.length > 0) {
+      if (!quiet && report!.failed.length > 0) {
         log.dim(
           `--ci: ${report!.failed.length} per-package failure(s) recorded in the report; exit 0 anyway.`,
         );

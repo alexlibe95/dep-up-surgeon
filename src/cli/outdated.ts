@@ -8,6 +8,7 @@ import { detectProjectInfo, type PackageManager } from '../core/workspaces.js';
 import { isRegistryRange, scanProject } from '../core/scanner.js';
 import { dedupeScannedByName } from '../core/scannedDedup.js';
 import { fetchLatestVersion } from '../utils/npm.js';
+import { correctLaggingLatest } from '../utils/latestTag.js';
 import {
   loadLockfileVersionTree,
   resolveInstalledVersion,
@@ -24,6 +25,11 @@ export interface OutdatedRow {
   declared: string;
   installed?: string;
   latest?: string;
+  /**
+   * The registry `latest` dist-tag, present only when it lags behind the installed major. `latest`
+   * then holds the newest release of the installed major instead (see `correctLaggingLatest`).
+   */
+  latestTag?: string;
   status: OutdatedStatus;
   /** Registry lookup failure message when `latest` could not be fetched. */
   error?: string;
@@ -81,9 +87,12 @@ export async function runOutdated(opts: RunOutdatedOptions): Promise<OutdatedRep
       lockfileVersions,
     });
     let latest: string | undefined;
+    let latestTag: string | undefined;
     let error: string | undefined;
     try {
-      latest = await fetchLatestVersion(p.name, cache);
+      const resolved = await correctLaggingLatest(p.name, installed, await fetchLatestVersion(p.name, cache), cache);
+      latest = resolved.latest;
+      latestTag = resolved.laggingTag;
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     }
@@ -101,6 +110,7 @@ export async function runOutdated(opts: RunOutdatedOptions): Promise<OutdatedRep
     };
     if (installed) row.installed = installed;
     if (latest) row.latest = latest;
+    if (latestTag) row.latestTag = latestTag;
     if (error) row.error = error;
     return row;
   });
@@ -149,8 +159,9 @@ export function renderOutdatedHuman(report: OutdatedReport): string {
           ? chalk.cyan(r.status)
           : chalk.dim(r.status);
     const error = r.error ? chalk.dim(`  (${r.error})`) : '';
+    const tag = r.latestTag ? chalk.dim(`  (npm "latest" tag: ${r.latestTag})`) : '';
     lines.push(
-      `  ${pad(r.name, nameW)}  ${pad(r.installed ?? '?', verW)}  ${pad(r.latest ?? '?', verW)}  ${statusColor}${error}`,
+      `  ${pad(r.name, nameW)}  ${pad(r.installed ?? '?', verW)}  ${pad(r.latest ?? '?', verW)}  ${statusColor}${error}${tag}`,
     );
   }
   if (report.rows.every((r) => r.error)) {

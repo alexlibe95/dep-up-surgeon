@@ -36,6 +36,13 @@ npm run build
 npx dep-up-surgeon --help
 ```
 
+## What's new in 4.1
+
+- **A failed linked group no longer drops its safe members.** When the whole group fails, the members that jump to a new major are held back and the rest upgrade on their own (e.g. an `eslint-config-next` patch lands while `eslint@10` is reported as failed). See **When a linked group can't move as a whole**. Consumers that key on `[group:<id>]` rows: a held-back member is now reported as a plain row with `linkedGroupId`.
+- **A lagging `latest` dist-tag no longer hides updates.** When the installed version is newer than the tag, the newest release of the installed major is used (`@types/node` 26.5.1 → 26.6.1 while `latest` pointed at 22.20.3); `outdated` reports it with `latestTag`.
+- **Peer hold-backs name their blocker** (`skipped[].blockedBy`), and a resolver tuple equal to what's installed is no longer installed and validated again. `failed[].requestedLatest` records the version each failure was aiming for.
+- **`--progress`** keeps the progress lines on stderr together with `--json`, for tools that show a live log next to the report.
+
 ## Upgrading from 3.x
 
 4.0 changes a few defaults — check these if you run dep-up-surgeon in CI:
@@ -63,8 +70,9 @@ dep-up-surgeon outdated [options]
 | `--interactive` | On failure, prompts for next steps (see **Interactive mode**). After the run, optionally bulk-add failed names to `.dep-up-surgeonrc`. |
 | `--force` | Keep a version bump even when validation fails; also skips **rollback** when structured conflicts are detected in npm output after a successful exit code (use with care). |
 | `--ignore <pkgs>` | Comma-separated **package names** to skip in **every** workspace (merged with `.dep-up-surgeonrc`). This is global by name — unlike `--retry-failed`, which freezes per workspace. |
-| `--json` | Machine-readable report on stdout (see **JSON report**). Progress, warnings and errors go to stderr, so stdout is always valid JSON. |
-| `--fallback-strategy <mode>` | `major-lines` (**default**), `minor-lines`, or `none`. After `@latest` fails, **`major-lines`** tries the best stable version per **major** (e.g. `9.x` → `8.x` → `7.x` …). **`minor-lines`** steps one **`major.minor` line** at a time. If npm output looks like **ESM vs CommonJS** (`ERR_REQUIRE_ESM`), further fallbacks for that package **stop**. `none` only attempts `@latest`. |
+| `--json` | Machine-readable report on stdout (see **JSON report**). Warnings and errors go to stderr, so stdout is always valid JSON. Progress lines are off unless `--progress` is added. |
+| `--progress` | With `--json`, still print progress (installs, validation, rollbacks, the lines of **Live progress**) to **stderr**; stdout keeps only the JSON report. For tools that show a live log next to the report (e.g. PumpBar). Parallel `--concurrency` drops to `1` so the lines stay readable. |
+| `--fallback-strategy <mode>` | `major-lines` (**default**), `minor-lines`, or `none`. After `@latest` fails, **`major-lines`** tries the best stable version per **major** (e.g. `9.x` → `8.x` → `7.x` …). **`minor-lines`** steps one **`major.minor` line** at a time. If npm output looks like **ESM vs CommonJS** (`ERR_REQUIRE_ESM`), further fallbacks for that package **stop**. `none` only attempts `@latest`. For **linked groups**, members step back together, and when the whole group still fails the members that jump to a new major are held back while the rest upgrade on their own (see **When a linked group can't move as a whole**); `none` turns both off. |
 | `--link-groups <mode>` | `auto` (**default**) or `none`. **`auto`** builds **linked batches** from the registry graph and optional **`linkedGroups`**. **`none`** upgrades one dependency per step. |
 | `--validate <cmd>` | Override the validator command run after every install. Defaults to `<manager> test` if a `test` script exists, else `<manager> run build` (yarn classic uses `yarn build`), else nothing — plus any `lint` / `typecheck` / `type-check` script, guarded by its pre-flight exit code (see **Pre-flight check**). Useful in monorepos where the default build is heavy or fragile (e.g. `--validate "tsc -p tsconfig.json --noEmit"`). |
 | `--no-validate` | Skip validation entirely. Upgrades are kept regardless of test/build outcome. Different from `--force`: `--force` runs the validator and only keeps the bump when it fails, `--no-validate` doesn’t run a validator at all. |
@@ -363,6 +371,7 @@ Where it shows up:
 - **`--summary md|html`**: a dedicated **Peer-range resolutions** table (package / group / requested / installed / tuples explored) above the upgraded table, plus a `peer-resolved from <v>` badge in the upgraded row's Notes column.
 - **Commit subjects**: `[peer-resolved]` tag sits between `[breaking]` and `[security:<sev>]` (stable order). The body gets a `Peer-range resolutions (kept linked group satisfiable):` footer listing each pinned member.
 - **`--json`**: `upgraded[].resolvedPeer = { originalTarget, reason, tuplesExplored }` plus `upgraded[].requestedLatest` still reflects the pre-resolver target so downstream tools can diff them.
+- **Kept at the installed version**: when the resolver's tuple is what's already installed, the group isn't installed and validated again. The members are reported as skipped `no change` rows with `requestedLatest` and `blockedBy: [{ name, version, range }]`, e.g. `@react-three/fiber` `9.7.0` needing `react` `>=19 <19.3`.
 
 ### Transitive overrides (`--apply-overrides` / `--override`)
 
@@ -570,7 +579,7 @@ npx dep-up-surgeon doctor
 
 ### Outdated report (`dep-up-surgeon outdated`)
 
-`outdated` is a **read-only** scan of direct dependencies vs registry `@latest`. Installed versions come from the lockfile when available (so `^1.0.0` that already resolved to `1.9.0` is not flagged if `1.9.0` is latest). Exits `1` when anything is outdated, `2` when no package could be checked (every registry lookup failed), `0` otherwise — useful as a CI soft gate before an upgrade run.
+`outdated` is a **read-only** scan of direct dependencies vs registry `@latest`. Installed versions come from the lockfile when available (so `^1.0.0` that already resolved to `1.9.0` is not flagged if `1.9.0` is latest). When the `latest` dist-tag lags behind the installed major, the newest release of that major is reported as `latest` (the tag itself goes to `latestTag`; see **Why not only “latest”?**). Exits `1` when anything is outdated, `2` when no package could be checked (every registry lookup failed), `0` otherwise — useful as a CI soft gate before an upgrade run.
 
 ```bash
 npx dep-up-surgeon outdated
@@ -661,6 +670,16 @@ There are **no framework-specific lists**. Groups are derived from your **direct
 
 **Performance**: manifests are fetched with **bounded concurrency** (parallel batches); responses are **cached** for the duration of the run.
 
+### When a linked group can't move as a whole
+
+A group is first tried at every member's `latest`. When that fails:
+
+1. A **peer** failure goes to the **peer-range intersection resolver**, which looks for the newest tuple that satisfies every peer range. When that tuple is exactly what's installed (e.g. `react` kept at `19.2.8` because `@react-three/fiber` needs `react <19.3`), nothing is installed or validated again, and each member gets a `no change` row naming the blocker (`blockedBy`).
+2. With `--fallback-strategy major-lines` / `minor-lines`, members step back along their release lines **together** (up to 5 tries).
+3. If the group still fails, the members whose target **leaves the caret range** of the installed version (a new major, or a `0.x` minor) are **held back** and the rest is retried on its own. `eslint@10` breaking lint no longer rolls back the `eslint-config-next` patch it was grouped with: the patch lands, and `eslint` is reported as a plain failed row (name, `attemptedVersion`, `requestedLatest`, `linkedGroupId`) whose message says it failed with the whole group.
+
+Only when nothing is left to try is the whole group reported as `[group:<id>]`.
+
 ### Interactive mode (`--interactive`)
 
 - **Single package** failures: prompt to continue, pin (ignore) that package, or retry once. Pinning writes a **bare package name** to `.dep-up-surgeonrc`, so the next run skips it in every workspace.
@@ -675,6 +694,8 @@ After each `npm install`, output is passed through a **generic conflict parser**
 ### Why not only “latest”?
 
 `latest` may not be adoptable yet (e.g. **ESM-only** majors, or a **TypeScript** major that breaks your build). The default strategy tries **`@latest` first**, then walks older **release lines** when fallbacks are enabled.
+
+The `latest` **dist-tag** can also lag behind: packages that publish several majors in parallel sometimes leave it on an older line (DefinitelyTyped published `@types/node@22.20.3` seconds after `26.6.1`, and `latest` moved to 22.20.3). When the installed version is newer than the tag, the newest stable release of the **installed major** is used as latest instead, so `26.5.1` still upgrades to `26.6.1` rather than being skipped as "ahead of latest". Higher majors are never proposed this way. `outdated` reports the same version, with the tag under `latestTag`.
 
 ### Live progress (spinner + elapsed timer)
 
@@ -715,7 +736,7 @@ Environment handling:
 
 - **TTY (local dev)** — animated braille spinner updated in place with a live elapsed timer.
 - **Non-TTY (CI logs, piped output, `tee`-ed runs)** — auto-degrades to plain `› <phase>` lines, one per phase transition, no ANSI escapes. Jenkins / GitHub Actions logs stay clean and every phase remains visible in the scrollback.
-- **`--json` / `--ci`** — completely silent. Machine output is untouched so JSON consumers never see progress noise.
+- **`--json` / `--ci`** — silent unless `--progress` is passed, which prints the plain `› <phase>` lines to stderr (stdout still carries only the JSON report).
 - **`--concurrency > 1`** — already requires `--json`, so the spinner stays off in parallel runs. Serial runs keep a single clean status line regardless of how many workspace targets are traversed.
 
 ## Configuration
@@ -758,6 +779,8 @@ Stdout is a single JSON object including:
 - For **every** failed entry, an `install` block with `{ command, exitCode, lastLines, ok }` capturing the install step that triggered the failure. `ok: true` means the installer process exited 0 but a post-install conflict scan triggered the rollback (peer warnings, "Conflicting peer dependency", etc.); `ok: false` means the installer itself crashed. `lastLines` is the **last ~40 lines** of combined stdout/stderr — usually enough to include the actual `npm ERR!` / pnpm / yarn footer.
 - **`targets`**: list of `{ label, cwd, packageJson }` entries describing which `package.json` files were processed. With `--workspaces` / `--workspace <names>` this contains multiple entries (`label` = `"root"` or the workspace member's package `name`); without those flags it is a single root entry. Each `upgraded` / `failed` row also carries a matching `workspace` field. `--retry-failed` keys its auto-ignore list off that field (`workspace::name`) so a freeze does not leak across members. When more than one target is traversed, `groups[].id` values are namespaced as `"<workspace>::<group-id>"` so they stay unique across the aggregated report.
 - The `failed[].reason` field uses `validation-script` for build/test script crashes and `validation-conflicts` for npm-reported peer issues; `peer` and `install` retain their meanings.
+- **`failed[].requestedLatest`**: the registry latest the entry was upgrading to (`attemptedVersion` is the last version tried, which is an older line after a release-line fallback). A bare version, or `name@version, …` for a `[group:<id>]` row. Compare it with a later `latest` to tell whether a newer release could fix the failure.
+- **`skipped[].blockedBy`**: on `no change` rows of a linked group, the installed packages whose peer ranges kept the member on its current version.
 - **`project`**: `{ manager, managerVersion?, managerSource, lockfile?, hasWorkspaces, workspaceGlobs[], workspaceMembers[], yarnMajorVersion?, yarnSupportsFocus? }` — see **Workspaces & package managers** above. The two `yarn*` fields are only present when the active manager is yarn AND the project has workspaces (they drive the `--install-mode filtered` decision).
 - **`installMode`**: `"root"` or `"filtered"` — the workspace install strategy actually used for this run.
 - **`concurrency`**: effective number of targets traversed in parallel (only included when `> 1`).

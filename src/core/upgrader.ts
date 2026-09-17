@@ -9,6 +9,7 @@ import type {
   FailureReason,
   FinalReport,
   InstallDiagnostic,
+  PeerBlocker,
   ScannedPackage,
   UpgradeRecord,
   PreflightDiagnostic,
@@ -66,6 +67,7 @@ import {
 } from './conflictAnalyzer.js';
 import { promptGroupConflictChoice } from '../cli/interactive.js';
 import { buildLineFallbackOrder } from '../utils/versionFallback.js';
+import { correctLaggingLatest } from '../utils/latestTag.js';
 import { buildSingletonGroups } from './groups.js';
 import { buildDynamicLinkedGroups } from './dynamicGroups.js';
 import type { LinkedGroup } from './groups.js';
@@ -1186,7 +1188,47 @@ type Bump = {
    * catalog index in place, so computing it afterwards reported `^2.0.0 -> ^2.0.0`.
    */
   reportFrom?: string;
+  /** Installed version when the group started (lockfile), when known. */
+  fromVersion?: string;
+  /** The registry latest the bump started from, before any resolver / fallback change. */
+  requestedLatest?: string;
 };
+
+/**
+ * A bump that changes nothing: the target is the installed version and package.json would keep
+ * its range. Happens when the peer-range resolver settles a member back on what's installed.
+ */
+function isNoOpBump(b: Bump, opts: UpgradeEngineOptions): boolean {
+  if (!b.fromVersion || b.targetVersion !== b.fromVersion) return false;
+  const from = b.reportFrom ?? catalogStyleRange(opts.catalog, b.scanned.name, b.scanned.currentRange);
+  return formatWrittenRange(b.scanned, b.targetVersion, opts.pinExact, opts.catalog) === from;
+}
+
+/** True when the bump leaves the caret range of the installed version (a new major, or a 0.x minor). */
+function isBreakingBump(b: Bump): boolean {
+  if (!b.fromVersion || !semver.valid(b.fromVersion) || !semver.valid(b.targetVersion)) return false;
+  return !semver.satisfies(b.targetVersion, `^${b.fromVersion}`, { includePrerelease: true });
+}
+
+/**
+ * Who kept `name` back, from the peer conflicts that sent a group to the peer-range resolver:
+ * `[{ name: '@react-three/fiber', version: '9.7.0', range: '>=19 <19.3' }]` for `react`.
+ */
+function blockersFor(name: string, conflicts: readonly Conflict[]): PeerBlocker[] {
+  const blockers: PeerBlocker[] = [];
+  for (const c of conflicts) {
+    if (c.dependency !== name || !c.depender || !c.requiredRange) continue;
+    const at = c.depender.lastIndexOf('@');
+    const blocker: PeerBlocker =
+      at > 0
+        ? { name: c.depender.slice(0, at), version: c.depender.slice(at + 1), range: c.requiredRange }
+        : { name: c.depender, range: c.requiredRange };
+    if (!blockers.some((x) => x.name === blocker.name && x.range === blocker.range)) {
+      blockers.push(blocker);
+    }
+  }
+  return blockers;
+}
 
 /**
  * Bump several dependencies in one `package.json` write, then one install + validate.
@@ -1197,6 +1239,11 @@ async function attemptBatchUpgrade(
   bumps: Bump[],
   opts: UpgradeEngineOptions,
 ): Promise<AttemptResult> {
+  // Every member already sits on its target: nothing to install, and pre-flight (or the
+  // previous validated step) already covered this exact tree.
+  if (bumps.length > 0 && bumps.every((b) => isNoOpBump(b, opts))) {
+    return { ok: true };
+  }
   return withInstallLock(opts, () =>
     withAttemptSnapshot(cwd, opts, async (snaps) => {
       const attempt: AttemptContext = { snaps };
@@ -1707,6 +1754,16 @@ async function runSinglePackageUpgrade(
     return;
   }
 
+  const effective = await correctLaggingLatest(scanned.name, fromVersion, latest, opts.registryCache);
+  if (effective.laggingTag) {
+    latest = effective.latest;
+    if (!jsonOutput) {
+      log.dim(
+        `${scanned.name}: registry "latest" (${effective.laggingTag}) is behind the installed ${fromVersion} — targeting ${latest}, the newest release of that major`,
+      );
+    }
+  }
+
   if (fromVersion && semver.eq(fromVersion, latest)) {
     addUpgrade(report, {
       name: scanned.name,
@@ -1912,6 +1969,8 @@ async function runSinglePackageUpgrade(
       row.detail = result.message;
     } else if (usedFallback) {
       row.detail = `latest (${latest}) failed; kept highest working in older release lines`;
+    } else if (effective.laggingTag) {
+      row.detail = `registry "latest" tag (${effective.laggingTag}) is behind the installed major; upgraded within it`;
     }
     // Ad-hoc peer-range resolver succeeded — attach the audit trail and emit companion
     // rows for each blocker that moved. The primary row carries `resolvedPeer` so the
@@ -1989,6 +2048,7 @@ async function runSinglePackageUpgrade(
       reason: failureReason(kind),
       previousVersion: scanned.currentRange,
       attemptedVersion: lastAttemptedVersion,
+      requestedLatest: latest,
       message: fullFailureMessage,
       conflicts: toConflicts(classified),
       validation: result.validation,
@@ -2153,9 +2213,10 @@ async function tryCoordinatedGroupFallback(
     }
     try {
       const all = await fetchAllPublishedVersions(b.scanned.name, opts.registryCache);
-      const latest =
+      const tagLatest =
         (await fetchLatestVersion(b.scanned.name, opts.registryCache).catch(() => b.targetVersion)) ??
         b.targetVersion;
+      const { latest } = await correctLaggingLatest(b.scanned.name, fromVersion, tagLatest, opts.registryCache);
       const order = buildLineFallbackOrder(fromVersion, latest, all, mode);
       // Drop the first entry when it's the version we already tried.
       const rest = order.filter((v) => v !== b.targetVersion);
@@ -2290,6 +2351,16 @@ async function runLinkedGroupUpgrade(
       continue;
     }
 
+    const effective = await correctLaggingLatest(scanned.name, fromVersion, latest, opts.registryCache);
+    if (effective.laggingTag) {
+      latest = effective.latest;
+      if (!jsonOutput) {
+        log.dim(
+          `${scanned.name}: registry "latest" (${effective.laggingTag}) is behind the installed ${fromVersion} — targeting ${latest}, the newest release of that major`,
+        );
+      }
+    }
+
     if (fromVersion && (semver.eq(fromVersion, latest) || semver.gt(fromVersion, latest))) {
       addUpgrade(report, {
         name: scanned.name,
@@ -2312,7 +2383,13 @@ async function runLinkedGroupUpgrade(
     }
 
     const targetVersion = usablePreferredTarget(opts, scanned.name, fromVersion) ?? latest;
-    bumps.push({ scanned, targetVersion, reportFrom });
+    bumps.push({
+      scanned,
+      targetVersion,
+      reportFrom,
+      requestedLatest: latest,
+      ...(fromVersion ? { fromVersion } : {}),
+    });
   }
 
   if (bumps.length === 0) {
@@ -2358,6 +2435,12 @@ async function runLinkedGroupUpgrade(
   let forceAttempt = opts.force;
   let attempt = 0;
   let peerResolverTried = false;
+  // The peer conflicts that sent the group to the resolver: they name who blocks a kept member.
+  let resolverConflicts: ClassifiedConflict[] = [];
+  // Breaking members left out after the whole group failed, and that failure.
+  let holdBackTried = false;
+  let heldBack: Bump[] = [];
+  let heldBackFailure: AttemptResult | undefined;
 
   while (attempt < maxAttempts) {
     attempt++;
@@ -2380,6 +2463,7 @@ async function runLinkedGroupUpgrade(
       !opts.abortState?.reason
     ) {
       peerResolverTried = true;
+      resolverConflicts = classified;
       const resolved = await tryResolvePeerIntersection(cwd, bumps, opts);
       if (resolved) {
         let mutated = false;
@@ -2439,6 +2523,37 @@ async function runLinkedGroupUpgrade(
       }
     }
 
+    // Hold back the members that jump to a new major and retry the rest on their own: a patch
+    // of `eslint-config-next` shouldn't be rolled back just because `eslint@10` breaks lint.
+    // The held members are reported as failed with the whole-group failure as the reason.
+    if (
+      !result.ok &&
+      !forceAttempt &&
+      !opts.abortState?.reason &&
+      opts.fallbackStrategy !== 'none' &&
+      !holdBackTried
+    ) {
+      holdBackTried = true;
+      const breaking = bumps.filter(isBreakingBump);
+      const rest = bumps.filter((b) => !breaking.includes(b));
+      if (breaking.length > 0 && rest.length > 0) {
+        if (!jsonOutput) {
+          log.warn(
+            `Linked group [${gid}]: retrying without the breaking ${breaking.length === 1 ? 'bump' : 'bumps'} ` +
+              `${breaking.map((b) => `${b.scanned.name}@${b.targetVersion}`).join(', ')}: ` +
+              rest.map((b) => `${b.scanned.name}@${b.targetVersion}`).join(', '),
+          );
+        }
+        const partial = await attemptBatchUpgrade(cwd, rest, { ...opts, force: forceAttempt });
+        if (partial.ok) {
+          heldBack = breaking;
+          heldBackFailure = result;
+          result = partial;
+          break;
+        }
+      }
+    }
+
     if (!interactive || opts.abortState?.reason) {
       break;
     }
@@ -2477,19 +2592,23 @@ async function runLinkedGroupUpgrade(
     break;
   }
 
-  if (!result.ok) {
-    const classified = result.classified ?? classifyInstallOutput(result.installOutput, opts);
+  const failure = result.ok ? heldBackFailure : result;
+  if (failure) {
+    const classified = failure.classified ?? classifyInstallOutput(failure.installOutput, opts);
     pushParsedConflicts(report, classified);
   }
 
   if (result.ok) {
     const groupRows: UpgradeRecord[] = [];
     for (const b of bumps) {
+      if (heldBack.includes(b)) continue; // reported as a failure below
       const writtenTo = formatWrittenRange(b.scanned, b.targetVersion, opts.pinExact, opts.catalog);
       const from = b.reportFrom ?? catalogStyleRange(opts.catalog, b.scanned.name, b.scanned.currentRange);
       // The peer resolver can settle a member back on its current range (e.g. `react` kept at
       // ^19.2.8 for a peer): package.json didn't change, so it isn't an upgrade (or a commit).
       if (writtenTo === from) {
+        const blockedBy = blockersFor(b.scanned.name, resolverConflicts);
+        const requested = b.resolvedFrom ?? b.requestedLatest;
         addUpgrade(report, {
           name: b.scanned.name,
           success: true,
@@ -2497,11 +2616,20 @@ async function runLinkedGroupUpgrade(
           from,
           to: writtenTo,
           reason: 'skipped',
-          detail: `no change: the peer-range resolver kept ${b.targetVersion} for linked group [${gid}]`,
+          detail:
+            `no change: the peer-range resolver kept ${b.targetVersion} for linked group [${gid}]` +
+            (blockedBy.length > 0
+              ? ` (${blockedBy.map((x) => `${x.name} needs ${b.scanned.name} ${x.range}`).join('; ')})`
+              : ''),
+          ...(requested && requested !== b.targetVersion ? { requestedLatest: requested } : {}),
+          ...(blockedBy.length > 0 ? { blockedBy } : {}),
           linkedGroupId: gid,
         });
         if (!jsonOutput) {
-          log.dim(`${b.scanned.name} unchanged in group ${gid} (peer-range resolver kept ${b.targetVersion})`);
+          log.dim(
+            `${b.scanned.name} unchanged in group ${gid} (peer-range resolver kept ${b.targetVersion}` +
+              `${blockedBy.length > 0 ? `: ${blockedBy.map((x) => `${x.name} needs ${x.range}`).join('; ')}` : ''})`,
+          );
         }
         continue;
       }
@@ -2528,6 +2656,8 @@ async function runLinkedGroupUpgrade(
         row.detail = result.message;
       } else if (b.resolvedFrom) {
         row.detail = `upgraded with linked group [${gid}] (peer-range intersection: ${b.resolvedFrom} → ${b.targetVersion})`;
+      } else if (heldBack.length > 0) {
+        row.detail = `upgraded with linked group [${gid}] without ${heldBack.map((h) => `${h.scanned.name}@${h.targetVersion}`).join(', ')}, which failed with the whole group`;
       } else {
         row.detail = `upgraded with linked group [${gid}] (single install + validate)`;
       }
@@ -2545,44 +2675,77 @@ async function runLinkedGroupUpgrade(
       gid,
       catalogExtraFiles(
         opts.catalog,
-        bumps.map((b) => b.scanned.currentRange),
+        bumps.filter((b) => !heldBack.includes(b)).map((b) => b.scanned.currentRange),
       ),
     );
+  }
+  if (failure) {
+    const kept = bumps.filter((b) => !heldBack.includes(b) && !isNoOpBump(b, opts)).map((b) => b.scanned.name);
+    const note =
+      result.ok && kept.length > 0
+        ? `with the whole linked group; ${kept.join(', ')} ${kept.length === 1 ? 'was' : 'were'} upgraded without ${heldBack.length === 1 ? 'it' : 'them'}.`
+        : undefined;
+    recordGroupFailure(report, gid, result.ok ? heldBack : bumps, failure, opts, note);
+  }
+}
+
+/**
+ * Report a linked group's failure. A single member (the one held back after the rest of the
+ * group upgraded) gets a plain row, so `--retry-failed` and consumers key it by package name.
+ */
+function recordGroupFailure(
+  report: FinalReport,
+  gid: string,
+  members: Bump[],
+  failure: AttemptResult,
+  opts: UpgradeEngineOptions,
+  note?: string,
+): void {
+  const { jsonOutput } = opts;
+  const kind = failure.kind ?? 'install';
+  const single = members.length === 1 ? members[0] : undefined;
+  const pairs = (version: (b: Bump) => string | undefined): string =>
+    members.map((b) => `${b.scanned.name}@${version(b)}`).join(', ');
+  const message = appendInstallFailureContext(
+    report,
+    note ? { ...failure, message: `${failure.message ?? 'failed'} ${note}` } : failure,
+  );
+  addFailure(report, {
+    name: single ? single.scanned.name : `[group:${gid}]`,
+    reason: failureReason(kind),
+    previousVersion: single ? single.scanned.currentRange : pairs((b) => b.scanned.currentRange),
+    attemptedVersion: single ? single.targetVersion : pairs((b) => b.targetVersion),
+    requestedLatest: single
+      ? single.resolvedFrom ?? single.requestedLatest ?? single.targetVersion
+      : pairs((b) => b.resolvedFrom ?? b.requestedLatest ?? b.targetVersion),
+    message,
+    linkedGroupId: gid,
+    conflicts: toConflicts(failure.classified ?? classifyInstallOutput(failure.installOutput, opts)),
+    validation: failure.validation,
+    install: failure.install,
+  });
+  if (jsonOutput) {
+    return;
+  }
+  const label = single
+    ? `${single.scanned.name}@${single.targetVersion} in linked group [${gid}]`
+    : `linked group [${gid}]`;
+  if (kind === 'peer') {
+    log.peer(`${label} — ${message || 'peer conflict'}`);
+    if (failure.install?.lastLines) {
+      log.dim(indentBlock(failure.install.lastLines, '    '));
+    }
+  } else if (kind === 'validation-script') {
+    log.error(
+      `skipped ${label} — validator (${failure.validation?.command ?? 'unknown'}) failed; this is not a dependency conflict`,
+    );
+    if (failure.validation?.lastLines) {
+      log.dim(indentBlock(failure.validation.lastLines, '    '));
+    }
   } else {
-    const kind = result.kind ?? 'install';
-    const prev = bumps.map((b) => `${b.scanned.name}@${b.scanned.currentRange}`).join(', ');
-    const att = bumps.map((b) => `${b.scanned.name}@${b.targetVersion}`).join(', ');
-    const fullGroupFailureMessage = appendInstallFailureContext(report, result);
-    addFailure(report, {
-      name: `[group:${gid}]`,
-      reason: failureReason(kind),
-      previousVersion: prev,
-      attemptedVersion: att,
-      message: fullGroupFailureMessage,
-      linkedGroupId: gid,
-      conflicts: toConflicts(result.classified ?? classifyInstallOutput(result.installOutput, opts)),
-      validation: result.validation,
-      install: result.install,
-    });
-    if (!jsonOutput) {
-      if (kind === 'peer') {
-        log.peer(`group [${gid}] — ${fullGroupFailureMessage || 'peer conflict'}`);
-        if (result.install?.lastLines) {
-          log.dim(indentBlock(result.install.lastLines, '    '));
-        }
-      } else if (kind === 'validation-script') {
-        log.error(
-          `skipped linked group [${gid}] — validator (${result.validation?.command ?? 'unknown'}) failed; this is not a dependency conflict`,
-        );
-        if (result.validation?.lastLines) {
-          log.dim(indentBlock(result.validation.lastLines, '    '));
-        }
-      } else {
-        log.error(`skipped linked group [${gid}] (${result.message ?? kind})`);
-        if (result.install?.lastLines) {
-          log.dim(indentBlock(result.install.lastLines, '    '));
-        }
-      }
+    log.error(`skipped ${label} (${failure.message ?? kind})`);
+    if (failure.install?.lastLines) {
+      log.dim(indentBlock(failure.install.lastLines, '    '));
     }
   }
 }
@@ -3075,7 +3238,7 @@ export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalRep
   let effectiveConcurrency = Math.min(requested, targets.length, MAX_CONCURRENCY);
   if (effectiveConcurrency > 1 && !jsonOutput) {
     log.warn(
-      `--concurrency ${requested}: parallel target traversal interleaves human-mode log output; downgrading to 1. Add --json (or --ci) to enable parallelism.`,
+      `--concurrency ${requested}: parallel target traversal interleaves human-mode log output; downgrading to 1. Add --json without --progress (or --ci) to enable parallelism.`,
     );
     effectiveConcurrency = 1;
   }

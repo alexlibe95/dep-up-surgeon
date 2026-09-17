@@ -175,13 +175,32 @@ export interface UpgradeRecord {
     reason: string;
     tuplesExplored: number;
   };
+  /**
+   * On a "no change" row of a linked group: the installed packages whose peer ranges kept this
+   * one on its current version (so `requestedLatest` could not be used).
+   */
+  blockedBy?: PeerBlocker[];
+}
+
+/** An installed package whose peer range blocks an upgrade, e.g. `@react-three/fiber` needing `react >=19 <19.3`. */
+export interface PeerBlocker {
+  name: string;
+  version?: string;
+  /** The peer range it declares on the blocked package. */
+  range: string;
 }
 
 export interface ConflictEntry {
   name: string;
   reason: FailureReason;
   previousVersion: string;
+  /** Last version tried: after a release-line fallback, an older line than `requestedLatest`. */
   attemptedVersion?: string;
+  /**
+   * The registry latest this entry was upgrading to — what a later run compares against to tell
+   * whether a newer release appeared. A bare version, or `name@version, …` for a linked group.
+   */
+  requestedLatest?: string;
   message?: string;
   /** Present when the failure was a linked multi-package upgrade */
   linkedGroupId?: string;
