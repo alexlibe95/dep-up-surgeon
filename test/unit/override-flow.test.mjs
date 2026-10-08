@@ -7,6 +7,7 @@
  *   - Idempotent re-run: running the same pin twice does not re-install the second time.
  *   - Rollback restores the original bytes (pre-existing pins, indentation, pnpm-workspace.yaml).
  *   - Broad existing pins that can still resolve the vulnerable version are tightened, not skipped.
+ *   - Rollback also restores the lockfiles; npm tries `npm update <name>` before pinning.
  *
  * Hermetic: we inject a fake `installer` so no network, no real npm/pnpm/yarn calls. The
  * validator is a deterministic function of package.json state written by the flow, so a
@@ -348,4 +349,171 @@ test('runOverrideFlow (pnpm): pin lands in pnpm-workspace.yaml and rollback rest
   assert.equal(result.attempts[0].rolledBack, true);
   assert.equal(await fs.readFile(yamlPath, 'utf8'), yaml, 'pnpm-workspace.yaml restored');
   assert.equal(await fs.readFile(pkgPath, 'utf8'), pkgBefore, 'package.json untouched');
+});
+
+test('runOverrideFlow: rollback restores the lockfile bytes, so the reinstall does not keep the rejected version', async () => {
+  const cwd = await stageWorkspace({ name: 'x' });
+  const lockPath = path.join(cwd, 'package-lock.json');
+  const lockBefore = JSON.stringify({ packages: { 'node_modules/qs': { version: '6.7.2' } } }, null, 2) + '\n';
+  await fs.writeFile(lockPath, lockBefore);
+  // The pin install resolves qs@6.14.1 into the lockfile (and creates a stray yarn.lock).
+  const lockDuringInstall = [];
+  const installer = async () => {
+    lockDuringInstall.push(await fs.readFile(lockPath, 'utf8'));
+    if (lockDuringInstall.length === 1) {
+      await fs.writeFile(lockPath, JSON.stringify({ packages: { 'node_modules/qs': { version: '6.14.1' } } }));
+      await fs.writeFile(path.join(cwd, 'yarn.lock'), '# created by the attempt\n');
+    }
+    return { ok: true, output: '', exitCode: 0, command: 'npm install' };
+  };
+
+  const result = await runOverrideFlow({
+    cwd,
+    manager: 'yarn',
+    advisories: [QS_ADVISORY],
+    upgradedNames: new Set(),
+    directDepNames: new Set(),
+    installer,
+    runValidator: async () => ({ ok: false, message: 'tests failed' }),
+    json: true,
+  });
+
+  assert.equal(result.attempts[0].rolledBack, true);
+  assert.equal(lockDuringInstall.length, 2, 'install after pin + rollback reinstall');
+  assert.equal(lockDuringInstall[1], lockBefore, 'rollback reinstall starts from the pre-attempt lockfile');
+  assert.equal(await fs.readFile(lockPath, 'utf8'), lockBefore);
+  await assert.rejects(fs.access(path.join(cwd, 'yarn.lock')), 'a lockfile the attempt created is removed');
+});
+
+/** A stand-in for `npm update <name>` that rewrites package-lock.json with the given versions. */
+function lockfileUpdater(cwd, versions, ok = true) {
+  const calls = [];
+  const updater = async (dir, name) => {
+    calls.push({ dir, name });
+    const packages = { '': { name: 'x' } };
+    versions.forEach((v, i) => {
+      packages[i === 0 ? `node_modules/${name}` : `node_modules/dep${i}/node_modules/${name}`] = { version: v };
+    });
+    await fs.writeFile(path.join(cwd, 'package-lock.json'), JSON.stringify({ lockfileVersion: 3, packages }, null, 2));
+    return { ok, output: ok ? '' : 'npm ERR! boom', exitCode: ok ? 0 : 1, command: `npm update ${name}` };
+  };
+  return { updater, calls };
+}
+
+async function stageNpmWithLock() {
+  const cwd = await stageWorkspace({ name: 'x', dependencies: { express: '^4.17.0' } });
+  const lock = JSON.stringify({ lockfileVersion: 3, packages: { 'node_modules/qs': { version: '6.7.2' } } }, null, 2);
+  await fs.writeFile(path.join(cwd, 'package-lock.json'), lock);
+  return { cwd, lock, pkg: await fs.readFile(path.join(cwd, 'package.json'), 'utf8') };
+}
+
+test('runOverrideFlow (npm): `npm update` that clears the vulnerable range fixes the advisory without an override', async () => {
+  const { cwd, pkg } = await stageNpmWithLock();
+  const { installer, calls: installs } = makeInstaller();
+  const { updater, calls } = lockfileUpdater(cwd, ['6.14.2', '6.15.0']);
+  let validated = 0;
+
+  const result = await runOverrideFlow({
+    cwd,
+    manager: 'npm',
+    advisories: [QS_ADVISORY],
+    upgradedNames: new Set(),
+    directDepNames: new Set(['express']),
+    installer,
+    lockfileUpdater: updater,
+    runValidator: async () => {
+      validated++;
+      return { ok: true };
+    },
+    json: true,
+  });
+
+  const rec = result.attempts[0];
+  assert.deepEqual(calls, [{ dir: cwd, name: 'qs' }]);
+  assert.equal(rec.ok, true);
+  assert.equal(rec.skipped, false);
+  assert.equal(rec.method, 'lockfile-update');
+  assert.equal(rec.applied, '6.14.2, 6.15.0');
+  assert.equal(validated, 1);
+  assert.equal(installs.length, 0, 'no override install');
+  assert.equal(await fs.readFile(path.join(cwd, 'package.json'), 'utf8'), pkg, 'no override written');
+});
+
+test('runOverrideFlow (npm): `npm update` that keeps a vulnerable copy is undone, then the override is pinned', async () => {
+  const { cwd, lock } = await stageNpmWithLock();
+  const { installer } = makeInstaller();
+  const { updater } = lockfileUpdater(cwd, ['6.14.2', '6.5.0']);
+  let lockAtPin;
+  const result = await runOverrideFlow({
+    cwd,
+    manager: 'npm',
+    advisories: [QS_ADVISORY],
+    upgradedNames: new Set(),
+    directDepNames: new Set(['express']),
+    installer: async (...args) => {
+      lockAtPin = await fs.readFile(path.join(cwd, 'package-lock.json'), 'utf8');
+      return installer(...args);
+    },
+    lockfileUpdater: updater,
+    json: true,
+  });
+
+  const rec = result.attempts[0];
+  assert.equal(rec.ok, true);
+  assert.equal(rec.method, undefined, 'fell back to the override path');
+  assert.equal(rec.applied, '6.14.1');
+  assert.equal(lockAtPin, lock, 'lockfile bytes restored before the override install');
+  const pkg = JSON.parse(await fs.readFile(path.join(cwd, 'package.json'), 'utf8'));
+  assert.deepEqual(pkg.overrides, { qs: '6.14.1' });
+});
+
+test('runOverrideFlow (npm): a validator failure after `npm update` restores the lockfile and falls back to a pin', async () => {
+  const { cwd, lock } = await stageNpmWithLock();
+  const { installer, calls: installs } = makeInstaller();
+  const { updater } = lockfileUpdater(cwd, ['6.14.2']);
+  let validations = 0;
+  const result = await runOverrideFlow({
+    cwd,
+    manager: 'npm',
+    advisories: [QS_ADVISORY],
+    upgradedNames: new Set(),
+    directDepNames: new Set(['express']),
+    installer,
+    lockfileUpdater: updater,
+    // Rejects the refreshed lockfile, accepts the override.
+    runValidator: async () => ({ ok: ++validations > 1, message: 'build broke' }),
+    json: true,
+  });
+
+  const rec = result.attempts[0];
+  assert.equal(rec.ok, true);
+  assert.equal(rec.method, undefined);
+  assert.equal(installs.length, 2, 'rollback reinstall after the rejected update + the override install');
+  assert.equal(await fs.readFile(path.join(cwd, 'package-lock.json'), 'utf8'), lock);
+  const pkg = JSON.parse(await fs.readFile(path.join(cwd, 'package.json'), 'utf8'));
+  assert.deepEqual(pkg.overrides, { qs: '6.14.1' });
+});
+
+test('runOverrideFlow: the lockfile refresh is npm-only and skipped when a pin for the package exists', async () => {
+  for (const [manager, pkg] of [
+    ['pnpm', { name: 'x' }],
+    ['npm', { name: 'x', overrides: { qs: '6.7.2' } }],
+  ]) {
+    const cwd = await stageWorkspace(pkg);
+    const { installer } = makeInstaller();
+    const { updater, calls } = lockfileUpdater(cwd, ['6.14.2']);
+    const result = await runOverrideFlow({
+      cwd,
+      manager,
+      advisories: [QS_ADVISORY],
+      upgradedNames: new Set(),
+      directDepNames: new Set(),
+      installer,
+      lockfileUpdater: updater,
+      json: true,
+    });
+    assert.equal(calls.length, 0, `${manager}: no npm update`);
+    assert.equal(result.attempts[0].method, undefined);
+    assert.equal(result.attempts[0].applied, '6.14.1');
+  }
 });

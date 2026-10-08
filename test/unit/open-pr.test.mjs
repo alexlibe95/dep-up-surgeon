@@ -319,3 +319,21 @@ test('defaultPrBody: renders a minimal markdown table of upgraded packages', () 
   assert.match(body, /\| `axios` \| `1.6.0` \| `1.7.2` \|/);
   assert.match(body, /dep-up-surgeon/);
 });
+
+test('openPullRequest: refuses to push when the branch is the base branch', async () => {
+  const { exec, calls } = makeExec({
+    'gh auth status': { exitCode: 0, stdout: '', stderr: '' },
+    'gh repo view': {
+      exitCode: 0,
+      stdout: '{"nameWithOwner":"owner/repo","defaultBranch":"main"}',
+      stderr: '',
+    },
+  });
+  const result = await openPullRequest(
+    { cwd: '/tmp', branch: 'main', exec, commandExists: async () => true },
+    makeReport(),
+  );
+  assert.equal(result.ok, false);
+  assert.match(result.error, /base branch/);
+  assert.ok(calls.every((c) => !c.key.startsWith('git push')), 'the upgrades must not be pushed');
+});

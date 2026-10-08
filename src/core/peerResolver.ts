@@ -39,7 +39,7 @@
  */
 import semver from 'semver';
 import type { VersionPeers } from '../utils/concurrency.js';
-import type { LockfileVersionTree } from '../utils/installedVersion.js';
+import { lockfileInstalledVersion, type LockfileVersionTree } from '../utils/installedVersion.js';
 
 /** One member of a linked group, with the version we *wanted* to bump to. */
 export interface ResolverInput {
@@ -106,6 +106,11 @@ export interface ResolveOptions {
    * `>=5.8` peer although 5.9.3 is installed.
    */
   lockfileVersions?: LockfileVersionTree;
+  /**
+   * The workspace's directory relative to the lockfile's (`packages/web`; omit or `.` for the
+   * root), so `lockfileVersions` lookups read this importer's direct entries.
+   */
+  memberRelDir?: string;
   /**
    * Upper bound on tuples we examine before giving up. Keeps the search bounded on pathological
    * inputs (e.g. 5 packages × 50 versions each = 312M combos). Tuned to handle the typical
@@ -425,20 +430,28 @@ function pruneDomainAgainstPair(
 }
 
 /**
- * Installed version of `name` from a lockfile tree: the highest copy satisfying `declaredRange`
- * (a lockfile can also hold older nested copies), or the highest copy when the range isn't
- * semver (`catalog:`, `latest`). `undefined` when nothing usable is installed.
+ * Installed version of `name` from a lockfile tree, via the same direct-dependency lookup as
+ * `resolveInstalledVersion`: the importer's own locked entry (`memberRelDir`, relative to the
+ * lockfile's directory; the root importer when omitted) when the lockfile records one (npm,
+ * pnpm), else the highest copy satisfying `declaredRange` — a nested copy elsewhere in the tree
+ * can't stand in for it — or the highest copy when the range isn't semver (`catalog:`, `latest`).
+ * `undefined` when nothing usable is installed, including an entry outside a semver
+ * `declaredRange` (package.json changed since the last install).
  */
 export function installedVersionFor(
   name: string,
   declaredRange: string,
   lockfileVersions: LockfileVersionTree | undefined,
+  memberRelDir?: string,
 ): string | undefined {
-  const raw = lockfileVersions?.get(name);
-  if (!raw) return undefined;
-  const versions = [...raw].filter((v) => semver.valid(v)).sort(semver.rcompare);
-  if (semver.validRange(declaredRange) === null) return versions[0];
-  return versions.find((v) => safeSatisfies(v, declaredRange));
+  const version = lockfileInstalledVersion(lockfileVersions, name, {
+    declaredRange,
+    ...(memberRelDir !== undefined ? { memberRelDir } : {}),
+  });
+  if (!version || (semver.validRange(declaredRange) !== null && !safeSatisfies(version, declaredRange))) {
+    return undefined;
+  }
+  return version;
 }
 
 /**
@@ -450,7 +463,10 @@ function withInstalledExternals(options: ResolveOptions): ResolveOptions {
   if (!options.lockfileVersions) return options;
   const externalInstalled = new Map<string, string>();
   for (const [name, range] of options.externalInstalled) {
-    externalInstalled.set(name, installedVersionFor(name, range, options.lockfileVersions) ?? range);
+    externalInstalled.set(
+      name,
+      installedVersionFor(name, range, options.lockfileVersions, options.memberRelDir) ?? range,
+    );
   }
   return { ...options, externalInstalled };
 }

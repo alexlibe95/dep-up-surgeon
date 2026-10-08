@@ -87,6 +87,11 @@ export interface GitFlowController {
   flushAfterTarget(workspace: string, manager: PackageManager, installCwd: string): Promise<void>;
   /** Call once after the whole flow (all mode commits here; safety net for the others). */
   flushAtEnd(manager: PackageManager, installCwd: string): Promise<void>;
+  /**
+   * Commit what the post-run steps (override pins, `--fix-lockfile`) changed after the engine's
+   * last commit: the root package.json, pnpm-workspace.yaml and lockfiles.
+   */
+  commitPostRun(manager: PackageManager, installCwd: string, subject: string): Promise<void>;
   /** Accumulated commit records (for the structured report). */
   commits: GitCommitRecord[];
 }
@@ -101,6 +106,9 @@ const NOOP_CONTROLLER: GitFlowController = {
     /* no-op */
   },
   async flushAtEnd() {
+    /* no-op */
+  },
+  async commitPostRun() {
     /* no-op */
   },
 };
@@ -195,11 +203,9 @@ export async function createGitFlow(
       if (!excerpt) {
         return c;
       }
-      // Run the breaking-change scanner here (the cheapest place it touches): we already have
-      // the body in hand, and we only need to do it once per excerpt because the result is
-      // stable for a given (package, toVersion). The scan itself is pure regex; no I/O.
-      const { scanForBreakingChanges } = await import('../utils/changelog.js');
-      const breaking = scanForBreakingChanges(excerpt.body);
+      // `fetchChangelog` already scanned the FULL notes (plus crossed majors' boundary releases);
+      // `excerpt.body` is the truncated display copy, so re-scanning it would miss breaking lines.
+      const breaking = excerpt.breaking;
       return {
         ...c,
         changelog: {
@@ -232,6 +238,13 @@ export async function createGitFlow(
       for (const base of lockfileBasenamesFor(manager)) {
         out.add(path.join(dir, base));
       }
+      // Yarn zero-install repos commit the PnP map and the cache next to yarn.lock; leaving them
+      // out commits a yarn.lock that the committed install doesn't match. Ignored paths are dropped.
+      if (manager === 'yarn') {
+        for (const rel of ['.pnp.cjs', '.pnp.loader.mjs', '.pnp.data.json', '.yarn/cache']) {
+          out.add(path.join(dir, rel));
+        }
+      }
     }
     return [...out];
   };
@@ -250,7 +263,25 @@ export async function createGitFlow(
     return files;
   };
 
-  const recordCommit = async (
+  // One git index per repo: every stage + commit runs alone, whichever target or install lock
+  // triggered it (parallel targets would otherwise commit each other's staged files).
+  let gitQueue: Promise<unknown> = Promise.resolve();
+  const serialized = <T>(fn: () => Promise<T>): Promise<T> => {
+    const run = gitQueue.then(fn, fn);
+    gitQueue = run.catch(() => undefined);
+    return run;
+  };
+
+  const recordCommit = (
+    cwdForGit: string,
+    files: string[],
+    message: string,
+    workspace: string | undefined,
+    groupId: string | undefined,
+  ): Promise<void> =>
+    serialized(() => stageAndCommit(cwdForGit, files, message, workspace, groupId));
+
+  const stageAndCommit = async (
     cwdForGit: string,
     files: string[],
     message: string,
@@ -417,6 +448,19 @@ export async function createGitFlow(
     await recordCommit(installCwd, [...files], message, undefined, undefined);
   };
 
+  const commitPostRun = async (
+    manager: PackageManager,
+    installCwd: string,
+    subject: string,
+  ): Promise<void> => {
+    const files = [
+      path.join(installCwd, 'package.json'),
+      path.join(installCwd, 'pnpm-workspace.yaml'),
+      ...lockfilePaths([installCwd], manager),
+    ];
+    await recordCommit(installCwd, files, `${prefix}${subject}`, undefined, undefined);
+  };
+
   // Track the targetCwd seen for each workspace so per-target / all know which package.json
   // files to stage. (A workspace label always maps to one and only one targetCwd within a run.)
   const bufferedCwds = new Map<string, Set<string>>();
@@ -443,6 +487,7 @@ export async function createGitFlow(
       onUpgradeApplied: wrappedOnApplied,
       flushAfterTarget,
       flushAtEnd,
+      commitPostRun,
       commits,
     },
   };

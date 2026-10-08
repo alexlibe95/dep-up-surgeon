@@ -49,6 +49,14 @@ export interface ValidationDiagnostic {
 }
 
 /** The unchanged-tree validator run, plus which extra check scripts joined per-upgrade validation. */
+/** An audit advisory on a package that only arrives transitively (no direct upgrade reaches it). */
+export interface TransitiveAdvisory {
+  name: string;
+  severity: 'low' | 'moderate' | 'high' | 'critical';
+  ids: string[];
+  recommendedVersion?: string;
+}
+
 export interface PreflightDiagnostic extends ValidationDiagnostic {
   ok: boolean;
   skipped: boolean;
@@ -95,6 +103,11 @@ export interface UpgradeRecord {
   requestedLatest?: string;
   /** When set, this row was upgraded with other packages in the same batch */
   linkedGroupId?: string;
+  /**
+   * Dependency section the range was rewritten in. `undo` reverts exactly this section; rows
+   * without it (older reports) are matched against every section by their `to` value.
+   */
+  section?: DepSection;
   /**
    * Workspace member this row belongs to. `'root'` for the root `package.json`, or a workspace
    * package name (e.g. `'@org/core'`) for a child. Absent when the run targets only the root and
@@ -243,8 +256,9 @@ export interface ProjectInfoReport {
   yarnMajorVersion?: number;
   /**
    * True when `yarn workspaces focus <name>` is available on the active yarn binary (i.e.
-   * yarn berry v2+ AND `@yarnpkg/plugin-workspace-tools` is loaded). Drives whether
-   * `--install-mode filtered` produces a focused install or falls back to the root install.
+   * yarn berry v2+ AND `@yarnpkg/plugin-workspace-tools` is loaded). Informational only:
+   * `--install-mode filtered` always runs a full `yarn install`, because `focus` does not
+   * write yarn.lock and installs a partial tree.
    */
   yarnSupportsFocus?: boolean;
   /**
@@ -255,7 +269,7 @@ export interface ProjectInfoReport {
    */
   isolatedLockfiles?: boolean;
   /** Why `isolatedLockfiles` is true (only present when it IS true). */
-  isolatedLockfilesSource?: 'pnpm-npmrc' | 'per-workspace-lockfiles';
+  isolatedLockfilesSource?: 'per-workspace-lockfiles';
 }
 
 export interface FinalReport {
@@ -279,6 +293,8 @@ export interface FinalReport {
   preflightAborted?: boolean;
   /** Tracked files the run rewrote besides dependency files (e.g. tsconfig.json), restored at the end. */
   restoredFiles?: string[];
+  /** `--security-only` advisories on packages no direct dependency names (no upgrade reaches them). */
+  transitiveAdvisories?: TransitiveAdvisory[];
   /**
    * Detected package manager + workspace topology. Workspace-internal deps (i.e. names matching
    * a local workspace package) are skipped automatically and recorded in `upgraded` with
@@ -378,6 +394,12 @@ export interface FinalReport {
        * carried a `reason` string; CLI-only pins omit it.
        */
       policyReason?: string;
+      /**
+       * `lockfile-update` = npm's `npm update <name>` moved every installed copy out of the
+       * vulnerable range, so no pin was written (`applied` lists the installed versions).
+       * Absent = `override`.
+       */
+      method?: 'lockfile-update' | 'override';
       ok: boolean;
       skipped: boolean;
       reason?: string;
@@ -444,7 +466,7 @@ export interface LockfileStaleEntry {
 export interface LockfileFixReport {
   status: 'ok' | 'failed' | 'skipped' | 'dry-run';
   manager: 'npm' | 'pnpm' | 'yarn' | 'bun';
-  lockfile: 'package-lock.json' | 'pnpm-lock.yaml' | 'yarn.lock' | 'bun.lock' | 'bun.lockb';
+  lockfile: 'package-lock.json' | 'npm-shrinkwrap.json' | 'pnpm-lock.yaml' | 'yarn.lock' | 'bun.lock' | 'bun.lockb';
   /** Present when `status !== 'skipped'`. */
   command?: string;
   /** Exit code from the dedupe command (0 for ok, non-zero for failed dedupe). */

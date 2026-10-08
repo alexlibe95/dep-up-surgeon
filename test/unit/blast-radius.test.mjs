@@ -122,6 +122,52 @@ test('computeBlastRadius: empty packageNames returns empty result without walkin
   assert.equal(res.filesScanned, 0);
 });
 
+test('computeBlastRadius: @types/* packages match the package they type', async () => {
+  const dir = await mkTmp();
+  await write(dir, 'src/a.tsx', `import React from 'react';\n`);
+  await write(dir, 'src/b.ts', `import { transform } from '@babel/core';\n`);
+  await write(dir, 'src/c.ts', `import type {} from '@types/react';\n`);
+  await write(dir, 'src/d.ts', `import 'react-dom';\n`);
+
+  await write(dir, 'src/e.ts', `import node from 'node';\n`);
+
+  const res = await computeBlastRadius({
+    cwd: dir,
+    packageNames: ['@types/react', '@types/babel__core', '@types/node'],
+  });
+  const files = (name) => res.byPackage.get(name).hits.map((h) => h.relativePath).sort();
+  assert.deepEqual(files('@types/react'), ['src/a.tsx', 'src/c.ts']);
+  assert.deepEqual(files('@types/babel__core'), ['src/b.ts']);
+  // `@types/node` types the builtins, not the `node` npm package.
+  assert.deepEqual(files('@types/node'), []);
+});
+
+test('computeBlastRadius: build-output names are skipped only at the scan root and package roots', async () => {
+  const dir = await mkTmp();
+  await write(dir, 'package.json', '{}');
+  await write(dir, 'dist/bundle.js', `require('axios');`);
+  await write(dir, 'coverage/lcov-report/x.js', `require('axios');`);
+  await write(dir, 'src/build/request.ts', `import axios from 'axios';`);
+  await write(dir, 'src/out/client.ts', `import axios from 'axios';`);
+  await write(dir, 'src/coverage/report.ts', `import axios from 'axios';`);
+  // Workspace member: its own build output is skipped, its source is not.
+  await write(dir, 'packages/web/package.json', '{}');
+  await write(dir, 'packages/web/build/main.js', `require('axios');`);
+  await write(dir, 'packages/web/src/dist/helpers.ts', `import 'axios';`);
+  // node_modules / tool caches stay skipped at any depth.
+  await write(dir, 'src/node_modules/x/index.js', `require('axios');`);
+  await write(dir, 'packages/web/.next/server.js', `require('axios');`);
+
+  const res = await computeBlastRadius({ cwd: dir, packageNames: ['axios'] });
+  const files = res.byPackage.get('axios').hits.map((h) => h.relativePath).sort();
+  assert.deepEqual(files, [
+    'packages/web/src/dist/helpers.ts',
+    'src/build/request.ts',
+    'src/coverage/report.ts',
+    'src/out/client.ts',
+  ]);
+});
+
 test('DEFAULT_MAX_FILES is a positive integer', () => {
   assert.equal(typeof DEFAULT_MAX_FILES, 'number');
   assert.ok(DEFAULT_MAX_FILES > 0);

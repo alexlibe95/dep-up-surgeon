@@ -12,13 +12,14 @@ const LOCAL_PATH = /^(\.{1,2}[\\/]|~[\\/]|\/|[A-Za-z]:[\\/])|\.(tgz|tar\.gz|tar)
 
 /**
  * npm dist-tag: a single identifier, not a protocol and not a path.
- * `latest`, `next`, `canary`, and custom tags all match.
+ * `latest`, `next`, `canary`, and custom tags all match — including tags with digits
+ * (`ts5.6`, `next-15`, `beta2`, `v2-beta`): like npm, anything that isn't a valid range is a tag.
  */
 const DIST_TAG = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 export function isDistTag(range: string): boolean {
   const t = range.trim();
-  return DIST_TAG.test(t) && semver.validRange(t) == null && semver.coerce(t) == null;
+  return DIST_TAG.test(t) && !LOCAL_PATH.test(t) && semver.validRange(t) == null;
 }
 
 /**

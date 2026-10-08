@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   buildDomain,
   describeResolution,
+  installedVersionFor,
   resolvePeerRanges,
 } from '../../dist/core/peerResolver.js';
 
@@ -358,6 +359,52 @@ test('resolvePeerRanges: external peers are checked against the lockfile version
     assert.equal(r.versions.get('@angular/compiler-cli'), '21.0.0');
     assert.equal(r.downgradedFrom.size, 0);
   }
+});
+
+// Root importer resolved typescript 5.4.5 and packages/web 5.9.3; a nested copy elsewhere is newer.
+function treeWithImporters() {
+  const tree = new Map([['typescript', new Set(['5.4.5', '5.9.3', '5.9.9'])]]);
+  tree.direct = {
+    importers: new Map([
+      ['.', new Map([['typescript', '5.4.5']])],
+      ['packages/web', new Map([['typescript', '5.9.3']])],
+    ]),
+    hoisted: false,
+  };
+  return tree;
+}
+
+test("installedVersionFor: reads this importer's direct entry, not the highest locked copy", () => {
+  const tree = treeWithImporters();
+  assert.equal(installedVersionFor('typescript', '^5.4.0', tree), '5.4.5', 'root importer by default');
+  assert.equal(installedVersionFor('typescript', '^5.4.0', tree, '.'), '5.4.5');
+  assert.equal(installedVersionFor('typescript', '^5.4.0', tree, 'packages/web'), '5.9.3');
+  assert.equal(installedVersionFor('typescript', 'catalog:', tree, 'packages/web'), '5.9.3');
+  // Without a direct index (yarn / bun): the highest copy satisfying the range, as before.
+  const flat = new Map([['typescript', new Set(['4.9.5', '5.9.3'])]]);
+  assert.equal(installedVersionFor('typescript', '^5.0.0', flat), '5.9.3');
+  assert.equal(installedVersionFor('typescript', '^6.0.0', flat), undefined, 'nothing usable in range');
+  // A direct entry outside the declared range is stale (package.json moved): no installed version.
+  assert.equal(installedVersionFor('typescript', '^6.0.0', tree, 'packages/web'), undefined);
+});
+
+test('resolvePeerRanges: memberRelDir picks the external peer version of that importer', () => {
+  const build = makeDomain(
+    'build',
+    {
+      '2.0.0': { peerDependencies: { typescript: '>=5.9 <6.0' } },
+      '1.0.0': { peerDependencies: { typescript: '>=5.0 <6.0' } },
+    },
+    ['2.0.0', '1.0.0'],
+  );
+  const requested = new Map([['build', '2.0.0']]);
+  const externalInstalled = new Map([['typescript', '^5.4.0']]);
+  const opts = { externalInstalled, lockfileVersions: treeWithImporters() };
+  assert.equal(resolvePeerRanges([build], requested, opts)?.versions.get('build'), '1.0.0');
+  assert.equal(
+    resolvePeerRanges([build], requested, { ...opts, memberRelDir: 'packages/web' })?.versions.get('build'),
+    '2.0.0',
+  );
 });
 
 test('resolvePeerRanges: no satisfiable tuple returns undefined', () => {

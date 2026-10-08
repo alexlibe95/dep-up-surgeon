@@ -400,3 +400,126 @@ test('tryResolveAdHocPeerConflict: lockfileVersions replaces declared range floo
   assert.ok(res, 'installed typescript 5.9.3 satisfies the 20.x peer range');
   assert.equal(res.bumps.find((b) => b.isPrimary).to, '20.3.4');
 });
+
+// Bumping react 19.2.8 → 19.3.0 fails: @react-three/fiber@9.7.0 (installed, also latest) wants
+// react <19.3. Older fiber releases allowed any react 19, but a blocker must never be modelled
+// at its range floor (or moved below what's installed) to make the bump fit.
+const FIBER_ERESOLVE = [
+  'npm error code ERESOLVE',
+  'npm error ERESOLVE unable to resolve dependency tree',
+  'npm error',
+  'npm error While resolving: my-app@0.0.0',
+  'npm error Found: react@19.3.0',
+  'npm error node_modules/react',
+  'npm error   react@"^19.3.0" from the root project',
+  'npm error',
+  'npm error Could not resolve dependency:',
+  'npm error peer react@">=19 <19.3" from @react-three/fiber@9.7.0',
+  'npm error node_modules/@react-three/fiber',
+  'npm error   @react-three/fiber@"^9.0.0" from the root project',
+].join('\n');
+
+function fiberInput(reactVersions, extra = {}) {
+  return {
+    primary: { name: 'react', section: 'dependencies', currentRange: '^19.0.0' },
+    primaryTarget: '19.3.0',
+    classified: extractClassifiedConflicts(FIBER_ERESOLVE, { rootPackageName: 'my-app' }),
+    pkg: {
+      name: 'my-app',
+      version: '0.0.0',
+      dependencies: { react: '^19.0.0', '@react-three/fiber': '^9.0.0' },
+    },
+    registryCache: makeCache(
+      { react: '19.3.0', '@react-three/fiber': '9.7.0' },
+      {
+        react: Object.fromEntries(reactVersions.map((v) => [v, {}])),
+        '@react-three/fiber': {
+          '9.0.0': { peerDependencies: { react: '^19.0.0' } },
+          '9.3.0': { peerDependencies: { react: '^19.0.0' } },
+          '9.7.0': { peerDependencies: { react: '>=19 <19.3' } },
+        },
+      },
+    ),
+    lockfileVersions: new Map([
+      ['react', new Set(['19.2.8'])],
+      ['@react-three/fiber', new Set(['9.7.0'])],
+    ]),
+    ...extra,
+  };
+}
+
+test('tryResolveAdHocPeerConflict: a blocker is floored at its installed version, never downgraded', async () => {
+  // A react release between installed and target that fiber 9.7.0 accepts is the answer.
+  const res = await tryResolveAdHocPeerConflict(fiberInput(['19.0.0', '19.2.8', '19.2.9', '19.3.0']));
+  assert.ok(res);
+  assert.deepEqual(
+    res.bumps.map((b) => [b.name, b.to]),
+    [['react', '19.2.9']],
+    'fiber stays at its installed 9.7.0 instead of dropping to 9.3.0',
+  );
+});
+
+test('tryResolveAdHocPeerConflict: nothing to retry when the blocker caps the primary at its installed version', async () => {
+  // The only tuple keeps react at the installed 19.2.8 (and fiber at 9.7.0): no bump to make, so
+  // the engine rolls back and reports the blocker instead of "upgrading" to what's installed.
+  const res = await tryResolveAdHocPeerConflict(fiberInput(['19.0.0', '19.2.8', '19.3.0']));
+  assert.equal(res, undefined);
+});
+
+test('tryResolveAdHocPeerConflict: installed versions come from this importer (memberRelDir)', async () => {
+  // Root importer has fiber 9.3.0 (accepts react 19.3); packages/web has 9.7.0 (doesn't).
+  const lockfileVersions = new Map([
+    ['react', new Set(['19.2.8'])],
+    ['@react-three/fiber', new Set(['9.3.0', '9.7.0'])],
+  ]);
+  lockfileVersions.direct = {
+    importers: new Map([
+      ['.', new Map([['react', '19.2.8'], ['@react-three/fiber', '9.3.0']])],
+      ['packages/web', new Map([['react', '19.2.8'], ['@react-three/fiber', '9.7.0']])],
+    ]),
+    hoisted: false,
+  };
+  const versions = ['19.0.0', '19.2.8', '19.2.9', '19.3.0'];
+  const root = await tryResolveAdHocPeerConflict(fiberInput(versions, { lockfileVersions }));
+  assert.equal(root, undefined, 'at the root fiber 9.3.0 accepts react 19.3.0: the original target, nothing new');
+  const web = await tryResolveAdHocPeerConflict(
+    fiberInput(versions, { lockfileVersions, memberRelDir: 'packages/web' }),
+  );
+  assert.deepEqual(web?.bumps.map((b) => [b.name, b.to]), [['react', '19.2.9']]);
+});
+
+test('tryResolveAdHocPeerConflict: a blocker whose latest left its range is capped at its newest in-range release', async () => {
+  // eslint@^7.0.0 has 7.32.0 installed while latest is 8.57.0. Capping it at the 7.0.0 floor left
+  // an empty domain once floored at the installed 7.32.0, hiding that plugin 4.6.0 already works.
+  const res = await tryResolveAdHocPeerConflict({
+    primary: { name: 'plugin', section: 'devDependencies', currentRange: '^4.0.0' },
+    primaryTarget: '5.0.0',
+    classified: [
+      {
+        depender: 'eslint',
+        dependency: 'plugin',
+        requiredRange: '^8.0.0',
+        rawMessage: 'peer eslint@^8',
+        category: 'peerDependencyMismatch',
+      },
+    ],
+    pkg: { name: 'demo', version: '0.0.0', devDependencies: { plugin: '^4.0.0', eslint: '^7.0.0' } },
+    registryCache: makeCache(
+      { plugin: '5.0.0', eslint: '8.57.0' },
+      {
+        plugin: {
+          '5.0.0': { peerDependencies: { eslint: '^8.0.0' } },
+          '4.6.0': { peerDependencies: { eslint: '^7.30.0 || ^8.0.0' } },
+          '4.0.0': { peerDependencies: { eslint: '^7.0.0' } },
+        },
+        eslint: { '7.0.0': {}, '7.32.0': {}, '8.57.0': {} },
+      },
+    ),
+    lockfileVersions: new Map([
+      ['plugin', new Set(['4.0.0'])],
+      ['eslint', new Set(['7.32.0'])],
+    ]),
+  });
+  assert.ok(res);
+  assert.deepEqual(res.bumps.map((b) => [b.name, b.to]), [['plugin', '4.6.0']]);
+});

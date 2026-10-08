@@ -98,6 +98,7 @@ export async function writeSummary(
       ? renderSummaryHtml(structured, opts.toolVersion)
       : renderSummaryMarkdown(structured, opts.toolVersion);
   try {
+    await fs.ensureDir(path.dirname(dest.path));
     if (dest.append) {
       await fs.appendFile(dest.path, body + '\n', 'utf8');
     } else {
@@ -390,10 +391,11 @@ export function renderSummaryMarkdown(structured: StructuredReport, toolVersion:
     const ok = structured.overrides.attempts.filter((a) => a.ok && !a.skipped);
     const noOp = structured.overrides.attempts.filter((a) => a.ok && a.skipped);
     const failed = structured.overrides.attempts.filter((a) => !a.ok);
+    const lockfileUpdated = ok.filter((a) => a.method === 'lockfile-update').length;
     lines.push(`### Overrides applied`);
     lines.push('');
     lines.push(
-      `_wrote to \`${structured.overrides.field}\` — ${ok.length} pinned, ${noOp.length} already safe, ${failed.length} failed._`,
+      `_wrote to \`${structured.overrides.field}\` — ${ok.length - lockfileUpdated} pinned, ${lockfileUpdated > 0 ? `${lockfileUpdated} updated in lockfile, ` : ''}${noOp.length} already safe, ${failed.length} failed._`,
     );
     lines.push('');
     if (ok.length > 0) {
@@ -413,7 +415,11 @@ export function renderSummaryMarkdown(structured: StructuredReport, toolVersion:
         const label =
           a.chain && a.chain.length > 1 ? a.chain.join(' › ') : a.name;
         const sourceLabel = a.source === 'manual' ? '`--override`' : 'advisory';
-        const cells = [`\`${label}\``, `\`${a.applied ?? '?'}\``, sourceLabel, `${a.severity}`, advCell];
+        const pinCell =
+          a.method === 'lockfile-update'
+            ? `updated in lockfile (\`${a.applied ?? '?'}\`)`
+            : `\`${a.applied ?? '?'}\``;
+        const cells = [`\`${label}\``, pinCell, sourceLabel, `${a.severity}`, advCell];
         lines.push(mdRow(...(hasReason ? [...cells, a.policyReason ?? ''] : cells)));
       }
       lines.push('');

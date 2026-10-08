@@ -94,6 +94,40 @@ test('resolveInstalledVersion: dist-tag without lockfile cannot coerce', () => {
   );
 });
 
+test('isDistTag / isRegistryRange: dist-tags containing digits are registry specs', () => {
+  for (const tag of ['ts5.6', 'next-15', 'beta2', 'v2-beta', 'rc1']) {
+    assert.strictEqual(isDistTag(tag), true, tag);
+    assert.strictEqual(isRegistryRange(tag), true, tag);
+  }
+  // Specs with digits that still aren't registry ranges (or tags).
+  for (const spec of [
+    'me/lib#v1.2.3',
+    'github:me/lib#1.0.0',
+    'https://example.test/lib-1.2.3.tgz',
+    'lib-1.2.3.tgz',
+    'file:../lib-1.2.3',
+    'link:../lib2',
+    'workspace:^1.0.0',
+  ]) {
+    assert.strictEqual(isDistTag(spec), false, spec);
+    assert.strictEqual(isRegistryRange(spec), false, spec);
+  }
+  assert.strictEqual(isDistTag('v1'), false, 'a valid range is not a tag');
+  assert.strictEqual(isRegistryRange('catalog:react19'), true);
+});
+
+test('resolveInstalledVersion: a dist-tag with digits is never coerced into a version', () => {
+  // `ts5.6` → 5.6.0 / `next-15` → 15.0.0 would invent an installed version.
+  for (const tag of ['ts5.6', 'next-15', 'beta2']) {
+    assert.strictEqual(resolveInstalledVersion({ name: 'typescript', declaredRange: tag }), undefined, tag);
+  }
+  const tree = new Map([['typescript', new Set(['5.6.3'])]]);
+  assert.strictEqual(
+    resolveInstalledVersion({ name: 'typescript', declaredRange: 'ts5.6', lockfileVersions: tree }),
+    '5.6.3',
+  );
+});
+
 async function withLockfile(basename, contents, fn) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dus-installed-'));
   try {
@@ -145,6 +179,24 @@ test('resolveInstalledVersion: npm direct copy wins over a newer nested copy', a
       resolveInstalledVersion({ name: 'send', declaredRange: '^1.1.0', lockfileVersions: tree }),
       '1.1.0',
     );
+  });
+});
+
+test('loadLockfileVersionTree: npm reads npm-shrinkwrap.json before package-lock.json', async () => {
+  const lock = (debug) =>
+    JSON.stringify({
+      name: 'app',
+      lockfileVersion: 3,
+      packages: { '': { name: 'app', dependencies: { debug: '^2.6.0' } }, 'node_modules/debug': { version: debug } },
+    });
+  // Only a shrinkwrap (published CLIs ship one instead of package-lock.json).
+  await withLockfile('npm-shrinkwrap.json', lock('2.6.8'), async (dir) => {
+    const tree = await loadLockfileVersionTree(dir, 'npm');
+    assert.strictEqual(resolveInstalledVersion({ name: 'debug', declaredRange: '^2.6.0', lockfileVersions: tree }), '2.6.8');
+    // Both present: npm installs from the shrinkwrap, so that's what's installed.
+    await fs.writeFile(path.join(dir, 'package-lock.json'), lock('2.6.9'));
+    const both = await loadLockfileVersionTree(dir, 'npm');
+    assert.strictEqual(resolveInstalledVersion({ name: 'debug', declaredRange: '^2.6.0', lockfileVersions: both }), '2.6.8');
   });
 });
 

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
 import fs from 'fs-extra';
 import prompts from 'prompts';
@@ -65,7 +66,7 @@ import {
   shouldRollbackAfterSuccessfulInstall,
   type ClassifiedConflict,
 } from './conflictAnalyzer.js';
-import { promptGroupConflictChoice } from '../cli/interactive.js';
+import { haltIfCancelled, promptGroupConflictChoice, stopRunOnCancel } from '../cli/interactive.js';
 import { buildLineFallbackOrder } from '../utils/versionFallback.js';
 import { correctLaggingLatest } from '../utils/latestTag.js';
 import { buildSingletonGroups } from './groups.js';
@@ -371,8 +372,9 @@ const inFlightSnapshots = new Set<FileSnapshot[]>();
 
 /**
  * Exact bytes of every file an attempt can touch: the target package.json, the lockfile(s) at
- * the install root and the catalog file. Restoring bytes (instead of re-writing the old range and
- * re-resolving) puts the lockfile back on the versions that were actually installed.
+ * the install root and in the target's own directory, and the catalog file. Restoring bytes
+ * (instead of re-writing the old range and re-resolving) puts the lockfile back on the versions
+ * that were actually installed.
  */
 async function snapshotAttemptFiles(
   cwd: string,
@@ -382,6 +384,9 @@ async function snapshotAttemptFiles(
   const files = new Set([path.resolve(cwd, 'package.json')]);
   for (const name of LOCKFILE_NAMES) {
     files.add(path.resolve(installCwd, name));
+    // A member with its own lockfile (isolated-lockfile monorepo) is rewritten by a
+    // root install too; restoring only the root one kept the rejected version locked there.
+    files.add(path.resolve(cwd, name));
   }
   if (opts.catalog?.file) {
     files.add(path.resolve(opts.catalog.file));
@@ -738,19 +743,11 @@ function isWorkspaceInternal(name: string, opts: UpgradeEngineOptions): boolean 
  * Build the `InstallOptions` for the current engine call. Returns `{ filter }` only when
  * `installMode === 'filtered'` AND a child target is being mutated (`installFilter` is set).
  * Root-target runs always do a full install regardless of mode.
- *
- * Also forwards the per-manager capability bit (`yarnSupportsFocus`) so `installCommand` can
- * pick `yarn workspaces focus <name>` over the classic full-install fallback when the project
- * is on yarn berry with `@yarnpkg/plugin-workspace-tools` available.
+ * yarn ignores the filter (`installCommand` always runs a full `yarn install` there).
  */
 function installFilterOptions(opts: UpgradeEngineOptions): InstallOptions {
   if (opts.installMode === 'filtered' && opts.installFilter) {
-    return {
-      filter: opts.installFilter,
-      ...(opts.projectInfo?.yarnSupportsFocus
-        ? { yarnSupportsFocus: true }
-        : {}),
-    };
+    return { filter: opts.installFilter };
   }
   return {};
 }
@@ -770,12 +767,23 @@ async function withInstallLock<T>(
   opts: UpgradeEngineOptions,
   fn: () => Promise<T>,
 ): Promise<T> {
-  if (opts.installLock) {
-    const key = opts.installCwd ?? opts.cwd;
-    return opts.installLock.runExclusive(key, fn);
+  if (!opts.installLock) {
+    return fn();
   }
-  return fn();
+  const key = opts.installCwd ?? opts.cwd;
+  // Re-entrant: a package's whole upgrade (several attempts + its git commit) can hold the lock
+  // while each attempt still asks for it.
+  const held = heldInstallLocks.getStore();
+  if (held?.has(key)) {
+    return fn();
+  }
+  return opts.installLock.runExclusive(key, () =>
+    heldInstallLocks.run(new Set([...(held ?? []), key]), fn),
+  );
 }
+
+/** Install-lock keys the current async context already holds. */
+const heldInstallLocks = new AsyncLocalStorage<ReadonlySet<string>>();
 
 /**
  * Fire `onUpgradeApplied` if the orchestrator wired one up, swallowing every error so a buggy
@@ -812,6 +820,11 @@ async function fireUpgradeApplied(
       }
     }
   });
+}
+
+/** Upgrades the run has kept so far. */
+function countKept(report: FinalReport): number {
+  return report.upgraded.filter((r) => r.success && !r.skipped).length;
 }
 
 function tagWorkspaceLabels(report: FinalReport, label: string): void {
@@ -1192,6 +1205,8 @@ type Bump = {
   fromVersion?: string;
   /** The registry latest the bump started from, before any resolver / fallback change. */
   requestedLatest?: string;
+  /** Versions a policy `maxVersion` / `allowMajorAfter` rule allows; unset when none applies. */
+  allows?: (version: string) => boolean;
 };
 
 /**
@@ -1393,6 +1408,55 @@ async function attemptBatchUpgradeUnlocked(
  * npm can report a PARENT's fix version on a transitive advisory; a lower one would silently
  * downgrade the declared range while the lockfile keeps the installed version.
  */
+/**
+ * Versions a policy `maxVersion` / `allowMajorAfter` rule lets `name` move to, or `undefined`
+ * when no such rule applies (freezes are handled earlier, through the ignore list).
+ */
+async function policyVersionFilter(
+  opts: UpgradeEngineOptions,
+  name: string,
+  fromVersion: string | undefined,
+): Promise<{ allows: (version: string) => boolean; reason: string } | undefined> {
+  if (!opts.policy) return undefined;
+  const { evaluatePolicy } = await import('../config/policy.js');
+  const decision = evaluatePolicy(opts.policy, name);
+  if (!decision.maxRange && !decision.blockedMajorUntil) return undefined;
+  const fromClean = fromVersion ? semver.coerce(fromVersion)?.version : undefined;
+  return {
+    reason: decision.reason ?? 'policy',
+    allows: (v) => {
+      if (!semver.valid(v)) return true;
+      if (decision.maxRange && !semver.satisfies(v, decision.maxRange)) return false;
+      if (decision.blockedMajorUntil && fromClean && semver.major(v) > semver.major(fromClean)) {
+        return false;
+      }
+      return true;
+    },
+  };
+}
+
+/** Newest stable release above the installed one (and not past `latest`) that `allows` accepts. */
+async function newestAllowedVersion(
+  opts: UpgradeEngineOptions,
+  name: string,
+  fromVersion: string | undefined,
+  latest: string,
+  allows: (version: string) => boolean,
+): Promise<string | undefined> {
+  const all = await fetchAllPublishedVersions(name, opts.registryCache).catch(() => [] as string[]);
+  const floor = fromVersion && semver.valid(fromVersion) ? fromVersion : undefined;
+  return all
+    .filter(
+      (v) =>
+        semver.valid(v) &&
+        !semver.prerelease(v) &&
+        semver.lte(v, latest) &&
+        (!floor || semver.gt(v, floor)) &&
+        allows(v),
+    )
+    .sort(semver.rcompare)[0];
+}
+
 function usablePreferredTarget(
   opts: UpgradeEngineOptions,
   name: string,
@@ -1501,6 +1565,10 @@ async function upgradeWithReleaseLineFallbacks(
   let last: AttemptResult = { ok: false, kind: 'install', message: 'not attempted' };
   let lastAttemptedVersion = candidates[0]!;
   for (let i = 0; i < candidates.length; i++) {
+    // Another target's failed rollback install left the shared tree out of sync: stop here.
+    if (i > 0 && opts.abortState?.reason) {
+      break;
+    }
     const target = candidates[i]!;
     lastAttemptedVersion = target;
     if (
@@ -1637,17 +1705,21 @@ async function promptAfterFailure(
   if (!interactive) {
     return 'continue';
   }
-  const res = await prompts({
-    type: 'select',
-    name: 'action',
-    message: `Upgrade failed for "${pkgName}". What next?`,
-    choices: [
-      { title: 'Continue with other packages', value: 'continue' },
-      { title: 'Pin (skip) this package for this run', value: 'pin' },
-      { title: 'Retry this upgrade once', value: 'retry' },
-    ],
-    initial: 0,
-  });
+  const res = await prompts(
+    {
+      type: 'select',
+      name: 'action',
+      message: `Upgrade failed for "${pkgName}". What next?`,
+      choices: [
+        { title: 'Continue with other packages', value: 'continue' },
+        { title: 'Pin (skip) this package for this run', value: 'pin' },
+        { title: 'Retry this upgrade once', value: 'retry' },
+      ],
+      initial: 0,
+    },
+    stopRunOnCancel,
+  );
+  await haltIfCancelled();
   if (!res || typeof res.action !== 'string') {
     return 'continue';
   }
@@ -1818,7 +1890,27 @@ async function runSinglePackageUpgrade(
   const preferredTarget = usablePreferredTarget(opts, scanned.name, fromVersion);
 
   if (dryRun) {
-    const plannedTo = preferredTarget ?? latest;
+    let plannedTo = preferredTarget ?? latest;
+    // Plan what a real run would try first: within the policy's caps, or nothing at all.
+    const cap = await policyVersionFilter(opts, scanned.name, fromVersion);
+    if (cap && !cap.allows(plannedTo)) {
+      const capped = await newestAllowedVersion(opts, scanned.name, fromVersion, latest, cap.allows);
+      if (!capped) {
+        addUpgrade(report, {
+          name: scanned.name,
+          success: true,
+          skipped: true,
+          from: reportFrom,
+          reason: 'policy',
+          detail: `policy allows no newer version: ${cap.reason}`,
+        });
+        if (!jsonOutput) {
+          log.dim(`policy-skipped: ${scanned.name} — ${cap.reason}`);
+        }
+        return;
+      }
+      plannedTo = capped;
+    }
     addUpgrade(report, {
       name: scanned.name,
       success: true,
@@ -1826,7 +1918,11 @@ async function runSinglePackageUpgrade(
       from: reportFrom,
       to: plannedTo,
       reason: 'skipped',
-      detail: preferredTarget ? 'dry-run (preferred security target)' : 'dry-run',
+      detail: preferredTarget
+        ? 'dry-run (preferred security target)'
+        : plannedTo !== latest
+          ? `dry-run (capped by policy: ${cap?.reason ?? 'policy'})`
+          : 'dry-run',
       requestedLatest: latest,
     });
     if (!jsonOutput) {
@@ -1892,8 +1988,25 @@ async function runSinglePackageUpgrade(
           isFrozen: (name) => ignore.has(name),
           includePeers: opts.includePeers === true,
           ...(opts.lockfileVersions ? { lockfileVersions: opts.lockfileVersions } : {}),
+          memberRelDir: lockfileMemberDir(opts),
         });
-        if (adHoc) {
+        const resolvedPrimary = adHoc?.bumps.find((b) => b.isPrimary)?.to;
+        // The only compatible tuple keeps the installed version: there is nothing to upgrade, and
+        // the peer failure (which names the blockers) stays the result instead of a no-op "success".
+        const keepsInstalled =
+          resolvedPrimary !== undefined &&
+          fromVersion !== undefined &&
+          semver.valid(resolvedPrimary) !== null &&
+          semver.valid(fromVersion) !== null &&
+          semver.eq(resolvedPrimary, fromVersion) &&
+          formatWrittenRange(scanned, resolvedPrimary, opts.pinExact, opts.catalog) === reportFrom;
+        if (adHoc && keepsInstalled) {
+          if (!jsonOutput) {
+            log.dim(
+              `Ad-hoc peer-range resolver can only keep ${scanned.name} at the installed ${fromVersion}`,
+            );
+          }
+        } else if (adHoc) {
           adHocResolved = adHoc;
           if (!jsonOutput) {
             const label = adHoc.bumps
@@ -1908,6 +2021,10 @@ async function runSinglePackageUpgrade(
           chosenVersion = retry.chosenVersion;
           usedFallback = retry.usedFallback;
           lastAttemptedVersion = retry.lastAttemptedVersion;
+          if (!result.ok) {
+            // Rolled back: the blocker edits are gone, so nothing may report them as upgrades.
+            adHocResolved = undefined;
+          }
         } else if (!jsonOutput) {
           log.dim(`Ad-hoc peer-range resolver could not find a compatible tuple for ${scanned.name}`);
         }
@@ -1924,7 +2041,7 @@ async function runSinglePackageUpgrade(
     }
   }
 
-  if (!result.ok && interactive) {
+  if (!result.ok && interactive && !opts.abortState?.reason) {
     const action = await promptAfterFailure(scanned.name, true);
     if (action === 'pin') {
       ignore.add(scanned.name);
@@ -1942,6 +2059,7 @@ async function runSinglePackageUpgrade(
       if (!jsonOutput) {
         log.warn(`Retrying ${scanned.name} …`);
       }
+      adHocResolved = undefined;
       ({
         result,
         chosenVersion,
@@ -1961,9 +2079,11 @@ async function runSinglePackageUpgrade(
       // can restore the catalog file. Regular deps keep the declared range including ^/~.
       from: reportFrom,
       to: writtenTo,
+      section: scanned.section,
       requestedLatest: latest,
       usedFallback,
     };
+    const blockerRows: UpgradeRecord[] = [];
     if (result.message?.includes('--force')) {
       row.forced = true;
       row.detail = result.message;
@@ -1989,20 +2109,32 @@ async function runSinglePackageUpgrade(
         }
         row.detail = `ad-hoc peer-range intersection [${adHocResolved.method}] — primary ${scanned.name}: ${latest} → ${primaryBump.to}`;
       }
+      const pkgNow = await readPackageJson(cwd);
       for (const b of adHocResolved.bumps) {
         if (b.isPrimary) continue;
-        addUpgrade(report, {
+        const section = findSectionFor(pkgNow, b.name);
+        // `to` must be the range package.json now holds (`^15.3.0`), or undo reads it as drifted.
+        const blockerTo = formatWrittenRange(
+          { name: b.name, section: section ?? 'dependencies', currentRange: b.from },
+          b.to,
+          opts.pinExact,
+          opts.catalog,
+        );
+        const blockerRow: UpgradeRecord = {
           name: b.name,
           success: true,
           from: b.from,
-          to: b.to,
-          detail: `ad-hoc peer-range blocker for ${scanned.name}: ${b.from} → ${b.to}`,
+          to: blockerTo,
+          ...(section ? { section } : {}),
+          detail: `ad-hoc peer-range blocker for ${scanned.name}: ${b.from} → ${blockerTo}`,
           resolvedPeer: {
             originalTarget: b.from,
             reason: adHocResolved.reason,
             tuplesExplored: adHocResolved.tuplesExplored,
           },
-        });
+        };
+        addUpgrade(report, blockerRow);
+        blockerRows.push(blockerRow);
       }
     }
     addUpgrade(report, row);
@@ -2015,12 +2147,13 @@ async function runSinglePackageUpgrade(
         log.success(`upgraded: ${scanned.name} → ${writtenTo}`);
       }
     }
+    // The commit carries every edit the batch made: the blockers moved in the same package.json.
     await fireUpgradeApplied(
       opts,
-      [row],
+      [row, ...blockerRows],
       cwd,
       undefined,
-      catalogExtraFiles(opts.catalog, [scanned.currentRange]),
+      catalogExtraFiles(opts.catalog, [scanned.currentRange, ...blockerRows.map((r) => r.from ?? '')]),
     );
   } else {
     const kind = result.kind ?? 'install';
@@ -2137,6 +2270,7 @@ async function tryResolvePeerIntersection(
       b.scanned.name,
       catalogStyleRange(opts.catalog, b.scanned.name, b.scanned.currentRange),
       opts.lockfileVersions,
+      lockfileMemberDir(opts),
     );
     return {
       name: b.scanned.name,
@@ -2147,10 +2281,13 @@ async function tryResolvePeerIntersection(
   });
 
   const domains: CandidateDomain[] = [];
-  for (const inp of inputs) {
+  for (const [i, inp] of inputs.entries()) {
     const peerMap = await fetchVersionPeers(inp.name, opts.registryCache);
     if (peerMap.size === 0) return undefined;
     const domain = buildDomain(inp, peerMap);
+    // The resolver may move a member below its target, never outside the policy's caps.
+    const allows = bumps[i]?.allows;
+    if (allows) domain.versions = domain.versions.filter(allows);
     if (domain.versions.length === 0) return undefined;
     domains.push(domain);
   }
@@ -2178,6 +2315,7 @@ async function tryResolvePeerIntersection(
     externalInstalled,
     // External peers are then checked against what's installed, not the declared range floor.
     ...(opts.lockfileVersions ? { lockfileVersions: opts.lockfileVersions } : {}),
+    memberRelDir: lockfileMemberDir(opts),
   });
 }
 
@@ -2218,9 +2356,9 @@ async function tryCoordinatedGroupFallback(
         b.targetVersion;
       const { latest } = await correctLaggingLatest(b.scanned.name, fromVersion, tagLatest, opts.registryCache);
       const order = buildLineFallbackOrder(fromVersion, latest, all, mode);
-      // Drop the first entry when it's the version we already tried.
-      const rest = order.filter((v) => v !== b.targetVersion);
-      ladders.push(rest.length > 0 ? rest : []);
+      // Drop the first entry when it's the version we already tried, and anything the policy caps.
+      const rest = order.filter((v) => v !== b.targetVersion && (!b.allows || b.allows(v)));
+      ladders.push(rest);
     } catch {
       ladders.push([]);
     }
@@ -2249,6 +2387,8 @@ async function tryCoordinatedGroupFallback(
     }
     last = await attemptBatchUpgrade(cwd, bumps, opts);
     if (last.ok) return last;
+    // A failed rollback install (here or in another target) leaves the tree out of sync.
+    if (last.abortFallbacks || opts.abortState?.reason) break;
   }
   // Restore original targets so subsequent interactive retries start from latest again.
   for (let i = 0; i < bumps.length; i++) {
@@ -2382,13 +2522,35 @@ async function runLinkedGroupUpgrade(
       continue;
     }
 
-    const targetVersion = usablePreferredTarget(opts, scanned.name, fromVersion) ?? latest;
+    let targetVersion = usablePreferredTarget(opts, scanned.name, fromVersion) ?? latest;
+    // Policy caps (maxVersion / allowMajorAfter) bound a linked member exactly like a single bump.
+    const cap = await policyVersionFilter(opts, scanned.name, fromVersion);
+    if (cap && !cap.allows(targetVersion)) {
+      const capped = await newestAllowedVersion(opts, scanned.name, fromVersion, latest, cap.allows);
+      if (!capped) {
+        addUpgrade(report, {
+          name: scanned.name,
+          success: true,
+          skipped: true,
+          from: reportFrom,
+          reason: 'policy',
+          detail: `policy allows no newer version: ${cap.reason}`,
+          linkedGroupId: gid,
+        });
+        if (!jsonOutput) {
+          log.dim(`policy-skipped: ${scanned.name} in group [${gid}] — ${cap.reason}`);
+        }
+        continue;
+      }
+      targetVersion = capped;
+    }
     bumps.push({
       scanned,
       targetVersion,
       reportFrom,
       requestedLatest: latest,
       ...(fromVersion ? { fromVersion } : {}),
+      ...(cap ? { allows: cap.allows } : {}),
     });
   }
 
@@ -2587,6 +2749,8 @@ async function runLinkedGroupUpgrade(
         log.warn(`Pinned linked group [${gid}] (${rcNote})`);
       }
       pushParsedConflicts(report, classified);
+      // Like a pinned single package: the group still failed this run, and the report says so.
+      recordGroupFailure(report, gid, bumps, result, opts, `Frozen by choice: ${rcNote}.`);
       return;
     }
     break;
@@ -2638,6 +2802,7 @@ async function runLinkedGroupUpgrade(
         success: true,
         from,
         to: writtenTo,
+        section: b.scanned.section,
         // `requestedLatest` should still reflect what the user ASKED for (registry latest),
         // even when the peer resolver nudged us to a slightly older version. That way the
         // summary can render "requested 19.0.0, got 18.3.1 (peer-range intersection)".
@@ -2937,10 +3102,22 @@ export async function runUpgradeEngine(opts: UpgradeEngineOptions): Promise<Fina
       continue;
     }
 
-    if (active.length === 1) {
-      await runSinglePackageUpgrade(cwd, active[0]!, engineOpts, report, ignore);
+    const keptBefore = countKept(report);
+    const upgradeGroup = (): Promise<void> =>
+      active.length === 1
+        ? runSinglePackageUpgrade(cwd, active[0]!, engineOpts, report, ignore)
+        : runLinkedGroupUpgrade(cwd, group, active, engineOpts, report, ignore);
+    // With a git hook, the attempts and the commit are one critical section: otherwise another
+    // target's install can land in the shared lockfile between this install and its commit.
+    if (engineOpts.onUpgradeApplied && engineOpts.installLock) {
+      await withInstallLock(engineOpts, upgradeGroup);
     } else {
-      await runLinkedGroupUpgrade(cwd, group, active, engineOpts, report, ignore);
+      await upgradeGroup();
+    }
+    // Later groups judge "already latest" from the lockfile; a kept step (an ad-hoc blocker
+    // included) changed it.
+    if (!dryRun && countKept(report) > keptBefore) {
+      engineOpts.lockfileVersions = await loadLockfileVersionTree(installCwd, projectInfo.manager);
     }
   }
 
@@ -3013,8 +3190,8 @@ export interface UpgradeFlowOptions
   /**
    * Force installs + validation to stay serialized even when `ProjectInfo.isolatedLockfiles`
    * is true. By default the orchestrator parallelizes installs across workspaces in isolated-
-   * lockfile setups (`pnpm shared-workspace-lockfile=false` or every member has its own
-   * lockfile on disk); setting this to `true` pins the old serialized behavior. Useful when
+   * lockfile setups (every member has its own lockfile on disk and there is no shared root
+   * lockfile); setting this to `true` pins the old serialized behavior. Useful when
    * a postinstall script in one workspace touches shared state outside the workspace tree
    * (npm scripts, generated files, etc.) and can't tolerate concurrent peers.
    */
@@ -3202,32 +3379,17 @@ export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalRep
   // shape so existing JSON consumers / fixture assertions stay stable.
   const namespaceGroups = targets.length > 1;
 
-  // Yarn-specific user feedback for `--install-mode filtered`:
-  //   - berry + plugin → use `yarn workspaces focus <name>` (great), inform once.
-  //   - berry without plugin → fall back to root install, point at the plugin install hint.
-  //   - classic (v1) → no `workspaces focus` exists, fall back to root install with version hint.
-  // We deliberately log only once per run (not per target) so monorepos with many members don't
-  // produce a wall of identical warnings.
+  // yarn has no lockfile-safe per-workspace install: `yarn workspaces focus` doesn't write
+  // yarn.lock and installs a partial tree. Logged once per run, not per target.
   if (
     opts.installMode === 'filtered' &&
     projectInfo.manager === 'yarn' &&
     !jsonOutput &&
     targets.some((t) => t.cwd !== rootCwd)
   ) {
-    const major = projectInfo.yarnMajorVersion;
-    if (projectInfo.yarnSupportsFocus) {
-      log.info(
-        `--install-mode filtered: using \`yarn workspaces focus <name>\` (yarn ${major ?? 'berry'} + @yarnpkg/plugin-workspace-tools).`,
-      );
-    } else if (major !== undefined && major < 2) {
-      log.warn(
-        `--install-mode filtered: yarn ${major}.x (classic) has no \`workspaces focus\` command. Falling back to a full root install for child targets — upgrade to yarn berry (v2+) for filtered installs.`,
-      );
-    } else {
-      log.warn(
-        '--install-mode filtered: `yarn workspaces focus` is unavailable (install `@yarnpkg/plugin-workspace-tools` with `yarn plugin import workspace-tools`). Falling back to a full root install for child targets.',
-      );
-    }
+    log.warn(
+      '--install-mode filtered: yarn has no lockfile-safe per-workspace install (`yarn workspaces focus` does not write yarn.lock and installs a partial tree). Falling back to a full root install for child targets.',
+    );
   }
 
   // Resolve effective concurrency. Cap at the target count (no point spawning more workers than
@@ -3257,8 +3419,8 @@ export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalRep
   const installLock =
     effectiveConcurrency > 1 || opts.onUpgradeApplied ? new KeyedMutex() : undefined;
 
-  // Isolated-lockfile monorepos (pnpm `shared-workspace-lockfile=false`, or every workspace
-  // member shipping its own lockfile) can install IN PARALLEL — different workspaces touch
+  // Isolated-lockfile monorepos (every workspace member ships its own lockfile and there is no
+  // shared root one) can install IN PARALLEL — different workspaces touch
   // different lockfiles. `detectProjectInfo` sets `isolatedLockfiles` when it can prove this
   // is safe. When true, `installCwd` becomes the target's own dir (not `rootCwd`), the keyed
   // mutex gives each target its own lock, and the `installFilter` is dropped (running a
@@ -3278,6 +3440,38 @@ export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalRep
       log.dim(
         `Parallel traversal: scan/plan up to ${effectiveConcurrency} targets concurrently; install + validate stay serialized (shared root lockfile).`,
       );
+    }
+  }
+
+  // In parallel-install mode each member validates in its own directory (its own scripts and
+  // node_modules), so each gets its own pre-flight and extra-check baseline, like the root did.
+  const validateByDir = new Map<string, UpgradeEngineOptions['validate']>();
+  if (parallelInstalls && !dryRun) {
+    const memberDirs = [...new Set(targets.map((t) => t.cwd).filter((d) => d !== rootCwd))];
+    const checks = await runWithConcurrency(memberDirs, effectiveConcurrency, async (dir) => ({
+      dir,
+      pre: await preflightValidate(dir, await readPackageJson(dir), {
+        ...(opts.validate ?? {}),
+        manager: projectInfo.manager,
+      }),
+    }));
+    for (const { dir, pre } of checks) {
+      const where = path.relative(rootCwd, dir) || dir;
+      if (!pre.skipped && !pre.ok && !force) {
+        aggregate.preflight = { ...preflightRecord(pre), command: `${pre.command} (in ${where})` };
+        aggregate.preflightAborted = true;
+        if (!jsonOutput) {
+          log.error(`Pre-flight failed in ${where}: \`${pre.command}\` exited ${pre.exitCode ?? '?'}`);
+          if (pre.lastLines) {
+            log.dim(indentBlock(pre.lastLines, '    '));
+          }
+        }
+        return aggregate;
+      }
+      if (pre.skipped && !jsonOutput && !opts.validate?.skip) {
+        log.warn(`No validator in ${where}: its upgrades will be kept without any check.`);
+      }
+      validateByDir.set(dir, withPreflightExtras(opts.validate, pre, jsonOutput));
     }
   }
 
@@ -3323,39 +3517,85 @@ export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalRep
     if (abortState.reason) {
       return createEmptyReport();
     }
-    const subReport = await runUpgradeEngine(buildEngineOpts(target));
+    const engineOpts: UpgradeEngineOptions = buildEngineOpts(target);
+    const installCwd = engineOpts.installCwd ?? rootCwd;
+    if (installCwd !== rootCwd) {
+      // A member installing in its own directory still upgrades the root's `catalog:` entries,
+      // and its validator needs the baseline pre-flight took in that directory.
+      engineOpts.catalog = await loadCatalogIndex(rootCwd);
+      engineOpts.validate = validateByDir.get(installCwd) ?? engineOpts.validate;
+    }
+    const subReport = await runUpgradeEngine(engineOpts);
     if (opts.onTargetComplete) {
-      try {
-        await opts.onTargetComplete({
-          workspace: target.label,
-          targetCwd: target.cwd,
-          installCwd: rootCwd,
-          manager: projectInfo.manager,
-          report: subReport,
-        });
-      } catch (e) {
-        if (!jsonOutput) {
-          const msg = e instanceof Error ? e.message : String(e);
-          log.warn(`onTargetComplete hook threw for ${target.label}: ${msg}`);
+      // The per-target commit stages the lockfile: hold its install lock so no other target's
+      // install is half-way through it.
+      await withInstallLock(engineOpts, async () => {
+        try {
+          await opts.onTargetComplete!({
+            workspace: target.label,
+            targetCwd: target.cwd,
+            installCwd,
+            manager: projectInfo.manager,
+            report: subReport,
+          });
+        } catch (e) {
+          if (!jsonOutput) {
+            const msg = e instanceof Error ? e.message : String(e);
+            log.warn(`onTargetComplete hook threw for ${target.label}: ${msg}`);
+          }
         }
-      }
+      });
     }
     return subReport;
+  };
+
+  // With several targets, one that throws becomes a failure row and stops the rest, instead of
+  // discarding the report of targets that already upgraded (and that `undo` must be able to see).
+  let targetError: string | undefined;
+  const runTarget = async (target: ResolvedTarget): Promise<FinalReport> => {
+    if (targets.length === 1) {
+      return runOneTarget(target);
+    }
+    if (targetError) {
+      return createEmptyReport();
+    }
+    try {
+      return await runOneTarget(target);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      targetError ??= `${target.label}: ${msg}`;
+      const failed = createEmptyReport();
+      addFailure(failed, {
+        name: `[target:${target.label}]`,
+        reason: 'install',
+        previousVersion: '',
+        message: `dep-up-surgeon stopped on workspace target ${target.label}: ${msg}`,
+      });
+      return failed;
+    }
+  };
+  const reportTargetError = (): void => {
+    if (targetError && !jsonOutput) {
+      log.error(
+        `Stopped after an error in workspace target ${targetError}; the targets after it were not attempted.`,
+      );
+    }
   };
 
   if (effectiveConcurrency === 1) {
     // Serial path — exact pre-existing behavior. Header logs print before each target.
     for (const target of targets) {
-      if (abortState.reason) {
+      if (abortState.reason || targetError) {
         break;
       }
       if (!jsonOutput && namespaceGroups) {
         log.title(`Target: ${target.label}`);
       }
-      const subReport = await runOneTarget(target);
+      const subReport = await runTarget(target);
       aggregate = mergeSubReport(aggregate, subReport, target.label, namespaceGroups);
     }
     reportStop();
+    reportTargetError();
     return aggregate;
   }
 
@@ -3363,13 +3603,12 @@ export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalRep
   // results in **input order** (not completion order) so the aggregated report is deterministic
   // for snapshot-style assertions and CI diffs. JSON-mode is the gate for this path so we don't
   // worry about interleaved human logs.
-  const subReports = await runWithConcurrency(targets, effectiveConcurrency, async (target) => {
-    return runOneTarget(target);
-  });
+  const subReports = await runWithConcurrency(targets, effectiveConcurrency, runTarget);
   for (let i = 0; i < targets.length; i++) {
     aggregate = mergeSubReport(aggregate, subReports[i], targets[i].label, namespaceGroups);
   }
   reportStop();
+  reportTargetError();
   return aggregate;
 }
 

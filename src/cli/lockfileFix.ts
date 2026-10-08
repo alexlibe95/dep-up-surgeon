@@ -63,6 +63,29 @@ function lockfileBasenameFor(
 }
 
 /**
+ * The lockfile the manager actually reads: npm prefers `npm-shrinkwrap.json` over
+ * `package-lock.json` (and `npm dedupe` rewrites the shrinkwrap), and bun falls back to the
+ * binary `bun.lockb` when there is no text `bun.lock`.
+ */
+async function resolveLockfileBasename(
+  cwd: string,
+  manager: PackageManager,
+): Promise<ReturnType<typeof lockfileBasenameFor> | 'npm-shrinkwrap.json'> {
+  if (manager === 'npm' && (await fs.pathExists(path.join(cwd, 'npm-shrinkwrap.json')))) {
+    return 'npm-shrinkwrap.json';
+  }
+  const basename = lockfileBasenameFor(manager);
+  if (
+    manager === 'bun' &&
+    !(await fs.pathExists(path.join(cwd, basename))) &&
+    (await fs.pathExists(path.join(cwd, 'bun.lockb')))
+  ) {
+    return 'bun.lockb';
+  }
+  return basename;
+}
+
+/**
  * Build the dedupe command for each manager. Returns `undefined` when the manager has no
  * dedupe subcommand at all (yarn classic) — caller records a skip.
  *
@@ -139,15 +162,8 @@ export interface RunLockfileFixResult {
  */
 export async function runLockfileFix(opts: RunLockfileFixOptions): Promise<RunLockfileFixResult> {
   const { cwd, manager, yarnMajorVersion, json, dryRun } = opts;
-  let lockfileBasename = lockfileBasenameFor(manager);
-  let lockfilePath = path.join(cwd, lockfileBasename);
-  if (manager === 'bun' && !(await fs.pathExists(lockfilePath))) {
-    const binary = path.join(cwd, 'bun.lockb');
-    if (await fs.pathExists(binary)) {
-      lockfileBasename = 'bun.lockb';
-      lockfilePath = binary;
-    }
-  }
+  const lockfileBasename = await resolveLockfileBasename(cwd, manager);
+  const lockfilePath = path.join(cwd, lockfileBasename);
 
   // No lockfile → nothing to dedupe. Emit a `skipped` report so --json consumers see the
   // reason explicitly rather than the field being absent.
@@ -431,11 +447,14 @@ function addDirectVersion(
  * npm lockfile parsers handle both v1 (top-level `dependencies`) and v2/v3 (`packages` map
  * keyed by on-disk path). v2 lockfiles carry BOTH fields for backward compatibility with
  * npm@6; we prefer `packages` because it's flatter and reliable.
+ *
+ * Aliased installs (`"string-width-cjs": "npm:string-width@^4"`) are keyed by the REAL package
+ * name: the folder is only the alias, and the registry knows nothing called `string-width-cjs`.
  */
 function parseNpmLockfile(raw: string): Map<string, Set<string>> {
   const out = new Map<string, Set<string>>();
   const j = JSON.parse(raw) as {
-    packages?: Record<string, { version?: string }>;
+    packages?: Record<string, { name?: string; version?: string }>;
     dependencies?: Record<string, { version?: string; dependencies?: unknown }>;
   };
   if (j.packages && typeof j.packages === 'object') {
@@ -444,17 +463,23 @@ function parseNpmLockfile(raw: string): Map<string, Set<string>> {
       // segment after the LAST `/node_modules/` occurrence. For scoped packages (`@scope/x`)
       // that segment actually contains a `/`, which our splitter handles.
       if (!key || typeof entry?.version !== 'string') continue;
-      const name = extractPackageNameFromNodeModulesPath(key);
-      if (!name) continue;
+      const folderName = extractPackageNameFromNodeModulesPath(key);
+      if (!folderName) continue;
+      // v2/v3 record `name` only when it differs from the folder, i.e. for aliases.
+      const name = typeof entry.name === 'string' && entry.name ? entry.name : folderName;
       addVersion(out, name, entry.version);
     }
     return out;
   }
   if (j.dependencies && typeof j.dependencies === 'object') {
     // v1: walk recursively; names are keys, nested `dependencies` follow the same shape.
+    // Aliases keep the real name in the version: `"version": "npm:string-width@4.2.3"`.
     const walk = (deps: Record<string, { version?: string; dependencies?: unknown }>): void => {
       for (const [name, d] of Object.entries(deps)) {
-        if (typeof d?.version === 'string') addVersion(out, name, d.version);
+        if (typeof d?.version === 'string') {
+          const alias = parseNpmAlias(d.version);
+          addVersion(out, alias?.name ?? name, alias?.spec ?? d.version);
+        }
         if (d && typeof d.dependencies === 'object') {
           walk(d.dependencies as Record<string, { version?: string; dependencies?: unknown }>);
         }
@@ -473,7 +498,9 @@ function parseNpmLockfile(raw: string): Map<string, Set<string>> {
  *   /@types/node@20.4.5:
  *   /@babel/core@7.22.5(something):
  * pnpm v9 switched to `'axios@1.6.2':` (unslashed, quoted). Both shapes are supported; we
- * strip the prefix, split on the LAST `@`, and that's the version.
+ * strip the prefix, split on the LAST `@`, and that's the version. pnpm v5 (lockfile 5.x)
+ * separates with a slash instead — `/@babel/core/7.22.5:`, `/react-dom/18.2.0_react@18.2.0:` —
+ * so the version is the segment after the (scoped) name, up to the `_peers` suffix.
  */
 function parsePnpmLockfile(raw: string): Map<string, Set<string>> {
   const out = new Map<string, Set<string>>();
@@ -489,6 +516,11 @@ function parsePnpmLockfile(raw: string): Map<string, Set<string>> {
       inPackages = false;
     }
     if (!inPackages) continue;
+    const v5 = line.match(/^\s{2}['"]?\/((?:@[^/@'"\s]+\/)?[^/@'"\s]+)\/(\d[^/_('":\s]*)/);
+    if (v5) {
+      addVersion(out, v5[1]!, v5[2]!);
+      continue;
+    }
     const m = line.match(/^\s{2}['"]?\/?(@?[^@'"/\s]+(?:\/[^@'"/\s]+)?)@([^(:'"\s]+)/);
     if (m) addVersion(out, m[1]!, m[2]!);
   }
@@ -526,7 +558,8 @@ function parseYarnLockfile(raw: string): Map<string, Set<string>> {
 
 /**
  * bun.lock (text / JSONC, bun 1.1.38+). `packages` values are typically
- * `["name@version", tarball, integrity, deps]`. Binary `bun.lockb` is not parsed here.
+ * `["name@version", tarball, integrity, deps]`. Binary `bun.lockb` is not parsed here — see
+ * `isBinaryLockfile`.
  */
 function parseBunLockfile(raw: string): Map<string, Set<string>> {
   const out = new Map<string, Set<string>>();
@@ -544,6 +577,14 @@ function parseBunLockfile(raw: string): Map<string, Set<string>> {
     if (parsed) addVersion(out, parsed.name, parsed.version);
   }
   return out;
+}
+
+/**
+ * Lockfiles stored in a binary format (`bun.lockb`) that none of the parsers here can read.
+ * Callers report them as "present, not inspected" instead of as an unparseable lockfile.
+ */
+export function isBinaryLockfile(basename: string): boolean {
+  return basename === 'bun.lockb';
 }
 
 function parseJsonc(raw: string): unknown {
@@ -564,7 +605,19 @@ function splitNameAtVersion(spec: string): { name: string; version: string } | u
   return { name, version };
 }
 
-/** Parse a yarn.lock header line into the list of package names it declares. */
+/**
+ * `npm:<name>@<version-or-range>` (an aliased install) → the real package name + its spec.
+ * `npm:^4.17.0` (berry's plain descriptor, no name) is not an alias.
+ */
+function parseNpmAlias(spec: string): { name: string; spec: string } | undefined {
+  const m = spec.match(/^npm:((?:@[^/@\s]+\/)?[^/@\s]+)@(.+)$/);
+  return m ? { name: m[1]!, spec: m[2]! } : undefined;
+}
+
+/**
+ * Parse a yarn.lock header line into the list of package names it declares. Aliases
+ * (`string-width-cjs@npm:string-width@^4.2.0`) resolve to the real package name.
+ */
 function parseYarnEntryHeader(header: string): string[] {
   const raw = header.replace(/:\s*$/, '').trim();
   // Split on commas outside quotes.
@@ -589,9 +642,10 @@ function parseYarnEntryHeader(header: string): string[] {
     // Scoped: @scope/name@range → we want `@scope/name`. Berry's `__metadata` has no `@`.
     const at = spec.indexOf('@', spec.startsWith('@') ? 1 : 0);
     if (at <= 0) continue;
+    const range = spec.slice(at + 1);
     // Berry lists local workspaces (`app@workspace:.`, version `0.0.0-use.local`); not installs.
-    if (/^(?:workspace|link|portal):/.test(spec.slice(at + 1))) continue;
-    names.add(spec.slice(0, at));
+    if (/^(?:workspace|link|portal):/.test(range)) continue;
+    names.add(parseNpmAlias(range)?.name ?? spec.slice(0, at));
   }
   return [...names];
 }

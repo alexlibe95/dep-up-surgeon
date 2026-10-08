@@ -34,16 +34,15 @@ export function splitNamespacedId(id: string): { workspace?: string; bare: strin
  * Copy `ignore` and, for the current target, promote matching `label::name` keys to bare
  * `name` so existing `ignore.has(scanned.name)` checks keep working. The original set is never
  * mutated — each workspace target gets its own copy so a freeze in one member cannot leak.
+ * A target without a label is the root of a root-only run, so `root::name` keys (written by an
+ * earlier `--workspaces` run) apply to it.
  */
 export function materializeIgnoreForTarget(
   ignore: ReadonlySet<string>,
   targetLabel?: string,
 ): Set<string> {
   const out = new Set(ignore);
-  if (!targetLabel) {
-    return out;
-  }
-  const prefix = `${targetLabel}${IGNORE_SCOPE_SEP}`;
+  const prefix = `${targetLabel || 'root'}${IGNORE_SCOPE_SEP}`;
   for (const key of ignore) {
     if (key.startsWith(prefix)) {
       out.add(key.slice(prefix.length));

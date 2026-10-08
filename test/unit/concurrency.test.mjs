@@ -289,23 +289,24 @@ test('KeyedMutex: thrown fn releases the key, queue continues', async () => {
 
 const { detectProjectInfo } = await import(path.join(root, 'dist/core/workspaces.js'));
 
-test('detectProjectInfo: pnpm .npmrc shared-workspace-lockfile=false → isolatedLockfiles', async () => {
+test('detectProjectInfo: pnpm .npmrc shared-workspace-lockfile=false is NOT isolated (pnpm install stays recursive)', async () => {
+  // Per-project lockfiles, but `pnpm install` anywhere under pnpm-workspace.yaml installs every
+  // project — parallel per-member installs would race on node_modules and each other's lockfiles.
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dus-isol-'));
-  await fs.writeFile(
-    path.join(dir, 'package.json'),
-    JSON.stringify({ name: 'mono', private: true, workspaces: ['packages/*'] }),
-  );
-  await fs.writeFile(path.join(dir, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
+  await fs.writeFile(path.join(dir, 'package.json'), JSON.stringify({ name: 'mono', private: true }));
+  await fs.writeFile(path.join(dir, 'pnpm-workspace.yaml'), 'packages:\n  - packages/*\n');
   await fs.writeFile(path.join(dir, '.npmrc'), 'shared-workspace-lockfile=false\n');
-  await fs.mkdir(path.join(dir, 'packages', 'a'), { recursive: true });
-  await fs.writeFile(
-    path.join(dir, 'packages', 'a', 'package.json'),
-    JSON.stringify({ name: '@org/a', version: '0.0.1' }),
-  );
+  for (const name of ['a', 'b']) {
+    const m = path.join(dir, 'packages', name);
+    await fs.mkdir(m, { recursive: true });
+    await fs.writeFile(path.join(m, 'package.json'), JSON.stringify({ name: `@org/${name}`, version: '0.0.1' }));
+    await fs.writeFile(path.join(m, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
+  }
 
   const info = await detectProjectInfo(dir, 'pnpm');
-  assert.strictEqual(info.isolatedLockfiles, true);
-  assert.strictEqual(info.isolatedLockfilesSource, 'pnpm-npmrc');
+  assert.strictEqual(info.workspaceMembers.length, 2);
+  assert.ok(!info.isolatedLockfiles);
+  assert.strictEqual(info.isolatedLockfilesSource, undefined);
 });
 
 test('detectProjectInfo: commented-out shared-workspace-lockfile is NOT detected', async () => {
@@ -361,8 +362,9 @@ test('detectProjectInfo: shared root lockfile only → isolatedLockfiles not set
   assert.ok(!info.isolatedLockfiles, 'must not flag isolated when members share the root lockfile');
 });
 
-// pnpm's `shared-workspace-lockfile=false` is a real per-member lockfile contract. (Member
-// lockfiles under an npm root `workspaces` field are not — npm installs from the root anyway.)
+// pnpm ignores package.json `workspaces`, so without pnpm-workspace.yaml every member with its own
+// pnpm-lock.yaml is an independent project. (Member lockfiles under an npm root `workspaces` field,
+// or under pnpm-workspace.yaml, are not — those installs run from the workspace root anyway.)
 async function isolatedPnpmMono(prefix, members) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
   await fs.writeFile(
@@ -370,11 +372,11 @@ async function isolatedPnpmMono(prefix, members) {
     JSON.stringify({ name: 'mono', private: true, workspaces: ['packages/*'] }),
   );
   await fs.writeFile(path.join(dir, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
-  await fs.writeFile(path.join(dir, '.npmrc'), 'shared-workspace-lockfile=false\n');
   for (const name of members) {
     const m = path.join(dir, 'packages', name);
     await fs.mkdir(m, { recursive: true });
     await fs.writeFile(path.join(m, 'package.json'), JSON.stringify({ name: `@org/${name}`, version: '0.0.1' }));
+    await fs.writeFile(path.join(m, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
   }
   return dir;
 }

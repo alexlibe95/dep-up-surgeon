@@ -24,6 +24,7 @@ const {
   fetchChangelog,
   createChangelogCache,
   formatExcerptForCommit,
+  neutralizeGithubRefs,
 } = mod;
 
 // ---------------------------------------------------------------------------
@@ -174,6 +175,10 @@ test('sanitizeMarkdown: strips HTML comments', () => {
 test('sanitizeMarkdown: converts links to text (url) form', () => {
   const out = sanitizeMarkdown('See [docs](https://example.com/docs) for more.');
   assert.match(out, /docs \(https:\/\/example\.com\/docs\)/);
+});
+
+test('sanitizeMarkdown: neutralizes GitHub mentions and issue refs', () => {
+  assert.strictEqual(sanitizeMarkdown('Fixed by @alice, closes #12'), 'Fixed by `@alice`, closes `#12`');
 });
 
 test('sanitizeMarkdown: collapses triple+ blank lines to doubles', () => {
@@ -458,7 +463,212 @@ test('fetchChangelog: legacy getGithubRelease seam stops probing once it reports
   };
   await fetchChangelog({ packageName: 'a', toVersion: '1.0.0', cache, fetchers });
   await fetchChangelog({ packageName: 'b', toVersion: '1.0.0', cache, fetchers });
-  assert.deepStrictEqual(tagsTried, ['v1.0.0']);
+  assert.deepStrictEqual(tagsTried, ['a@1.0.0']);
+});
+
+// ---------------------------------------------------------------------------
+// Tag candidates in monorepos
+// ---------------------------------------------------------------------------
+
+function listedFetchers(releases, extra = {}) {
+  const probed = [];
+  return {
+    probed,
+    fetchers: {
+      ...noTarball,
+      getManifest: async () => ({ repository: 'github:vitejs/vite' }),
+      listGithubReleases: async () => ({ releases }),
+      getGithubRelease: async (owner, repo, tag) => {
+        probed.push(tag);
+        return extra[tag];
+      },
+    },
+  };
+}
+
+test("fetchChangelog: a monorepo package gets its own release, not the main package's `v<version>`", async () => {
+  const releases = [
+    { tag_name: 'v5.0.0', body: '- vite core notes', html_url: 'u/v5.0.0' },
+    { tag_name: 'create-vite@5.0.0', body: '- create-vite notes', html_url: 'u/create-vite@5.0.0' },
+    { tag_name: 'plugin-react@4.0.0', body: '- plugin-react notes', html_url: 'u/plugin-react@4.0.0' },
+    { tag_name: 'v4.0.0', body: '- vite 4 notes', html_url: 'u/v4.0.0' },
+  ];
+  const { fetchers } = listedFetchers(releases);
+  const unscoped = await fetchChangelog({ packageName: 'create-vite', toVersion: '5.0.0', fetchers });
+  assert.match(unscoped.body, /create-vite notes/);
+  const scoped = await fetchChangelog({ packageName: '@vitejs/plugin-react', toVersion: '4.0.0', fetchers });
+  assert.match(scoped.body, /plugin-react notes/);
+  // The main package still finds its generic `v` tag.
+  const core = await fetchChangelog({ packageName: 'vite', toVersion: '5.0.0', fetchers });
+  assert.match(core.body, /vite core notes/);
+});
+
+test('fetchChangelog: per-tag probing tries package-specific tags before `v<version>`', async () => {
+  const tagsTried = [];
+  const fetchers = {
+    ...noTarball,
+    getManifest: async () => ({ repository: 'github:x/monorepo' }),
+    getGithubRelease: async (owner, repo, tag) => {
+      tagsTried.push(tag);
+      return tag === 'v1.0.0' ? { body: 'x', html_url: 'u' } : undefined;
+    },
+  };
+  await fetchChangelog({ packageName: 'pkg', toVersion: '1.0.0', fetchers });
+  assert.deepStrictEqual(tagsTried, ['pkg@1.0.0', 'pkg-1.0.0', 'v1.0.0']);
+  tagsTried.length = 0;
+  await fetchChangelog({ packageName: '@scope/pkg', toVersion: '1.0.0', fetchers });
+  assert.deepStrictEqual(tagsTried, ['@scope/pkg@1.0.0', 'pkg@1.0.0', 'pkg-1.0.0', 'v1.0.0']);
+});
+
+test('fetchChangelog: a full page without the release probes the tag scheme the repo uses', async () => {
+  const filler = (fmt) => Array.from({ length: 100 }, (_, i) => ({ tag_name: fmt(i), body: 'old', html_url: 'u' }));
+  const single = listedFetchers(filler((i) => `v9.${i}.0`), { 'v1.0.0': { body: 'v-tag notes', html_url: 'u' } });
+  const a = await fetchChangelog({ packageName: 'pkg', toVersion: '1.0.0', fetchers: single.fetchers });
+  assert.deepStrictEqual(single.probed, ['v1.0.0']);
+  assert.match(a.body, /v-tag notes/);
+
+  const mono = listedFetchers(filler((i) => `pkg@9.${i}.0`), { 'pkg@1.0.0': { body: 'own notes', html_url: 'u' } });
+  const b = await fetchChangelog({ packageName: 'pkg', toVersion: '1.0.0', fetchers: mono.fetchers });
+  assert.deepStrictEqual(mono.probed, ['pkg@1.0.0']);
+  assert.match(b.body, /own notes/);
+});
+
+// ---------------------------------------------------------------------------
+// Breaking-change scan on the returned excerpt
+// ---------------------------------------------------------------------------
+
+test('fetchChangelog: breaking scan reads the full notes, not the truncated body', async () => {
+  const notes = [
+    ...Array.from({ length: 50 }, (_, i) => `- fix ${i}`),
+    '',
+    'BREAKING CHANGE: `parse()` now throws on invalid input',
+  ].join('\n');
+  const { fetchers } = listedFetchers([{ tag_name: 'v2.0.0', body: notes, html_url: 'u' }]);
+  const excerpt = await fetchChangelog({ packageName: 'pkg', toVersion: '2.0.0', fetchers });
+  assert.strictEqual(excerpt.truncated, true);
+  assert.doesNotMatch(excerpt.body, /BREAKING/);
+  assert.strictEqual(excerpt.breaking.hasBreaking, true);
+  assert.match(excerpt.breaking.matchedLines[0], /parse\(\) now throws/);
+});
+
+test('fetchChangelog: a bump across majors scans the boundary releases from the same listing', async () => {
+  const releases = [
+    { tag_name: 'v3.1.0', body: '### Features\n- add `retry` option', html_url: 'u/v3.1.0' },
+    { tag_name: 'v3.0.0', body: '### Breaking\n- Drop support for Node 16', html_url: 'u/v3.0.0' },
+    { tag_name: 'v2.5.0', body: '- add things', html_url: 'u/v2.5.0' },
+    { tag_name: 'v2.0.0', body: '- Removed the deprecated `legacy` option', html_url: 'u/v2.0.0' },
+    { tag_name: 'v1.4.0', body: '- BREAKING CHANGE: not part of this bump', html_url: 'u/v1.4.0' },
+  ];
+  const { fetchers, probed } = listedFetchers(releases);
+  const excerpt = await fetchChangelog({ packageName: 'pkg', toVersion: '3.1.0', fromVersion: '^1.4.0', fetchers });
+  assert.match(excerpt.body, /retry/, 'the displayed notes stay the target release');
+  assert.strictEqual(excerpt.breaking.hasBreaking, true);
+  assert.deepStrictEqual(excerpt.breaking.matchedLines, [
+    '3.0.0: Drop support for Node 16',
+    '2.0.0: Removed the deprecated legacy option',
+  ]);
+  assert.deepStrictEqual(probed, [], 'boundaries on the listed page cost no extra request');
+
+  // Same major: nothing extra is scanned.
+  const minor = await fetchChangelog({ packageName: 'pkg', toVersion: '3.1.0', fromVersion: '3.0.0', fetchers });
+  assert.strictEqual(minor.breaking.hasBreaking, false);
+});
+
+test('fetchChangelog: boundary releases off a full page are probed, at most 3', async () => {
+  const releases = [
+    { tag_name: 'v9.0.1', body: '- fix', html_url: 'u' },
+    ...Array.from({ length: 99 }, (_, i) => ({ tag_name: `other@1.0.${i}`, body: 'x', html_url: 'u' })),
+  ];
+  const { fetchers, probed } = listedFetchers(releases, {
+    'v8.0.0': { body: 'BREAKING CHANGE: config is now ESM-only', html_url: 'u' },
+  });
+  const excerpt = await fetchChangelog({ packageName: 'pkg', toVersion: '9.0.1', fromVersion: '1.0.0', fetchers });
+  assert.deepStrictEqual(probed, ['v9.0.0', 'v8.0.0', 'v7.0.0']);
+  assert.deepStrictEqual(excerpt.breaking.matchedLines, ['8.0.0: BREAKING CHANGE: config is now ESM-only']);
+});
+
+test('fetchChangelog: CHANGELOG.md fallback scans crossed 0.x minors from the same file', async () => {
+  const changelog = [
+    '# Changelog',
+    '## 0.5.1',
+    '- fix typo',
+    '## 0.5.0',
+    '- **BREAKING CHANGE**: `init()` is async',
+    '## 0.4.0',
+    '- Renamed `createClient` to `connect`',
+    '## 0.3.2',
+    '- Removed the `debug` option',
+  ].join('\n');
+  const fetchers = makeFetchers({ changelogBody: changelog });
+  const excerpt = await fetchChangelog({ packageName: 'zero', toVersion: '0.5.1', fromVersion: '~0.3.2', fetchers });
+  assert.strictEqual(excerpt.source, 'changelog.md');
+  assert.match(excerpt.body, /fix typo/);
+  assert.doesNotMatch(excerpt.body, /init/);
+  assert.deepStrictEqual(excerpt.breaking.matchedLines, [
+    '0.5.0: BREAKING CHANGE: init() is async',
+    '0.4.0: Renamed createClient to connect',
+  ]);
+});
+
+test('fetchChangelog: the cache keeps bumps with different crossed majors apart', async () => {
+  let listed = 0;
+  const releases = [
+    { tag_name: 'v3.0.1', body: '- fix', html_url: 'u' },
+    { tag_name: 'v3.0.0', body: 'BREAKING CHANGE: x', html_url: 'u' },
+  ];
+  const fetchers = {
+    ...noTarball,
+    getManifest: async () => ({ repository: 'github:o/r' }),
+    listGithubReleases: async () => {
+      listed++;
+      return { releases };
+    },
+    getGithubRelease: async () => undefined,
+  };
+  const cache = createChangelogCache();
+  const plain = await fetchChangelog({ packageName: 'p', toVersion: '3.0.1', fromVersion: '3.0.0', cache, fetchers });
+  const crossing = await fetchChangelog({ packageName: 'p', toVersion: '3.0.1', fromVersion: '2.1.0', cache, fetchers });
+  await fetchChangelog({ packageName: 'p', toVersion: '3.0.1', fromVersion: '^2.0.0', cache, fetchers });
+  assert.strictEqual(plain.breaking.hasBreaking, false);
+  assert.strictEqual(crossing.breaking.hasBreaking, true);
+  assert.strictEqual(listed, 2, 'one fetch per distinct boundary set');
+});
+
+// ---------------------------------------------------------------------------
+// GitHub mentions / issue refs
+// ---------------------------------------------------------------------------
+
+test('neutralizeGithubRefs: wraps mentions and issue refs, leaves code, emails and URLs alone', () => {
+  const input = [
+    '- fix crash (#123) by @alice in vitejs/vite#456, fixes #789',
+    '- closes GH-12; thanks @bob-smith and @org/team',
+    '- bump @babel/core@7.22.0 and `@types/node` (see `#1`)',
+    '- mail dev@example.com, see https://example.com/page#123 or https://github.com/o/r/pull/9#issuecomment-1',
+    '- &#123; entity, pkg@1.2.3 spec',
+  ].join('\n');
+  assert.strictEqual(
+    neutralizeGithubRefs(input),
+    [
+      '- fix crash (`#123`) by `@alice` in `vitejs/vite#456`, fixes `#789`',
+      '- closes `GH-12`; thanks `@bob-smith` and `@org/team`',
+      '- bump `@babel/core@7.22.0` and `@types/node` (see `#1`)',
+      '- mail dev@example.com, see https://example.com/page#123 or https://github.com/o/r/pull/9#issuecomment-1',
+      '- &#123; entity, pkg@1.2.3 spec',
+    ].join('\n'),
+  );
+});
+
+test('fetchChangelog: excerpt body and breaking lines never carry live mentions / closing refs', async () => {
+  const notes = "## What's Changed\n- BREAKING CHANGE: drop `legacy` mode by @alice in #42 (fixes #7)\n- docs by @bob";
+  const { fetchers } = listedFetchers([{ tag_name: 'v2.0.0', body: notes, html_url: 'u' }]);
+  const excerpt = await fetchChangelog({ packageName: 'pkg', toVersion: '2.0.0', fetchers });
+  assert.match(excerpt.body, /by `@alice` in `#42` \(fixes `#7`\)/);
+  assert.match(excerpt.body, /docs by `@bob`/);
+  // The scan unwraps inline code for readability, then re-neutralizes.
+  assert.deepStrictEqual(excerpt.breaking.matchedLines, [
+    'BREAKING CHANGE: drop legacy mode by `@alice` in `#42` (fixes `#7`)',
+  ]);
+  assert.match(formatExcerptForCommit('pkg', '1.0.0', '2.0.0', excerpt), /`@alice`/);
 });
 
 test('fetchChangelog: skips tarball extraction when dist.unpackedSize exceeds the cap', async () => {

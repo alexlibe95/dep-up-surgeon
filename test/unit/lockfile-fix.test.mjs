@@ -21,6 +21,7 @@ const {
   diffLockfileTrees,
   dedupeCommandFor,
   runLockfileFix,
+  isBinaryLockfile,
 } = await import(path.join(root, 'dist/cli/lockfileFix.js'));
 
 function mapToSortedObject(m) {
@@ -66,6 +67,106 @@ test('parseLockfileInstalledVersions: npm v1 recursive `dependencies`', () => {
     axios: ['1.6.4'],
     debug: ['4.3.4'],
     'form-data': ['4.0.0'],
+  });
+});
+
+test('parseLockfileInstalledVersions: npm aliases are keyed by the real package name', () => {
+  // `"string-width-cjs": "npm:string-width@^4.2.0"` (pulled in by @isaacs/cliui).
+  const v3 = JSON.stringify({
+    lockfileVersion: 3,
+    packages: {
+      '': { name: 'root' },
+      'packages/app': { name: '@demo/app', version: '1.0.0' },
+      'node_modules/@demo/app': { resolved: 'packages/app', link: true },
+      'node_modules/string-width': { version: '5.1.2' },
+      'node_modules/string-width-cjs': { name: 'string-width', version: '4.2.3' },
+      'node_modules/@isaacs/cliui/node_modules/wrap-ansi-cjs': { name: 'wrap-ansi', version: '7.0.0' },
+    },
+  });
+  assert.deepStrictEqual(mapToSortedObject(parseLockfileInstalledVersions(v3, 'npm')), {
+    'string-width': ['4.2.3', '5.1.2'],
+    'wrap-ansi': ['7.0.0'],
+  });
+
+  const v1 = JSON.stringify({
+    lockfileVersion: 1,
+    dependencies: {
+      'string-width': { version: '5.1.2' },
+      'string-width-cjs': { version: 'npm:string-width@4.2.3' },
+      'scoped-alias': { version: 'npm:@scope/real@1.0.0' },
+    },
+  });
+  assert.deepStrictEqual(mapToSortedObject(parseLockfileInstalledVersions(v1, 'npm')), {
+    'string-width': ['4.2.3', '5.1.2'],
+    '@scope/real': ['1.0.0'],
+  });
+});
+
+test('parseLockfileInstalledVersions: yarn alias headers resolve to the real package name', () => {
+  const classic = [
+    '"string-width-cjs@npm:string-width@^4.2.0":',
+    '  version "4.2.3"',
+    '',
+    'string-width@^5.0.1:',
+    '  version "5.1.2"',
+    '',
+    '"my-babel@npm:@babel/core@^7.22.0":',
+    '  version "7.22.5"',
+  ].join('\n');
+  assert.deepStrictEqual(mapToSortedObject(parseLockfileInstalledVersions(classic, 'yarn')), {
+    'string-width': ['4.2.3', '5.1.2'],
+    '@babel/core': ['7.22.5'],
+  });
+
+  const berry = [
+    '__metadata:',
+    '  version: 8',
+    '',
+    '"string-width-cjs@npm:string-width@^4.2.0":',
+    '  version: 4.2.3',
+    '  resolution: "string-width@npm:4.2.3"',
+    '',
+    '"string-width@npm:^5.0.1":',
+    '  version: 5.1.2',
+    '  resolution: "string-width@npm:5.1.2"',
+  ].join('\n');
+  assert.deepStrictEqual(mapToSortedObject(parseLockfileInstalledVersions(berry, 'yarn')), {
+    'string-width': ['4.2.3', '5.1.2'],
+  });
+});
+
+test('parseLockfileInstalledVersions: pnpm v5 `/name/version[_peers]` keys', () => {
+  const raw = [
+    'lockfileVersion: 5.4',
+    '',
+    'specifiers:',
+    '  react-dom: ^18.2.0',
+    '',
+    'packages:',
+    '',
+    '  /@babel/core/7.22.5:',
+    '    resolution: {integrity: sha-a}',
+    '    dependencies:',
+    '      debug: 4.3.4',
+    '',
+    '  /react-dom/18.2.0_react@18.2.0:',
+    '    resolution: {integrity: sha-b}',
+    '',
+    '  /@testing-library/react/14.0.0_biqbaboplfbrettd7655fr4n2y:',
+    '    resolution: {integrity: sha-c}',
+    '',
+    '  /debug/4.3.4:',
+    '    resolution: {integrity: sha-d}',
+    '',
+    '  /typescript/5.2.0-beta:',
+    '    resolution: {integrity: sha-e}',
+  ].join('\n');
+  assert.deepStrictEqual(mapToSortedObject(parseLockfileInstalledVersions(raw, 'pnpm')), {
+    '@babel/core': ['7.22.5'],
+    'react-dom': ['18.2.0'],
+    '@testing-library/react': ['14.0.0'],
+    debug: ['4.3.4'],
+    typescript: ['5.2.0-beta'],
   });
 });
 
@@ -284,6 +385,60 @@ test('runLockfileFix: skips with unsupported reason on bun.lockb', async () => {
   assert.strictEqual(r.report.status, 'skipped');
   assert.strictEqual(r.report.skipReason, 'unsupported');
   assert.strictEqual(r.report.lockfile, 'bun.lockb');
+});
+
+test('runLockfileFix: npm prefers npm-shrinkwrap.json over package-lock.json (as npm does)', async () => {
+  const { createRegistryCache } = await import(path.join(root, 'dist/utils/concurrency.js'));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dus-lockfix-'));
+  await fs.writeFile(path.join(dir, 'package.json'), '{}');
+  const lock = (version) =>
+    JSON.stringify({ lockfileVersion: 3, packages: { '': {}, 'node_modules/uuid': { version } } });
+  await fs.writeFile(path.join(dir, 'package-lock.json'), lock('11.0.5'));
+  await fs.writeFile(path.join(dir, 'npm-shrinkwrap.json'), lock('8.3.2'));
+  const registryCache = createRegistryCache();
+  registryCache.latest.set('uuid', Promise.resolve('11.0.5'));
+  const r = await runLockfileFix({ cwd: dir, manager: 'npm', json: true, dryRun: true, registryCache });
+  assert.strictEqual(r.report.lockfile, 'npm-shrinkwrap.json');
+  assert.deepStrictEqual(r.report.stale.map((s) => [s.name, s.installed]), [['uuid', ['8.3.2']]]);
+
+  // Shrinkwrap alone still counts as a lockfile (no `no-lockfile` skip).
+  await fs.rm(path.join(dir, 'package-lock.json'));
+  const alone = await runLockfileFix({ cwd: dir, manager: 'npm', json: true, dryRun: true, registryCache });
+  assert.strictEqual(alone.report.status, 'dry-run');
+  assert.strictEqual(alone.report.lockfile, 'npm-shrinkwrap.json');
+});
+
+test('runLockfileFix: stale scan queries the real name of an aliased install', async () => {
+  const { createRegistryCache } = await import(path.join(root, 'dist/utils/concurrency.js'));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dus-lockfix-'));
+  await fs.writeFile(path.join(dir, 'package.json'), '{}');
+  await fs.writeFile(
+    path.join(dir, 'package-lock.json'),
+    JSON.stringify({
+      lockfileVersion: 3,
+      packages: { '': {}, 'node_modules/string-width-cjs': { name: 'string-width', version: '4.2.3' } },
+    }),
+  );
+  const registryCache = createRegistryCache();
+  const queried = [];
+  const latest = registryCache.latest;
+  // Only `string-width` is seeded; looking up the alias name would fall through to the network.
+  latest.set('string-width', Promise.resolve('7.2.0'));
+  const realGet = latest.get.bind(latest);
+  latest.get = (name) => {
+    queried.push(name);
+    return realGet(name);
+  };
+  const r = await runLockfileFix({ cwd: dir, manager: 'npm', json: true, dryRun: true, registryCache });
+  assert.deepStrictEqual(queried, ['string-width']);
+  assert.deepStrictEqual(r.report.stale.map((s) => s.name), ['string-width']);
+});
+
+test('isBinaryLockfile: only bun.lockb', () => {
+  assert.strictEqual(isBinaryLockfile('bun.lockb'), true);
+  for (const name of ['bun.lock', 'package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'yarn.lock']) {
+    assert.strictEqual(isBinaryLockfile(name), false, name);
+  }
 });
 
 test('runLockfileFix: dry-run returns the command but never exec', async () => {

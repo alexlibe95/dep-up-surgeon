@@ -2,6 +2,7 @@
  * Unit tests for the persisted last-run report and the `--retry-failed` ignore computation.
  */
 import assert from 'node:assert';
+import { execFileSync } from 'node:child_process';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -14,6 +15,8 @@ const {
   lastRunReportPath,
   TERMINAL_RETRY_REASONS,
   computeRetryFailedIgnores,
+  findLastRunReport,
+  legacyLastRunWarning,
   loadLastRunReport,
   persistLastRunReport,
 } = await import(path.join(root, 'dist/cli/lastRun.js'));
@@ -315,4 +318,88 @@ test('materializeIgnoreForTarget: promotes only the current workspace keys to ba
   // Original set is not mutated.
   assert.ok(!ignore.has('axios'));
   assert.ok(!ignore.has('typescript'));
+});
+
+const EMPTY_STRUCTURED = { upgraded: [], skipped: [], failed: [], conflicts: [], unresolved: [], groups: [] };
+
+test('findLastRunReport: says which file was read, and flags the legacy root report with a warning', async () => {
+  const dir = await makeTmp('find');
+  const legacy = path.join(dir, LEGACY_LAST_RUN_FILENAME);
+  await fs.writeFile(
+    legacy,
+    JSON.stringify({ upgraded: [], finishedAt: '2026-01-02T03:04:05.000Z', toolVersion: '3.0.0' }),
+  );
+  const old = await findLastRunReport(dir);
+  assert.strictEqual(old.file, legacy);
+  assert.strictEqual(old.legacy, true);
+  const warning = legacyLastRunWarning(old);
+  assert.ok(warning.includes(legacy), warning);
+  assert.match(warning, /2026-01-02T03:04:05\.000Z/);
+  assert.match(warning, /dep-up-surgeon 3\.0\.0/);
+
+  await persistLastRunReport(EMPTY_STRUCTURED, { cwd: dir, toolVersion: '9.9.9', dryRun: false });
+  const current = await findLastRunReport(dir);
+  assert.strictEqual(current.file, lastRunReportPath(dir));
+  assert.strictEqual(current.legacy, false);
+  assert.strictEqual(legacyLastRunWarning(current), undefined);
+});
+
+test('persistLastRunReport: deletes the legacy root report + backups outside git', async () => {
+  const dir = await makeTmp('legacy-cleanup');
+  const legacyFiles = [LEGACY_LAST_RUN_FILENAME, '.dep-up-surgeon.last-run.package-lock.json'];
+  for (const name of legacyFiles) {
+    await fs.writeFile(path.join(dir, name), '{}');
+  }
+  await persistLastRunReport(EMPTY_STRUCTURED, { cwd: dir, toolVersion: '9.9.9', dryRun: false });
+  assert.deepStrictEqual(await fs.readdir(dir), ['node_modules']);
+  assert.strictEqual((await findLastRunReport(dir)).legacy, false);
+});
+
+test('persistLastRunReport: keeps a legacy root report git tracks, deletes an untracked one', async () => {
+  const dir = await makeTmp('legacy-git');
+  execFileSync('git', ['init', '-q'], { cwd: dir });
+  await fs.writeFile(path.join(dir, LEGACY_LAST_RUN_FILENAME), '{}');
+  await fs.writeFile(path.join(dir, '.dep-up-surgeon.last-run.bun.lock'), 'x');
+  execFileSync('git', ['add', LEGACY_LAST_RUN_FILENAME], { cwd: dir });
+  await persistLastRunReport(EMPTY_STRUCTURED, { cwd: dir, toolVersion: '9.9.9', dryRun: false });
+  const left = (await fs.readdir(dir)).filter((f) => f !== '.git').sort();
+  assert.deepStrictEqual(left, [LEGACY_LAST_RUN_FILENAME, 'node_modules'].sort());
+});
+
+test('--retry-failed chain: the keys a retry run froze stay frozen on the next retry', async () => {
+  const dir = await makeTmp('retry-chain');
+  // Run 1 (normal): axios upgraded, react peer-failed, esbuild install-failed.
+  const run1 = {
+    ...EMPTY_STRUCTURED,
+    upgraded: [{ name: 'axios', success: true, from: '1.0.0', to: '1.6.0' }],
+    failed: [
+      { name: 'react', reason: 'peer', previousVersion: '17.0.0' },
+      { name: 'esbuild', reason: 'install', previousVersion: '0.20.0' },
+    ],
+  };
+  await persistLastRunReport(run1, { cwd: dir, toolVersion: '9.9.9', dryRun: false });
+  const retry1 = computeRetryFailedIgnores(await loadLastRunReport(dir));
+  assert.deepStrictEqual([...retry1.added].sort(), ['axios', 'react']);
+
+  // Run 2 (--retry-failed): only esbuild was attempted, and it succeeded.
+  const run2 = { ...EMPTY_STRUCTURED, upgraded: [{ name: 'esbuild', success: true, from: '0.20.0', to: '0.21.0' }] };
+  await persistLastRunReport(run2, { cwd: dir, toolVersion: '9.9.9', dryRun: false, retryFrozen: retry1.added });
+  const loaded = await loadLastRunReport(dir);
+  assert.deepStrictEqual(loaded.retryFrozen, ['axios', 'react']);
+
+  const retry2 = computeRetryFailedIgnores(loaded);
+  assert.deepStrictEqual([...retry2.added].sort(), ['axios', 'esbuild', 'react']);
+  assert.strictEqual(retry2.carriedOver, 2);
+
+  // A normal run starts the chain over.
+  await persistLastRunReport(run2, { cwd: dir, toolVersion: '9.9.9', dryRun: false });
+  assert.strictEqual((await loadLastRunReport(dir)).retryFrozen, undefined);
+});
+
+test('materializeIgnoreForTarget: root:: keys apply to an unlabeled (root-only) target', () => {
+  const ignore = new Set(['root::typescript', '@org/web::axios', 'lodash']);
+  const rootOnly = materializeIgnoreForTarget(ignore, undefined);
+  assert.ok(rootOnly.has('typescript'));
+  assert.ok(rootOnly.has('lodash'));
+  assert.ok(!rootOnly.has('axios'));
 });

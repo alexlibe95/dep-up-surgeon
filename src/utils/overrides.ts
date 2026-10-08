@@ -199,6 +199,13 @@ function collectOverrideBlock(
       // Leaf: a direct `name` OR a chain key for pnpm/yarn.
       const chain = parseChainKey(k, manager);
       pushEntry(into.entries, chain, v);
+    } else if (
+      (manager === 'pnpm' || manager === 'yarn') &&
+      (typeof v === 'number' || typeof v === 'boolean')
+    ) {
+      // YAML reads an unquoted `qs: 6` as a number. It is still a pin, so a conflict or the
+      // `previous` value must not go unnoticed.
+      pushEntry(into.entries, parseChainKey(k, manager), String(v));
     } else if ((manager === 'npm' || manager === 'bun') && isPlainObject(v)) {
       // npm nested object form. Walk it recursively so grandchildren (`foo>bar>baz` in npm
       // parlance = `{ foo: { bar: { baz: "X" } } }`) are flattened into a single chain.
@@ -388,6 +395,7 @@ function chainsEqual(a: string[], b: string[]): boolean {
 function removeChainFromNpmNested(
   block: Record<string, unknown>,
   chain: string[],
+  collapseSelfPin = false,
 ): boolean {
   if (chain.length === 0) return false;
   const [head, ...tail] = chain;
@@ -420,10 +428,14 @@ function removeChainFromNpmNested(
   // Internal node: descend. `value` must be a nested object for the chain to be meaningful.
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const child = { ...(value as Record<string, unknown>) };
-  const ok = removeChainFromNpmNested(child, tail);
+  const ok = removeChainFromNpmNested(child, tail, collapseSelfPin);
   if (!ok) return false;
-  if (Object.keys(child).length === 0) {
+  const keys = Object.keys(child);
+  if (keys.length === 0) {
     delete block[head!];
+  } else if (collapseSelfPin && keys.length === 1 && typeof child['.'] === 'string') {
+    // Only the self-pin is left: `{".": "1.0.0"}` back to the `"1.0.0"` it was promoted from.
+    block[head!] = child['.'];
   } else {
     block[head!] = child;
   }
@@ -437,7 +449,9 @@ function removeChainFromNpmNested(
  *
  * When `entry.parentChain` is non-empty the write is **parent-scoped**:
  *   - npm writes a nested object (`{parent: {child: "X"}}`), creating intermediate levels as
- *     needed and preserving sibling keys at every level.
+ *     needed and preserving sibling keys at every level. Pinning a package whose slot already
+ *     holds child pins (`{"foo": {".": "1", "bar": "2"}}`) sets its `"."` instead, so the
+ *     children survive — for flat pins too.
  *   - pnpm writes a flat `"parent>child"` key (pnpm's native chain encoding).
  *   - yarn writes a flat `"parent/child"` key. Scoped names are kept intact thanks to the
  *     chain being an array rather than a pre-encoded string.
@@ -488,7 +502,7 @@ export function applyOverrideInMemory(
       : {};
 
   if (chain.length === 1) {
-    rootBlock[chain[0]!] = entry.range;
+    rootBlock[chain[0]!] = withSelfPin(rootBlock[chain[0]!], entry.range);
     next[field] = rootBlock;
     return next;
   }
@@ -509,9 +523,19 @@ export function applyOverrideInMemory(
     }
     cursor = cursor[seg] as Record<string, unknown>;
   }
-  cursor[chain[chain.length - 1]!] = entry.range;
+  const leaf = chain[chain.length - 1]!;
+  cursor[leaf] = withSelfPin(cursor[leaf], entry.range);
   next[field] = rootBlock;
   return next;
+}
+
+/**
+ * npm value for pinning a package that may already carry child pins: an object
+ * (`{".": "1.0.0", "bar": "2.0.0"}`) keeps its children and gets the pin as its `"."`
+ * self-selector; anything else is replaced by the plain range.
+ */
+function withSelfPin(existing: unknown, range: string): unknown {
+  return isPlainObject(existing) ? { ...existing, '.': range } : range;
 }
 
 /**
@@ -599,19 +623,36 @@ export interface ApplyOverrideToFileOptions {
    * then kept only if it cannot resolve to a vulnerable version — see `decideOverride`.
    */
   vulnerableRange?: string;
+  /**
+   * `undo` putting back a pin the run replaced: write `entry.range` whatever the existing pin
+   * is. A revert may move the pin backwards; that is the point of it.
+   */
+  restore?: boolean;
 }
 
 /**
  * Disk-level convenience: read the package.json, compute the decision, write the new pin when
  * appropriate, and return a structured result. Rewrites keep the file's indentation, line
- * endings and trailing newline. For pnpm, when `pnpm-workspace.yaml` next to package.json has
- * a top-level `overrides` key, the existing pin is read from (and the new pin written to) that
- * file instead, with its comments preserved.
+ * endings and trailing newline. For pnpm, when `pnpm-workspace.yaml` sits next to package.json
+ * and either has a top-level `overrides` key or package.json has no `pnpm.overrides` block, the
+ * existing pin is read from (and the new pin written to) that file instead, with its comments
+ * preserved: pnpm 10+ reads it and pnpm 11 ignores `pnpm.overrides`. A `packageManager` of
+ * pnpm 9 or older keeps new pins in package.json. Bun only honors top-level overrides, so a
+ * parent-scoped pin is refused for it.
  */
 export async function applyOverrideToFile(
   opts: ApplyOverrideToFileOptions,
 ): Promise<ApplyOverrideResult> {
   const field = overrideFieldFor(opts.manager);
+  const wantChain = [...(opts.entry.parentChain ?? []), opts.entry.name];
+  if (opts.manager === 'bun' && wantChain.length > 1) {
+    return {
+      ok: false,
+      written: false,
+      field,
+      reason: `bun only supports top-level overrides; parent-scoped pin "${wantChain.join('>')}" not applied (pin "${opts.entry.name}" flat instead)`,
+    };
+  }
   let raw: string;
   try {
     raw = await fs.readFile(opts.packageJsonPath, 'utf8');
@@ -640,7 +681,9 @@ export async function applyOverrideToFile(
   }
 
   // pnpm 10+ also reads `overrides` from pnpm-workspace.yaml (pnpm 11 only from there). When the
-  // project keeps its pins there, that is where the existing pin lives and the new one belongs.
+  // project keeps its pins there, that is where the existing pin lives and the new one belongs;
+  // so does a first pin, unless package.json already has a `pnpm.overrides` block. A pin that
+  // already exists is rewritten where it lives (package.json only when the YAML lacks it).
   const workspace =
     opts.manager === 'pnpm'
       ? await readPnpmWorkspace(path.dirname(opts.packageJsonPath))
@@ -648,7 +691,18 @@ export async function applyOverrideToFile(
   if (workspace && !workspace.ok) {
     return { ok: false, written: false, field, reason: workspace.reason };
   }
-  const yamlTarget = workspace?.holdsOverrides ? workspace : undefined;
+  const pnpmKey = encodeChainKey(wantChain, 'pnpm');
+  const pkgBlock = isPlainObject(pkg.pnpm) ? pkg.pnpm.overrides : undefined;
+  const pkgHasKey = isPlainObject(pkgBlock) && pnpmKey in pkgBlock;
+  const yamlBlock = workspace?.doc.get('overrides');
+  const yamlHasKey = YAML.isMap(yamlBlock) && yamlBlock.has(pnpmKey);
+  const yamlTarget =
+    workspace &&
+    (yamlHasKey ||
+      (!pkgHasKey &&
+        (workspace.holdsOverrides || (pkgBlock === undefined && !pinsPnpmBefore10(pkg)))))
+      ? workspace
+      : undefined;
 
   // Read existing pin so we can decide skip / write / conflict. Match on the EXACT chain,
   // not just the name — a flat `foo` pin and a parent-scoped `bar>foo` pin are separate
@@ -656,9 +710,16 @@ export async function applyOverrideToFile(
   const read = yamlTarget
     ? readOverrides(undefined, opts.manager, { pnpmWorkspace: yamlTarget.doc.toJS() })
     : readOverrides(pkg, opts.manager);
-  const wantChain = [...(opts.entry.parentChain ?? []), opts.entry.name];
   const existing = read.entries.find((e) => chainsEqual(e.chain, wantChain));
-  const decision = decideOverride(existing?.range, opts.entry.range, opts.vulnerableRange);
+  const decision: OverrideDecision = !opts.restore
+    ? decideOverride(existing?.range, opts.entry.range, opts.vulnerableRange)
+    : existing?.range === opts.entry.range
+      ? { action: 'skip', reason: 'already pinned to target', previous: existing.range }
+      : {
+          action: 'write',
+          ...(existing ? { previous: existing.range } : {}),
+          applied: opts.entry.range,
+        };
 
   if (decision.action === 'skip') {
     return {
@@ -685,14 +746,12 @@ export async function applyOverrideToFile(
   let content: string;
   if (yamlTarget) {
     file = yamlTarget.file;
-    const key = encodeChainKey(wantChain, 'pnpm');
-    const block = yamlTarget.doc.get('overrides');
-    if (YAML.isMap(block)) {
-      block.set(key, opts.entry.range);
+    if (YAML.isMap(yamlBlock)) {
+      yamlBlock.set(pnpmKey, opts.entry.range);
     } else {
-      yamlTarget.doc.set('overrides', yamlTarget.doc.createNode({ [key]: opts.entry.range }));
+      yamlTarget.doc.set('overrides', yamlTarget.doc.createNode({ [pnpmKey]: opts.entry.range }));
     }
-    content = withEolOf(yamlTarget.raw, String(yamlTarget.doc));
+    content = withEolOf(yamlTarget.raw, yamlTarget.doc.toString({ lineWidth: 0 }));
   } else {
     content = stringifyJsonLike(raw, applyOverrideInMemory(pkg, opts.manager, opts.entry));
   }
@@ -717,20 +776,51 @@ export async function applyOverrideToFile(
   return result;
 }
 
+/** True when package.json's `packageManager` names pnpm 9 or older, which ignores the YAML pins. */
+function pinsPnpmBefore10(pkg: Record<string, unknown>): boolean {
+  const m = typeof pkg.packageManager === 'string' ? /^pnpm@(\d+)\./.exec(pkg.packageManager) : null;
+  return m ? Number(m[1]) < 10 : false;
+}
+
 /**
- * Inverse of `applyOverrideToFile` — delete a single override entry. Used by the rollback
- * path when the install + validator fails AFTER we added a pin.
+ * The pin currently stored for exactly `chain`, as `undo` needs it to spot drift: package.json
+ * plus, for pnpm, pnpm-workspace.yaml. `undefined` when there is none (or a file can't be read).
+ */
+export async function readOverridePin(
+  packageJsonPath: string,
+  manager: PackageManager,
+  chain: string[],
+): Promise<string | undefined> {
+  let pkg: unknown;
+  try {
+    pkg = JSON.parse(await fs.readFile(packageJsonPath, 'utf8'));
+  } catch {
+    return undefined;
+  }
+  const workspace =
+    manager === 'pnpm' ? await readPnpmWorkspace(path.dirname(packageJsonPath)) : undefined;
+  const read = readOverrides(pkg, manager, {
+    ...(workspace?.ok ? { pnpmWorkspace: workspace.doc.toJS() } : {}),
+  });
+  return read.entries.find((e) => chainsEqual(e.chain, chain))?.range;
+}
+
+/**
+ * Inverse of `applyOverrideToFile` — delete a single override entry. Used by `undo` to drop a
+ * pin the recorded run added.
  *
  * `target` can be a bare package name (drops the flat top-level entry, legacy API) or a
  * structured `{ chain: string[] }` selector (drops a parent-scoped entry matching the exact
  * chain). When a parent-scoped write was adjacent to a sibling-writing flat pin, we leave the
  * sibling intact; same-level empty objects are pruned recursively so the file shrinks back to
- * what existed before the write.
+ * what existed before the write. With `collapseSelfPin` (npm), a parent left holding only its
+ * `"."` self-pin goes back to the plain string the write promoted it from.
  */
 export async function removeOverrideFromFile(
   packageJsonPath: string,
   manager: PackageManager,
   target: string | { chain: string[] },
+  options: { collapseSelfPin?: boolean } = {},
 ): Promise<{ ok: boolean; removed: boolean; reason?: string }> {
   const chain =
     typeof target === 'string' ? [target] : [...target.chain];
@@ -747,7 +837,8 @@ export async function removeOverrideFromFile(
     if (workspace?.ok && YAML.isMap(block) && block.has(key)) {
       block.delete(key);
       try {
-        await fs.writeFile(workspace.file, withEolOf(workspace.raw, String(workspace.doc)), 'utf8');
+        const text = withEolOf(workspace.raw, workspace.doc.toString({ lineWidth: 0 }));
+        await fs.writeFile(workspace.file, text, 'utf8');
       } catch (e) {
         return { ok: false, removed: false, reason: `write failed: ${e instanceof Error ? e.message : String(e)}` };
       }
@@ -815,7 +906,7 @@ export async function removeOverrideFromFile(
     const block = pkg[field];
     if (block && typeof block === 'object' && !Array.isArray(block)) {
       const nextRoot = { ...(block as Record<string, unknown>) };
-      removed = removeChainFromNpmNested(nextRoot, chain);
+      removed = removeChainFromNpmNested(nextRoot, chain, Boolean(options.collapseSelfPin));
       if (Object.keys(nextRoot).length === 0) {
         delete pkg[field];
       } else {

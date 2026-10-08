@@ -83,12 +83,53 @@ test('parseEresolveFallback extracts peer-from tuples from a full ERESOLVE block
     'npm error peer typescript@">=5.9 <6.0" from @angular/build@21.2.8',
   ].join('\n');
   const a = parseEresolveFallback(block);
-  // At minimum: both Angular peers extracted (peer + peerOptional, dedup'd by raw line).
+  // The unsatisfied @angular/build peer is extracted (listed under both `Found:` and `Could not
+  // resolve dependency:`, deduped). @angular/compiler-cli's peerOptional range is satisfied by the
+  // found typescript@6.0.3, so it's part of the current tree, not the conflict.
   const byDep = a.filter((c) => c.dependency === 'typescript');
-  assert.ok(byDep.length >= 2, `expected >=2 typescript tuples, got ${byDep.length}`);
-  const ranges = new Set(byDep.map((c) => c.requiredRange));
-  assert.ok(ranges.has('>=5.9 <6.0'), 'missing @angular/build peer range');
-  assert.ok(ranges.has('>=5.9 <6.1'), 'missing @angular/compiler-cli peerOptional range');
+  assert.deepStrictEqual(
+    byDep.map((c) => [c.depender, c.requiredRange]),
+    [['@angular/build@21.2.8', '>=5.9 <6.0']],
+  );
+});
+
+test('satisfied dependents in an npm `Found:` block are not conflicts', () => {
+  // react-dom@19 needs react ^19; the dependents listed under `Found: react@18.3.1` (incl. the
+  // nested @mui/material → @emotion/react chain) are all satisfied and must not become blockers.
+  const block = [
+    'npm error code ERESOLVE',
+    'npm error ERESOLVE unable to resolve dependency tree',
+    'npm error',
+    'npm error While resolving: my-app@1.0.0',
+    'npm error Found: react@18.3.1',
+    'npm error node_modules/react',
+    'npm error   react@"^18.3.1" from the root project',
+    'npm error   peer react@">=16.8.0" from @emotion/react@11.11.0',
+    'npm error   node_modules/@emotion/react',
+    'npm error     @emotion/react@"^11.11.0" from the root project',
+    'npm error     peer @emotion/react@"^11.5.0" from @mui/material@5.14.0',
+    'npm error     node_modules/@mui/material',
+    'npm error       @mui/material@"^5.14.0" from the root project',
+    'npm error   peer react@"^16.8.0 || ^17.0.0" from legacy-widget@2.0.0',
+    'npm error',
+    'npm error Could not resolve dependency:',
+    'npm error peer react@"^19.0.0" from react-dom@19.0.0',
+    'npm error node_modules/react-dom',
+    'npm error   react-dom@"^19.0.0" from the root project',
+  ].join('\n');
+  const edges = (list) =>
+    list
+      .map((c) => `${c.dependency}@${c.requiredRange} <- ${c.depender}`)
+      .sort();
+  const expected = [
+    'react@^16.8.0 || ^17.0.0 <- legacy-widget@2.0.0', // in `Found:` but already broken: kept
+    'react@^19.0.0 <- react-dom@19.0.0',
+  ];
+  assert.deepStrictEqual(edges(parseConflictsFromNpmOutput(block)), expected);
+  assert.deepStrictEqual(edges(parseEresolveFallback(block)), expected);
+  const classified = extractClassifiedConflicts(block, { rootPackageName: 'my-app' });
+  assert.ok(classifiedHasPeerLikeFailure(classified));
+  assert.ok(!classified.some((c) => /@emotion|@mui/.test(`${c.depender} ${c.dependency}`)));
 });
 
 test('parseEresolveFallback falls back to unknown marker when no peer tuples match', () => {

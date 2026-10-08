@@ -6,7 +6,8 @@
  * Exit-code contract:
  *   - reverse pass succeeded (or noop) → 0
  *   - persisted run file not found / can't be parsed → 2
- *   - install or validator failed during the reverse pass → 1
+ *   - install or validator failed during the reverse pass, or none of the report's
+ *     package.json files exist here (wrong directory / checkout) → 1
  */
 import path from 'node:path';
 import { Command } from 'commander';

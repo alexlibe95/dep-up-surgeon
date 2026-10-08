@@ -156,3 +156,28 @@ test('scanForBreakingChanges: case-insensitive matching on BREAKING', () => {
     assert.equal(r.hasBreaking, true, `matched "${body}"`);
   }
 });
+
+test('scanForBreakingChanges: a "Breaking Changes" heading over an empty / None / N/A section is NOT flagged', () => {
+  for (const body of [
+    '## Breaking Changes\n\n## Features\n- add `retry` option',
+    '### ⚠ BREAKING CHANGES\n\nNone\n\n### Bug Fixes\n- fix crash',
+    '### Breaking changes\n- N/A\n### Fixes\n- fix',
+    '**Breaking Changes:**\n\n_None._\n\n**Features**\n- new flag',
+    '## 💥 Breaking Changes\n\nNo breaking changes in this release.\n',
+    'Some intro\n\n## Breaking Changes',
+  ]) {
+    const r = scanForBreakingChanges(body);
+    assert.equal(r.hasBreaking, false, `false positive on ${JSON.stringify(body)} (${r.matchedLines.join(' | ')})`);
+  }
+});
+
+test('scanForBreakingChanges: a "Breaking Changes" heading with content is still flagged', () => {
+  const r = scanForBreakingChanges('### ⚠ BREAKING CHANGES\n\n* **config:** the loader is now async\n\n### Features\n- x');
+  assert.equal(r.hasBreaking, true);
+  assert.match(r.matchedLines[0], /BREAKING CHANGES/);
+});
+
+test('scanForBreakingChanges: surfaced lines keep GitHub mentions / issue refs neutralized', () => {
+  const r = scanForBreakingChanges('- BREAKING CHANGE: drop `v1` API by @alice in #12, closes #3');
+  assert.deepEqual(r.matchedLines, ['BREAKING CHANGE: drop v1 API by `@alice` in `#12`, closes `#3`']);
+});

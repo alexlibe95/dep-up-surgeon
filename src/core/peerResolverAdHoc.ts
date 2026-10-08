@@ -22,11 +22,12 @@
  *   - We never ADD packages to `package.json`. The ad-hoc group is filtered down to
  *     packages the workspace already declares as a direct dep. Peers on transitives stay
  *     unresolved → caller falls back to the standard rollback.
- *   - We never pull a blocker FORWARD past its currently pinned range. The resolver's
- *     `buildDomain()` already respects `currentRange` as the lower bound, but we also cap
- *     the `requestedTarget` for blockers at the newest version that satisfies the existing
- *     range — ad-hoc resolution is allowed to downgrade the *target* of the bump, never to
- *     secretly also bump an unrelated dep that happened to appear in the peer graph.
+ *   - We never pull a blocker FORWARD past its currently pinned range, nor BELOW the version
+ *     the lockfile has installed for it. `buildDomain()` floors each domain at the installed
+ *     version (else `currentRange`'s minimum), and we cap the `requestedTarget` for blockers
+ *     at the newest version that satisfies the existing range — ad-hoc resolution is allowed
+ *     to downgrade the *target* of the bump, never to secretly also bump (or roll back) an
+ *     unrelated dep that happened to appear in the peer graph.
  *   - The ad-hoc group is capped at `maxAdHocMembers` (default 6) to keep registry fetch
  *     costs bounded. Beyond that the savings vanish (huge peer graphs with lots of blockers
  *     usually need manual attention) and the resolver would timeout anyway.
@@ -68,10 +69,17 @@ export interface AdHocResolveInput {
   /** Let blockers declared only in `peerDependencies` move (`--include-peers`). Default `false`. */
   includePeers?: boolean;
   /**
-   * Installed versions (lockfile). Floors the primary's domain (needed for `catalog:` ranges) and
-   * checks peers on packages outside the group against what's installed, not the range floor.
+   * Installed versions (lockfile). Floor every member's domain at what's installed (the primary's
+   * `catalog:` range needs it; a blocker must never be modelled — or moved — below its installed
+   * version) and check peers on packages outside the group against what's installed, not the
+   * range floor.
    */
   lockfileVersions?: LockfileVersionTree;
+  /**
+   * The workspace's directory relative to the lockfile's (`packages/web`; omit or `.` for the
+   * root), so installed versions come from this importer's own lockfile entries.
+   */
+  memberRelDir?: string;
 }
 
 export interface AdHocResolveResult {
@@ -99,7 +107,8 @@ type DepSection = 'dependencies' | 'devDependencies' | 'peerDependencies' | 'opt
 export async function tryResolveAdHocPeerConflict(
   input: AdHocResolveInput,
 ): Promise<AdHocResolveResult | undefined> {
-  const { primary, primaryTarget, classified, pkg, registryCache, lockfileVersions } = input;
+  const { primary, primaryTarget, classified, pkg, registryCache, lockfileVersions, memberRelDir } =
+    input;
   const maxMembers = input.maxAdHocMembers ?? 6;
 
   const directDeps = indexDirectDeps(pkg);
@@ -140,10 +149,28 @@ export async function tryResolveAdHocPeerConflict(
   blockers.sort((a, b) => a.name.localeCompare(b.name));
   const capped = blockers.slice(0, Math.max(1, maxMembers - 1));
 
+  // One packument per member, shared by the blocker caps and the domains below (callers may not
+  // pass a registry cache).
+  const peersByName = new Map<string, Awaited<ReturnType<typeof fetchVersionPeers>>>();
+  const peersOf = async (name: string) => {
+    let peers = peersByName.get(name);
+    if (!peers) {
+      peers = await fetchVersionPeers(name, registryCache);
+      peersByName.set(name, peers);
+    }
+    return peers;
+  };
+  // This importer's installed version (lockfile). It floors every member's domain: the primary's
+  // so a `catalog:` range has one, a blocker's so it's modelled where it actually is — at its
+  // range floor, `@react-three/fiber@^9.0.0` (9.7.0 installed) would "solve" a react bump by
+  // dropping to 9.3.0, a downgrade npm wouldn't even perform.
+  const installedOf = (name: string, range: string): string | undefined =>
+    installedVersionFor(name, range, lockfileVersions, memberRelDir);
+
   // Assemble resolver inputs: primary + each blocker. For blockers we use the newest
   // version **compatible with the existing range** as the upper bound — we never silently
   // upgrade a blocker past what the user pinned.
-  const primaryInstalled = installedVersionFor(primary.name, primary.currentRange, lockfileVersions);
+  const primaryInstalled = installedOf(primary.name, primary.currentRange);
   const inputs: ResolverInput[] = [
     {
       name: primary.name,
@@ -153,9 +180,16 @@ export async function tryResolveAdHocPeerConflict(
     },
   ];
   for (const b of capped) {
-    const currentMax = await resolveExistingUpperBound(b.name, b.range, registryCache);
+    const installed = installedOf(b.name, b.range);
+    const published = [...(await peersOf(b.name)).keys()];
+    const currentMax = await resolveExistingUpperBound(b.name, b.range, published, installed, registryCache);
     if (!currentMax) continue;
-    inputs.push({ name: b.name, currentRange: b.range, requestedTarget: currentMax });
+    inputs.push({
+      name: b.name,
+      currentRange: b.range,
+      requestedTarget: currentMax,
+      ...(installed ? { installedVersion: installed } : {}),
+    });
   }
 
   // After filtering, we need at least one blocker alongside the primary — otherwise the
@@ -165,7 +199,7 @@ export async function tryResolveAdHocPeerConflict(
 
   const domains: CandidateDomain[] = [];
   for (const inp of inputs) {
-    const peers = await fetchVersionPeers(inp.name, registryCache);
+    const peers = await peersOf(inp.name);
     if (peers.size === 0) return undefined;
     const d = buildDomain(inp, peers);
     if (d.versions.length === 0) return undefined;
@@ -184,21 +218,22 @@ export async function tryResolveAdHocPeerConflict(
   const resolved = resolvePeerRanges(domains, requested, {
     externalInstalled,
     ...(lockfileVersions ? { lockfileVersions } : {}),
+    ...(memberRelDir !== undefined ? { memberRelDir } : {}),
   });
   if (!resolved) return undefined;
 
-  // Build the `bumps` list. A blocker whose resolved version EQUALS the value already in
-  // `package.json` (i.e. the resolver didn't ask us to move it) is omitted — no point
-  // writing an identical range back.
+  // Build the `bumps` list. A blocker the resolver left where it already is — its installed
+  // version, or the range floor without a lockfile — is omitted: no point writing an
+  // identical range back.
   const bumps: AdHocResolveResult['bumps'] = [];
   for (const inp of inputs) {
     const resolvedVersion = resolved.versions.get(inp.name);
     if (!resolvedVersion) continue;
     const isPrimary = inp.name === primary.name;
     const currentPin = isPrimary ? primary.currentRange : capped.find((b) => b.name === inp.name)?.range ?? inp.currentRange;
-    const currentFloor = safeMin(currentPin);
-    if (!isPrimary && currentFloor && resolvedVersion === currentFloor) {
-      // Blocker stayed at its current floor — no mutation needed.
+    const current = inp.installedVersion ?? safeMin(currentPin);
+    if (!isPrimary && current && resolvedVersion === current) {
+      // Blocker stays put — no mutation needed.
       continue;
     }
     bumps.push({
@@ -209,10 +244,14 @@ export async function tryResolveAdHocPeerConflict(
     });
   }
 
-  // If the only bump left is the primary AND the resolver chose the original target, there's
-  // nothing new to try → bail out so the engine doesn't spin on an identical retry.
+  // If the only bump left is the primary AND the resolver chose the original target, or the
+  // version that's already installed (a blocker caps it right where it is), there's nothing new
+  // to try → bail out so the engine doesn't spin on an identical retry; its rollback keeps the
+  // primary where it is and reports the blocker.
   const onlyPrimaryUnchanged =
-    bumps.length === 1 && bumps[0]!.isPrimary && bumps[0]!.to === primaryTarget;
+    bumps.length === 1 &&
+    bumps[0]!.isPrimary &&
+    (bumps[0]!.to === primaryTarget || bumps[0]!.to === primaryInstalled);
   if (onlyPrimaryUnchanged) return undefined;
 
   const reason = describeResolution(resolved, inputs);
@@ -252,31 +291,45 @@ function indexDirectDeps(pkg: PackageJson): Map<string, DirectDep> {
 }
 
 /**
- * Given a pinned range like `^17.0.0`, return the newest published version that still
- * satisfies it. Used to cap blocker `requestedTarget` at "the newest compatible release" so
- * the ad-hoc resolver never silently bumps a blocker past its current range.
+ * Given a pinned range like `^17.0.0`, return the newest version the blocker may move to
+ * without leaving it. Used to cap blocker `requestedTarget` at "the newest compatible release"
+ * so the ad-hoc resolver never silently bumps a blocker past its current range:
  *
- * Returns `undefined` when the registry fetch fails OR when no published version satisfies
- * the range (rare — usually means the lockfile references a deleted / unpublished version).
+ *   - the registry `latest` dist-tag when it satisfies the pin;
+ *   - otherwise (a newer major is out, or the lookup failed) the newest `published` version
+ *     that does — not the range floor, which would model `eslint@^7` at 7.0.0 while 7.32.0
+ *     is installed;
+ *   - never below `installed` (a blocker already past `latest` stays where it is).
+ *
+ * Falls back to `installed`, then the range floor, when nothing published satisfies the range;
+ * `undefined` when neither exists either (e.g. a `workspace:` range).
  */
 async function resolveExistingUpperBound(
   name: string,
   range: string,
+  published: string[],
+  installed: string | undefined,
   registryCache: RegistryCache | undefined,
 ): Promise<string | undefined> {
+  let upper: string | undefined;
   try {
-    // `fetchLatestVersion` returns the registry's `latest` dist-tag. If it already satisfies
-    // the pin (rare, but happens for packages at a wildcard like `*`), we use it directly.
-    // Otherwise we fall back to the floor of the current range — `semver.minVersion(range)`
-    // — which is always a valid published version (modulo deleted tarballs).
     const latest = await fetchLatestVersion(name, registryCache);
     if (semver.valid(latest) && safeSatisfies(latest, range)) {
-      return latest;
+      upper = latest;
     }
   } catch {
-    // Network / registry miss — fall through to the floor.
+    // Network / registry miss — fall through to the packument.
   }
-  return safeMin(range);
+  upper ??= safeMaxSatisfying(published, range) ?? installed ?? safeMin(range);
+  return upper && installed && semver.gt(installed, upper) ? installed : upper;
+}
+
+function safeMaxSatisfying(versions: string[], range: string): string | undefined {
+  try {
+    return semver.maxSatisfying(versions.filter((v) => semver.valid(v)), range) ?? undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function safeMin(range: string): string | undefined {

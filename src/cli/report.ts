@@ -25,6 +25,8 @@ export interface StructuredReport {
   preflightAborted?: boolean;
   /** Tracked files the run rewrote besides dependency files (e.g. tsconfig.json), restored at the end. */
   restoredFiles?: string[];
+  /** `--security-only` advisories on packages no direct dependency names. */
+  transitiveAdvisories?: FinalReport['transitiveAdvisories'];
   /** Detected package manager + workspace topology. */
   project?: ProjectInfoReport;
   /** Targets that were processed in this run (root and/or workspace members). */
@@ -79,6 +81,7 @@ export function buildStructuredReport(
     ...(report.preflight ? { preflight: report.preflight } : {}),
     ...(report.preflightAborted ? { preflightAborted: true } : {}),
     ...(report.restoredFiles?.length ? { restoredFiles: report.restoredFiles } : {}),
+    ...(report.transitiveAdvisories?.length ? { transitiveAdvisories: report.transitiveAdvisories } : {}),
     ...(report.project ? { project: report.project } : {}),
     ...(report.targets ? { targets: report.targets } : {}),
     ...(report.ignored?.length ? { ignored: report.ignored } : {}),

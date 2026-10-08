@@ -129,3 +129,21 @@ test('lockfileBasenamesFor: includes bun.lockb and npm-shrinkwrap.json', () => {
   assert.deepStrictEqual(lockfileBasenamesFor('npm'), ['package-lock.json', 'npm-shrinkwrap.json']);
   assert.deepStrictEqual(lockfileBasenamesFor('pnpm'), ['pnpm-lock.yaml']);
 });
+
+test('gitFlow: commitPostRun commits what the override / dedupe steps changed (yarn PnP too)', async () => {
+  const repo = await makeRepo();
+  const setup = await createGitFlow(repo, FLOW, true, false);
+  assert.ok(setup.ok, setup.error);
+  // An override pin, a dedupe, and the zero-install map the yarn install rewrote.
+  await fs.writeFile(path.join(repo, 'package.json'), BUMPED);
+  await fs.writeFile(path.join(repo, 'yarn.lock'), '# lockfile v1\n# deduped\n');
+  await fs.writeFile(path.join(repo, '.pnp.cjs'), '// pnp\n');
+
+  await setup.controller.commitPostRun('yarn', repo, 'apply 1 override pin');
+
+  const rec = setup.controller.commits.at(-1);
+  assert.strictEqual(rec.ok, true, rec.error);
+  assert.match(rec.message, /^deps: apply 1 override pin/);
+  const { stdout } = await execa('git', ['show', '--name-only', '--format=', 'HEAD'], { cwd: repo });
+  assert.deepStrictEqual(stdout.trim().split('\n').sort(), ['.pnp.cjs', 'package.json', 'yarn.lock']);
+});

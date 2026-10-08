@@ -8,20 +8,25 @@
  *      successful upgrade (root + every workspace target).
  *   2. Drops override pins that this run added and, when the attempt recorded a `previous`
  *      value, restores the previous pin (i.e. if the advisory/manual pin REPLACED an
- *      existing override, we don't silently delete the original).
+ *      existing override, we don't silently delete the original). Attempts are unwound newest
+ *      first, so a slot pinned twice in one run ends at its pre-run value. Advisories fixed by
+ *      `npm update` (no pin) are left to the lockfile restore in step 3.
  *   3. Runs `<manager> install` so the lockfile reconverges to the reverted ranges.
  *   4. Runs the validator (unless `--no-validate`) so the operator knows the project builds
  *      with the reverted versions before they commit the undo.
  *
  * Safety contract:
  *   - If `package.json` has drifted since the recorded run (e.g. another upgrade changed the
- *     range), we **skip** that row with `reason: 'drifted'`. We never rewrite a range the
- *     user moved out from under us.
+ *     range, or the pin no longer holds the value the run wrote), we **skip** that row with
+ *     `reason: 'drifted'`. We never rewrite a range the user moved out from under us.
  *   - If the recorded run was `dryRun`, there's nothing to undo — we return a no-op report.
  *   - Lockfiles the run changed are restored from their pre-run backup before the reinstall,
  *     but only when every row reverted and the lockfile still hashes to what the run left
  *     behind. Otherwise the manager reinstalls from the reverted `package.json`, which keeps
  *     any version the old range still allows (`^16.3.1` keeps `16.3.5`).
+ *   - Every recorded path is taken relative to the recorded run's `cwd` and applied under
+ *     `opts.cwd`, so a report replayed in another checkout (`--file` from a CI artifact) edits
+ *     this checkout, never the recorded one.
  *
  * Everything heavy (install, validator) is injected via `opts.installer` / `opts.runValidator`
  * so unit tests can exercise the reverse pass without network / process calls.
@@ -37,19 +42,20 @@ import {
   writeCatalogRange,
 } from '../utils/catalog.js';
 import {
+  applyOverrideToFile,
+  readOverridePin,
   readOverrides,
   removeOverrideFromFile,
-  applyOverrideInMemory,
   type OverrideEntry,
 } from '../utils/overrides.js';
 import { writeJsonLike } from '../utils/jsonFile.js';
 import { runInstall } from '../utils/npm.js';
 import { log } from '../utils/logger.js';
+import type { DepSection } from '../types.js';
 import type { PersistedLastRun } from './lastRun.js';
-import { lastRunReportPath, loadLastRunReport, sha256 } from './lastRun.js';
+import { findLastRunReport, lastRunReportPath, legacyLastRunWarning, sha256 } from './lastRun.js';
 
-/** One slot in a `package.json` where dep ranges live. */
-type DepSection = 'dependencies' | 'devDependencies' | 'peerDependencies' | 'optionalDependencies';
+/** Every slot in a `package.json` where dep ranges live. */
 const DEP_SECTIONS: readonly DepSection[] = [
   'dependencies',
   'devDependencies',
@@ -84,7 +90,13 @@ export interface UndoOverrideRecord {
   previous?: string;
   ok: boolean;
   skipped: boolean;
-  reason?: 'dropped' | 'restored-previous' | 'not-present' | 'missing-package-json';
+  reason?:
+    | 'dropped'
+    | 'restored-previous'
+    | 'not-present'
+    | 'drifted'
+    | 'missing-package-json'
+    | 'write-failed';
   detail?: string;
 }
 
@@ -96,7 +108,13 @@ export interface UndoLockfileRecord {
 }
 
 export interface UndoResult {
+  /** The run report actually replayed. */
   sourceFile: string;
+  /**
+   * Caveats about the replayed report — e.g. it is an older version's project-root report,
+   * read because the cache one was missing. Already logged unless `json`.
+   */
+  warnings?: string[];
   /** True when the persisted run was `--dry-run` — the reverse pass is a no-op. */
   noop: boolean;
   /** Per-target dep revert outcomes. */
@@ -143,23 +161,39 @@ export interface UndoOptions {
  * recoverable errors — skipped / failed items are recorded on the result.
  */
 export async function runUndo(opts: UndoOptions): Promise<UndoResult> {
-  const file = opts.file ? path.resolve(opts.cwd, opts.file) : lastRunReportPath(opts.cwd);
-  const persisted = opts.file
-    ? await readPersisted(file)
-    : await loadLastRunReport(opts.cwd);
+  let file = opts.file ? path.resolve(opts.cwd, opts.file) : lastRunReportPath(opts.cwd);
+  let persisted: PersistedLastRun | undefined;
+  const warnings: string[] = [];
+  if (opts.file) {
+    persisted = await readPersisted(file);
+  } else {
+    const loaded = await findLastRunReport(opts.cwd);
+    if (loaded) {
+      file = loaded.file;
+      persisted = loaded.report;
+      const warning = legacyLastRunWarning(loaded);
+      if (warning) {
+        warnings.push(warning);
+        if (!opts.json) {
+          log.warn(`undo: ${warning}`);
+        }
+      }
+    }
+  }
   if (!persisted) {
     throw new Error(
       `undo: no run report found at ${file}. Pass --file <path> to point at a specific ` +
         'last-run report, or re-run dep-up-surgeon so it writes one.',
     );
   }
+  const head = { sourceFile: file, ...(warnings.length > 0 ? { warnings } : {}) };
 
   if (persisted.dryRun) {
     if (!opts.json) {
       log.info(`undo: the recorded run was a dry-run; nothing to revert.`);
     }
     return {
-      sourceFile: file,
+      ...head,
       noop: true,
       reverts: [],
       overrides: [],
@@ -206,6 +240,7 @@ export async function runUndo(opts: UndoOptions): Promise<UndoResult> {
       row.name,
       row.from,
       row.to,
+      row.section,
       opts.cwd,
       !opts.planOnly,
     );
@@ -229,9 +264,15 @@ export async function runUndo(opts: UndoOptions): Promise<UndoResult> {
   }
 
   // ---- 2. Drop / restore overrides ----------------------------------------
-  for (const att of persisted.overrides?.attempts ?? []) {
+  // Newest first: a slot the run pinned twice (an advisory pin, then a manual one) unwinds
+  // through its intermediate value back to the pre-run one.
+  const pkgJson = targets.get('root')?.packageJson ?? path.join(opts.cwd, 'package.json');
+  /** `planOnly`: the value each slot would hold after the rows planned so far. */
+  const planned = new Map<string, string | undefined>();
+  for (const att of [...(persisted.overrides?.attempts ?? [])].reverse()) {
     if (!att.ok || att.skipped) continue;
-    const pkgJson = targets.get('root')?.packageJson ?? path.join(opts.cwd, 'package.json');
+    // Fixed by `npm update` without writing a pin: the lockfile restore below reverts it.
+    if (att.method === 'lockfile-update') continue;
     if (!(await fs.pathExists(pkgJson))) {
       overrides.push({
         name: att.name,
@@ -243,83 +284,89 @@ export async function runUndo(opts: UndoOptions): Promise<UndoResult> {
       continue;
     }
     const chain = att.chain && att.chain.length > 0 ? [...att.chain] : [att.name];
-    let result: UndoOverrideRecord;
-    if (att.previous && att.previous !== att.applied) {
-      // Restore the pre-existing pin rather than deleting outright. This is the case where
-      // --apply-overrides REPLACED an existing override (e.g. we bumped 1.2.3 → 1.3.0); undo
-      // should put 1.2.3 back, not leave the transitive floating.
-      if (opts.planOnly) {
-        result = {
-          name: att.name,
-          chain,
-          ...(att.applied ? { applied: att.applied } : {}),
-          previous: att.previous,
-          ok: true,
-          skipped: false,
-          reason: 'restored-previous',
-          detail: `would restore ${att.previous}`,
-        };
-      } else {
-        const entry: OverrideEntry = { name: chain[chain.length - 1]!, range: att.previous };
-        if (chain.length > 1) entry.parentChain = chain.slice(0, -1);
-        // Undo deliberately bypasses `applyOverrideToFile`'s "skip if existing >= target"
-        // semantics — a revert is allowed to move the pin backwards; that's literally the
-        // whole point. We call `applyOverrideInMemory` directly and write the result.
-        const pkg = (await fs.readJson(pkgJson)) as Record<string, unknown>;
-        const next = applyOverrideInMemory(pkg, manager, entry);
-        await writeJsonLike(pkgJson, next);
-        editedTargets.add(opts.cwd);
-        result = {
-          name: att.name,
-          chain,
-          ...(att.applied ? { applied: att.applied } : {}),
-          previous: att.previous,
-          ok: true,
-          skipped: false,
-          reason: 'restored-previous',
-        };
+    const slot = chain.join('>');
+    // Restore the pre-existing pin rather than deleting outright when the run REPLACED an
+    // existing override (e.g. we bumped 1.2.3 → 1.3.0): undo should put 1.2.3 back, not leave
+    // the transitive floating.
+    const restore = att.previous && att.previous !== att.applied ? att.previous : undefined;
+    const base: UndoOverrideRecord = {
+      name: att.name,
+      chain,
+      ...(att.applied ? { applied: att.applied } : {}),
+      ...(restore ? { previous: restore } : {}),
+      ok: true,
+      skipped: false,
+      reason: restore ? 'restored-previous' : 'dropped',
+    };
+    const current = planned.has(slot)
+      ? planned.get(slot)
+      : await readOverridePin(pkgJson, manager, chain);
+    if (current === undefined) {
+      overrides.push({
+        ...base,
+        ok: false,
+        skipped: true,
+        reason: 'not-present',
+        detail: 'no pin for this slot any more',
+      });
+      continue;
+    }
+    if (att.applied !== undefined && current.trim() !== att.applied.trim()) {
+      overrides.push({
+        ...base,
+        ok: false,
+        skipped: true,
+        reason: 'drifted',
+        detail: `current pin is "${current}" but the run recorded "${att.applied}"; leaving as-is`,
+      });
+      continue;
+    }
+    if (opts.planOnly) {
+      planned.set(slot, restore);
+      overrides.push({ ...base, detail: restore ? `would restore ${restore}` : 'would drop' });
+      continue;
+    }
+    if (restore) {
+      const entry: OverrideEntry = { name: chain[chain.length - 1]!, range: restore };
+      if (chain.length > 1) entry.parentChain = chain.slice(0, -1);
+      // `restore` bypasses the "never lower an existing pin" rule — moving the pin backwards
+      // is the point — and writes wherever the pin lives (pnpm-workspace.yaml included).
+      const written = await applyOverrideToFile({
+        packageJsonPath: pkgJson,
+        manager,
+        entry,
+        restore: true,
+      });
+      if (!written.ok) {
+        overrides.push({
+          ...base,
+          ok: false,
+          skipped: true,
+          reason: 'write-failed',
+          ...(written.reason ? { detail: written.reason } : {}),
+        });
+        continue;
       }
     } else {
-      if (opts.planOnly) {
-        result = {
-          name: att.name,
-          chain,
-          ...(att.applied ? { applied: att.applied } : {}),
-          ok: true,
-          skipped: false,
-          reason: 'dropped',
-          detail: 'would drop',
-        };
-      } else {
-        const removed = await removeOverrideFromFile(pkgJson, manager, { chain });
-        if (removed.removed) {
-          editedTargets.add(opts.cwd);
-          result = {
-            name: att.name,
-            chain,
-            ...(att.applied ? { applied: att.applied } : {}),
-            ok: true,
-            skipped: false,
-            reason: 'dropped',
-          };
-        } else {
-          result = {
-            name: att.name,
-            chain,
-            ...(att.applied ? { applied: att.applied } : {}),
-            ok: false,
-            skipped: true,
-            reason: 'not-present',
-            ...(removed.reason ? { detail: removed.reason } : {}),
-          };
-        }
+      // npm: a parent the run promoted from `"x"` to `{".": "x", child}` goes back to `"x"`.
+      const removed = await removeOverrideFromFile(pkgJson, manager, { chain }, { collapseSelfPin: true });
+      if (!removed.removed) {
+        overrides.push({
+          ...base,
+          ok: false,
+          skipped: true,
+          reason: removed.ok ? 'not-present' : 'write-failed',
+          ...(removed.reason ? { detail: removed.reason } : {}),
+        });
+        continue;
       }
     }
-    overrides.push(result);
+    editedTargets.add(opts.cwd);
+    overrides.push(base);
   }
 
   // ---- 3. Restore pre-run lockfile bytes ----------------------------------
-  const rootCwd = persisted.cwd ?? opts.cwd;
+  const rootCwd = opts.cwd;
   const fullyReverted = reverts.every((r) => r.ok) && overrides.every((o) => o.ok);
   const lockfiles = await restoreLockfiles(persisted, rootCwd, fullyReverted, Boolean(opts.planOnly));
   if (!opts.planOnly && lockfiles.some((l) => l.restored)) {
@@ -352,7 +399,7 @@ export async function runUndo(opts: UndoOptions): Promise<UndoResult> {
   }
 
   return {
-    sourceFile: file,
+    ...head,
     noop: false,
     reverts,
     overrides,
@@ -375,9 +422,11 @@ async function restoreLockfiles(
 ): Promise<UndoLockfileRecord[]> {
   const records: UndoLockfileRecord[] = [];
   for (const snap of persisted.lockfiles ?? []) {
-    const lockPath = path.join(rootCwd, snap.file);
+    const lockPath = rebaseRecordedPath(snap.file, persisted.cwd, rootCwd);
     const current = await fs.readFile(lockPath).catch(() => null);
-    const backup = await fs.readFile(path.join(rootCwd, snap.backup)).catch(() => null);
+    const backup = await fs
+      .readFile(rebaseRecordedPath(snap.backup, persisted.cwd, rootCwd))
+      .catch(() => null);
     let detail: string | undefined;
     if (!fullyReverted) {
       detail = 'some rows were not reverted, so the pre-run lockfile no longer matches package.json';
@@ -410,41 +459,50 @@ async function readPersisted(file: string): Promise<PersistedLastRun | undefined
 }
 
 /**
- * Map workspace label → `{ cwd, packageJson }`. Falls back to the run's `cwd` when no
+ * Map workspace label → `{ cwd, packageJson }`, every path moved under `root` (the directory undo
+ * runs in) the way it sat under the recorded run's `cwd`. Falls back to `root` itself when no
  * targets block was persisted (single-root run).
  */
 function buildTargetMap(
   persisted: PersistedLastRun,
-  invokedAt: string,
+  root: string,
 ): Map<string, { cwd: string; packageJson: string }> {
   const map = new Map<string, { cwd: string; packageJson: string }>();
-  const targets = persisted.targets ?? [];
-  if (targets.length === 0) {
-    const rootCwd = persisted.cwd ?? invokedAt;
-    map.set('root', {
-      cwd: rootCwd,
-      packageJson: path.join(rootCwd, 'package.json'),
+  for (const t of persisted.targets ?? []) {
+    map.set(t.label, {
+      cwd: rebaseRecordedPath(t.cwd, persisted.cwd, root),
+      packageJson: rebaseRecordedPath(t.packageJson, persisted.cwd, root),
     });
-    return map;
-  }
-  for (const t of targets) {
-    map.set(t.label, { cwd: t.cwd, packageJson: t.packageJson });
   }
   if (!map.has('root')) {
-    const rootCwd = persisted.cwd ?? invokedAt;
-    map.set('root', {
-      cwd: rootCwd,
-      packageJson: path.join(rootCwd, 'package.json'),
-    });
+    map.set('root', { cwd: root, packageJson: path.join(root, 'package.json') });
   }
   return map;
 }
 
 /**
- * Revert `name` back to `from` in whichever dep section currently holds it. Returns the
- * modified `pkg` object alongside metadata about what section we touched. If the current
- * range doesn't match the recorded `to`, we skip with `drifted` — the user modified the
- * range out from under us and rewriting would be destructive.
+ * Where a path the recorded run wrote down lives in this checkout: relative to the recorded
+ * `cwd`, joined onto `root`. Separators are normalized, so a report written on Windows replays
+ * on POSIX and back. A relative path (e.g. a lockfile backup) is already root-relative; an
+ * absolute one from a report without `cwd` (very old) is kept as is.
+ */
+function rebaseRecordedPath(recorded: string, recordedRoot: string | undefined, root: string): string {
+  const slash = (p: string) => p.replace(/\\/g, '/');
+  const absolute = path.posix.isAbsolute(slash(recorded)) || path.win32.isAbsolute(recorded);
+  if (absolute && !recordedRoot) {
+    return recorded;
+  }
+  const rel = absolute ? path.posix.relative(slash(recordedRoot!), slash(recorded)) : slash(recorded);
+  return path.join(root, ...rel.split('/'));
+}
+
+/**
+ * Revert `name` back to `from` in the dep section the run wrote: `section` when the row
+ * recorded it, else the first section whose current value is the recorded `to` (a package can
+ * sit in several sections, e.g. `devDependencies` + `peerDependencies`). Returns the modified
+ * `pkg` object alongside metadata about what section we touched. If no section holds `to`, we
+ * skip with `drifted` — the user modified the range out from under us and rewriting would be
+ * destructive.
  *
  * We do NOT assert the recorded `from` matches the version before the run; the run itself
  * wrote it, so treating its `from` value as authoritative is exactly what the user wants.
@@ -454,6 +512,7 @@ async function revertDepRange(
   name: string,
   from: string,
   to: string | undefined,
+  recordedSection: DepSection | undefined,
   workspaceRoot: string,
   write: boolean,
 ): Promise<{
@@ -468,7 +527,9 @@ async function revertDepRange(
     return { ok: false, reason: 'missing', detail: `${packageJson} not found` };
   }
   const pkg = (await fs.readJson(packageJson)) as Record<string, unknown>;
-  for (const section of DEP_SECTIONS) {
+  // The first section holding something other than `to`; reported only if none holds `to`.
+  let drift: string | undefined;
+  for (const section of recordedSection ? [recordedSection] : DEP_SECTIONS) {
     const sec = pkg[section];
     if (!sec || typeof sec !== 'object') continue;
     const map = sec as Record<string, unknown>;
@@ -479,11 +540,8 @@ async function revertDepRange(
       const spec = parseCatalogSpec(current);
       const catalogCurrent = spec ? resolveCatalogRange(catalog, name, spec) : undefined;
       if (to && catalogCurrent !== undefined && catalogCurrent !== to) {
-        return {
-          ok: false,
-          reason: 'drifted',
-          detail: `current catalog entry for ${name} is "${catalogCurrent}" but the run recorded "${to}"; leaving as-is`,
-        };
+        drift ??= `current catalog entry for ${name} is "${catalogCurrent}" but the run recorded "${to}"; leaving as-is`;
+        continue;
       }
       if (!spec || !catalog.file) {
         return {
@@ -498,23 +556,25 @@ async function revertDepRange(
       return { ok: true, pkg, section, catalogOnly: true };
     }
     if (to && current !== undefined && current !== to) {
-      // The recorded run landed on `to` but the current file holds something else — another
-      // run (or a human edit) changed it. Bail out of this row; undo is about REVERSING this
-      // specific run, not about steamrolling later history.
-      return {
-        ok: false,
-        reason: 'drifted',
-        detail: `current \`${section}.${name}\` is "${current}" but the run recorded "${to}"; leaving as-is`,
-      };
+      // The recorded run landed on `to` but this section holds something else — another
+      // run (or a human edit) changed it, or the run wrote a different section. Keep looking;
+      // undo is about REVERSING this specific run, not about steamrolling later history.
+      drift ??= `current \`${section}.${name}\` is "${current}" but the run recorded "${to}"; leaving as-is`;
+      continue;
     }
     map[name] = from;
     pkg[section] = map;
     return { ok: true, pkg, section };
   }
+  if (drift) {
+    return { ok: false, reason: 'drifted', detail: drift };
+  }
   return {
     ok: false,
     reason: 'missing',
-    detail: `${name} not found in any dep section of ${path.basename(packageJson)}`,
+    detail: recordedSection
+      ? `${name} not found in \`${recordedSection}\` of ${path.basename(packageJson)}`
+      : `${name} not found in any dep section of ${path.basename(packageJson)}`,
   };
 }
 
@@ -583,6 +643,12 @@ export function undoSucceeded(result: UndoResult): boolean {
   if (result.noop) return true;
   if (result.installs.some((i) => !i.ok)) return false;
   if (result.validation && !result.validation.ok) return false;
+  // Nothing the report names exists here (wrong checkout / directory): nothing was undone.
+  const rows = [...result.reverts, ...result.overrides];
+  const unreachable = new Set(['missing', 'target-missing', 'missing-package-json']);
+  if (rows.length > 0 && rows.every((r) => !r.ok && unreachable.has(r.reason ?? ''))) {
+    return false;
+  }
   // Skipped revert rows are soft failures — the user knows about them — so we still return
   // true so `--undo` can exit 0 when everything else is clean. The JSON report surfaces the
   // per-row `skipped` so CI bots can be stricter if they care.
@@ -617,7 +683,8 @@ export async function checkOverridesStillPresent(
   let present = 0;
   let missing = 0;
   for (const att of persisted.overrides?.attempts ?? []) {
-    if (!att.ok || att.skipped) continue;
+    // A `lockfile-update` fix wrote no pin, so there is nothing to find.
+    if (!att.ok || att.skipped || att.method === 'lockfile-update') continue;
     const chain = att.chain && att.chain.length > 0 ? att.chain : [att.name];
     const hit = read.entries.find(
       (e) => e.chain.length === chain.length && e.chain.every((seg, i) => seg === chain[i]),

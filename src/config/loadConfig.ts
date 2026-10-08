@@ -1,5 +1,6 @@
 import path from 'node:path';
 import fs from 'fs-extra';
+import { stringifyJsonLike } from '../utils/jsonFile.js';
 
 /**
  * Persisted / policy-style override pin. Mirrors `--override` on the CLI but parsed ahead of
@@ -66,7 +67,8 @@ export interface DepUpSurgeonRc {
 const CONFIG_FILENAME = '.dep-up-surgeonrc';
 
 /**
- * Load `.dep-up-surgeonrc` from the project root (JSON).
+ * Load `.dep-up-surgeonrc` from the project root (JSON, with `//` / `/* *\/` comments, trailing
+ * commas and a UTF-8 BOM allowed).
  * A missing file yields an empty config. Nothing here throws: an unreadable or unparseable
  * file, or a malformed section, is reported in `warnings`, and every other section is still
  * normalized on its own.
@@ -87,7 +89,7 @@ export async function loadConfig(cwd: string): Promise<DepUpSurgeonRc> {
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(stripJsonc(raw).text);
   } catch (e) {
     // A silent `{}` here would un-ignore packages and drop the custom validator.
     return {
@@ -175,6 +177,50 @@ function normalizeIgnore(raw: unknown, warnings: string[]): string[] {
 
 function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * Turn JSONC (what the README's rc examples use) into JSON for `JSON.parse`: drop a leading
+ * UTF-8 BOM, and blank out `//` / `/* *\/` comments and trailing commas outside strings. Blanking
+ * (instead of deleting) keeps the offsets in a parse error pointing at the original text.
+ */
+function stripJsonc(raw: string): { text: string; hadComments: boolean } {
+  const src = raw.startsWith('\uFEFF') ? raw.slice(1) : raw;
+  const blank = (s: string) => s.replace(/[^\r\n]/g, ' ');
+  let out = '';
+  let hadComments = false;
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i]!;
+    if (c === '"') {
+      // Copy the whole string literal, escapes included.
+      let j = i + 1;
+      while (j < src.length && src[j] !== '"') j += src[j] === '\\' ? 2 : 1;
+      out += src.slice(i, j + 1);
+      i = j + 1;
+    } else if (c === '/' && src[i + 1] === '/') {
+      let j = i;
+      while (j < src.length && src[j] !== '\n' && src[j] !== '\r') j++;
+      out += blank(src.slice(i, j));
+      hadComments = true;
+      i = j;
+    } else if (c === '/' && src[i + 1] === '*') {
+      const end = src.indexOf('*/', i + 2);
+      const j = end === -1 ? src.length : end + 2;
+      out += blank(src.slice(i, j));
+      hadComments = true;
+      i = j;
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  // Comments are blank now, so a trailing comma is followed by whitespace and `}` / `]` only.
+  // Strings are skipped so a `",]"` value stays intact.
+  const text = out.replace(/"(?:[^"\\]|\\.)*"|,(\s*[}\]])/g, (m, tail: string | undefined) =>
+    tail === undefined ? m : ` ${tail}`,
+  );
+  return { text, hadComments };
 }
 
 /**
@@ -425,20 +471,25 @@ export function mergeIgnoreLists(
 }
 
 /**
- * Append package names to `.dep-up-surgeonrc` ignore list (creates or merges file).
+ * Append package names to `.dep-up-surgeonrc` ignore list (creates or merges file). The existing
+ * list keeps its order (new names go at the end), and the file keeps its indentation, line
+ * endings, trailing newline and BOM.
  * Throws instead of writing when the existing rc can't be merged safely (invalid JSON, a
  * non-object root, or an `ignore` that isn't a list): rewriting it from scratch would destroy
- * `linkedGroups` / `validate` / `overrides`.
+ * `linkedGroups` / `validate` / `overrides`. An rc with comments is refused too, since
+ * re-serializing it would drop them.
  */
 export async function appendIgnoreToRc(cwd: string, ...packageNames: string[]): Promise<void> {
   const rcPath = path.join(cwd, CONFIG_FILENAME);
   let data: Record<string, unknown> = {};
+  let raw = '';
   if (await fs.pathExists(rcPath)) {
-    const raw = await fs.readFile(rcPath, 'utf8');
+    raw = await fs.readFile(rcPath, 'utf8');
     if (raw.trim()) {
+      const jsonc = stripJsonc(raw);
       let parsed: unknown;
       try {
-        parsed = JSON.parse(raw);
+        parsed = JSON.parse(jsonc.text);
       } catch (e) {
         throw new Error(
           `refusing to update ${rcPath}: it is not valid JSON (${errorMessage(e)}). Fix the file, then add ${packageNames.join(', ')} to "ignore".`,
@@ -446,6 +497,11 @@ export async function appendIgnoreToRc(cwd: string, ...packageNames: string[]): 
       }
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
         throw new Error(`refusing to update ${rcPath}: it must contain a JSON object`);
+      }
+      if (jsonc.hadComments) {
+        throw new Error(
+          `refusing to update ${rcPath}: rewriting it would drop its comments. Add ${packageNames.join(', ')} to "ignore" by hand.`,
+        );
       }
       data = parsed as Record<string, unknown>;
     }
@@ -458,6 +514,7 @@ export async function appendIgnoreToRc(cwd: string, ...packageNames: string[]): 
   for (const name of packageNames) {
     ignore.add(name);
   }
-  data.ignore = [...ignore].sort();
-  await fs.writeJson(rcPath, data, { spaces: 2 });
+  data.ignore = [...ignore];
+  const bom = raw.startsWith('\uFEFF') ? '\uFEFF' : '';
+  await fs.writeFile(rcPath, bom + stringifyJsonLike(raw.slice(bom.length), data), 'utf8');
 }

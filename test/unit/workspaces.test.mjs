@@ -10,9 +10,13 @@ import fs from 'node:fs/promises';
 import fssync from 'node:fs';
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const { describeRootLockfiles, detectProjectInfo, parsePackageManagerOption, isPackageManager } = await import(
-  path.join(root, 'dist/core/workspaces.js')
-);
+const {
+  describeRootLockfiles,
+  detectProjectInfo,
+  findWorkspaceProblems,
+  parsePackageManagerOption,
+  isPackageManager,
+} = await import(path.join(root, 'dist/core/workspaces.js'));
 
 async function makeTmp(prefix) {
   return await fs.mkdtemp(path.join(os.tmpdir(), `dus-ws-${prefix}-`));
@@ -425,6 +429,93 @@ test('detectProjectInfo: npm-shrinkwrap.json is an npm lockfile; lockfile preced
   assert.strictEqual(withPnpmLock.lockfileName, 'pnpm-lock.yaml');
 });
 
+test('detectProjectInfo: yarn.lock next to bun.lock / bun.lockb is bun (bunfig print = "yarn")', async () => {
+  for (const bunLock of ['bun.lock', 'bun.lockb']) {
+    const dir = await makeTmp(`bun-yarn-${bunLock}`);
+    await writeJson(path.join(dir, 'package.json'), { name: 'app', version: '1.0.0' });
+    await fs.writeFile(path.join(dir, bunLock), bunLock === 'bun.lock' ? '{}' : Buffer.from([0, 1]));
+    await fs.writeFile(path.join(dir, 'yarn.lock'), '# yarn lockfile v1\n');
+    await fs.writeFile(path.join(dir, 'bunfig.toml'), '[install.lockfile]\nprint = "yarn"\n');
+
+    const info = await detectProjectInfo(dir, 'auto');
+    assert.strictEqual(info.manager, 'bun', bunLock);
+    assert.strictEqual(info.managerSource, 'lockfile');
+    assert.strictEqual(info.lockfileName, bunLock);
+    // bun rewrites that yarn.lock on every install, so it isn't flagged as going stale.
+    assert.deepStrictEqual(describeRootLockfiles(dir, 'bun'), { updated: ['yarn.lock', bunLock], stale: [] });
+  }
+});
+
+test('detectProjectInfo: bun.lock + yarn.lock still honors packageManager; without bunfig yarn.lock is stale', async () => {
+  const dir = await makeTmp('bun-yarn-field');
+  await writeJson(path.join(dir, 'package.json'), { name: 'app', packageManager: 'yarn@1.22.22' });
+  await fs.writeFile(path.join(dir, 'bun.lock'), '{}');
+  await fs.writeFile(path.join(dir, 'yarn.lock'), '# yarn lockfile v1\n');
+  // Point PATH at an empty dir so the yarn capability probe can't find a real binary.
+  const savedPath = process.env.PATH;
+  process.env.PATH = await makeTmp('no-yarn-bin');
+  try {
+    const info = await detectProjectInfo(dir, 'auto');
+    assert.strictEqual(info.manager, 'yarn');
+    assert.strictEqual(info.managerSource, 'package.json:packageManager');
+  } finally {
+    process.env.PATH = savedPath;
+  }
+  assert.deepStrictEqual(describeRootLockfiles(dir, 'bun'), { updated: ['bun.lock'], stale: ['yarn.lock'] });
+});
+
+test('findWorkspaceProblems: reports what member detection silently drops', async () => {
+  const dir = await makeTmp('ws-problems');
+  await writeJson(path.join(dir, 'package.json'), {
+    name: 'mono',
+    private: true,
+    workspaces: ['packages/*', 'apps/web', 'apps/gone', 'tools/**', '!packages/ignored'],
+  });
+  await writeMember(dir, 'packages/ok', '@org/ok');
+  fssync.mkdirSync(path.join(dir, 'packages/no-manifest'), { recursive: true });
+  fssync.mkdirSync(path.join(dir, 'packages/broken'), { recursive: true });
+  await fs.writeFile(path.join(dir, 'packages/broken/package.json'), '{ "name": ');
+  fssync.mkdirSync(path.join(dir, 'packages/nameless'), { recursive: true });
+  await writeJson(path.join(dir, 'packages/nameless/package.json'), { version: '1.0.0' });
+  fssync.mkdirSync(path.join(dir, 'packages/ignored'), { recursive: true });
+  fssync.mkdirSync(path.join(dir, 'packages/.cache'), { recursive: true });
+  fssync.mkdirSync(path.join(dir, 'apps/web'), { recursive: true });
+  // `**` searches a tree: plain directories under it are not problems.
+  await writeMember(dir, 'tools/scripts/lint', '@org/lint');
+  fssync.mkdirSync(path.join(dir, 'tools/scripts/lib'), { recursive: true });
+
+  const problems = await findWorkspaceProblems(dir);
+  assert.deepStrictEqual(
+    problems.map((p) => [path.relative(dir, p.dir).split(path.sep).join('/'), p.problem]),
+    [
+      ['apps/gone', 'missing-path'],
+      ['apps/web', 'missing-package-json'],
+      ['packages/broken', 'unreadable-package-json'],
+      ['packages/nameless', 'missing-name'],
+      ['packages/no-manifest', 'missing-package-json'],
+    ],
+  );
+  // Member detection itself is unchanged.
+  const info = await detectProjectInfo(dir, 'npm');
+  assert.deepStrictEqual(memberNames(info), ['@org/lint', '@org/ok']);
+});
+
+test('findWorkspaceProblems: pnpm-workspace.yaml entries; empty for coherent and single-package projects', async () => {
+  const dir = await makeTmp('ws-problems-pnpm');
+  await writeJson(path.join(dir, 'package.json'), { name: 'mono', private: true });
+  await fs.writeFile(path.join(dir, 'pnpm-workspace.yaml'), 'packages:\n  - packages/*\n  - docs\n');
+  await writeMember(dir, 'packages/a', '@org/a');
+  assert.deepStrictEqual(await findWorkspaceProblems(dir), [
+    { dir: path.join(dir, 'docs'), problem: 'missing-path' },
+  ]);
+  await writeMember(dir, 'docs', '@org/docs');
+  assert.deepStrictEqual(await findWorkspaceProblems(dir), []);
+
+  const single = await makeTmp('ws-problems-single');
+  await writeJson(path.join(single, 'package.json'), { name: 'app' });
+  assert.deepStrictEqual(await findWorkspaceProblems(single), []);
+});
+
 // ---------------------------------------------------------------------------
 // Workspace discovery: glob shapes, negations, pnpm-workspace.yaml parsing
 // ---------------------------------------------------------------------------
@@ -555,20 +646,22 @@ test('detectProjectInfo: pnpm-workspace.yaml + stale member pnpm-lock.yaml files
   assert.ok(!info.isolatedLockfiles);
 });
 
-test('detectProjectInfo: pnpm-workspace.yaml sharedWorkspaceLockfile: false → isolatedLockfiles', async () => {
+test('detectProjectInfo: pnpm-workspace.yaml sharedWorkspaceLockfile: false is NOT isolated', async () => {
+  // Each project gets its own pnpm-lock.yaml, but `pnpm install` (even inside a member) is
+  // recursive under pnpm-workspace.yaml: parallel per-member installs would all install everything.
   const dir = await makeTmp('isol-pnpm-yaml');
   await writeJson(path.join(dir, 'package.json'), { name: 'mono', private: true });
   await fs.writeFile(
     path.join(dir, 'pnpm-workspace.yaml'),
     'packages:\n  - packages/*\nsharedWorkspaceLockfile: false\n',
   );
-  await writeMember(dir, 'packages/a', '@org/a');
+  await makeMembersWithLockfiles(dir, 'pnpm-lock.yaml', 'lockfileVersion: 9.0\n');
 
   const info = await detectProjectInfo(dir, 'auto');
   assert.strictEqual(info.manager, 'pnpm');
-  assert.strictEqual(info.isolatedLockfiles, true);
-  // Reported under the existing pnpm-setting source so the report type stays unchanged.
-  assert.strictEqual(info.isolatedLockfilesSource, 'pnpm-npmrc');
+  assert.strictEqual(info.workspaceMembers.length, 2);
+  assert.ok(!info.isolatedLockfiles);
+  assert.strictEqual(info.isolatedLockfilesSource, undefined);
 });
 
 test('detectProjectInfo: pnpm without pnpm-workspace.yaml + per-member lockfiles stays isolated', async () => {

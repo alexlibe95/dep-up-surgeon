@@ -13,12 +13,7 @@
  */
 import type { UpgradeRecord } from '../types.js';
 import { runWithConcurrency } from '../utils/concurrency.js';
-import {
-  fetchChangelog,
-  scanForBreakingChanges,
-  type ChangelogCache,
-  type ChangelogFetchers,
-} from '../utils/changelog.js';
+import { fetchChangelog, type ChangelogCache, type ChangelogFetchers } from '../utils/changelog.js';
 
 export interface EnrichChangelogOptions {
   cache: ChangelogCache;
@@ -69,7 +64,9 @@ export async function enrichWithChangelogs(
           githubToken: opts.githubToken,
         });
         if (excerpt) {
-          const breaking = scanForBreakingChanges(excerpt.body);
+          // Scanned by `fetchChangelog` over the FULL notes (and crossed majors' releases);
+          // `body` is the truncated display copy, so never re-scan it.
+          const breaking = excerpt.breaking;
           r.changelog = {
             source: excerpt.source,
             url: excerpt.url,

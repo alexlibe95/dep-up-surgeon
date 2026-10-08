@@ -456,3 +456,16 @@ test('runUpgradeFlow dry-run: catalog: pointer resolves against catalogs.default
     assert.strictEqual(row.detail, 'dry-run');
   });
 });
+
+test('writeCatalogRange: keeps CRLF line endings and never re-folds long lines', async () => {
+  await withTempDir(async (dir) => {
+    const long = `# ${'a long comment that must stay on one line '.repeat(3)}`;
+    const desc = `description: "${'a long quoted value the YAML serializer would fold '.repeat(3)}"`;
+    const lines = ['packages:', '  - packages/*', long, desc, 'catalog:', '  react: ^18.2.0', ''];
+    await fs.writeFile(path.join(dir, 'pnpm-workspace.yaml'), lines.join('\r\n'));
+    const index = await loadCatalogIndex(dir);
+    await writeCatalogRange(index, 'react', { kind: 'default' }, '^19.0.0');
+    const raw = await fs.readFile(path.join(dir, 'pnpm-workspace.yaml'), 'utf8');
+    assert.strictEqual(raw, lines.join('\r\n').replace('^18.2.0', '^19.0.0'));
+  });
+});

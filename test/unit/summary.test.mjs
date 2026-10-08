@@ -374,3 +374,20 @@ test('renderSummaryMarkdown: lockfile-fix skipped reports reason', () => {
   );
   assert.match(md, /Skipped — package manager has no dedupe subcommand/);
 });
+
+test('renderSummaryMarkdown: an advisory fixed by `npm update` reads "updated in lockfile", not pinned', () => {
+  const report = {
+    ...fixtureReport(),
+    overrides: {
+      field: 'overrides',
+      attempts: [
+        { name: 'qs', severity: 'high', ids: ['GHSA-x'], applied: '6.14.2', method: 'lockfile-update', source: 'advisory', ok: true, skipped: false },
+        { name: 'lodash', severity: 'moderate', ids: ['GHSA-y'], applied: '4.17.21', source: 'advisory', ok: true, skipped: false },
+      ],
+    },
+  };
+  const md = renderSummaryMarkdown(report, '9.9.9');
+  assert.match(md, /1 pinned, 1 updated in lockfile, 0 already safe, 0 failed/);
+  assert.match(md, /\| `qs` \| updated in lockfile \(`6\.14\.2`\) \|/);
+  assert.match(md, /\| `lodash` \| `4\.17\.21` \|/);
+});

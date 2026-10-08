@@ -6,7 +6,8 @@
  * satisfies the declared range. Either way a nested copy of the same package elsewhere in the
  * tree (`node_modules/send/node_modules/debug@4`) can't mask an outdated direct one.
  * Fall back to `semver.coerce(declaredRange)` when the lockfile is missing or the package
- * isn't listed there yet. This avoids the classic false-positive where `^1.0.0` looks
+ * isn't listed there yet (never for a dist-tag). For npm, `npm-shrinkwrap.json` is read in
+ * preference to `package-lock.json`, like npm itself does. This avoids the classic false-positive where `^1.0.0` looks
  * outdated even though the lockfile already resolved to `1.9.0` (== registry latest).
  */
 import path from 'node:path';
@@ -17,6 +18,7 @@ import {
   parseLockfileInstalledVersions,
   type LockfileDirectVersions,
 } from '../cli/lockfileFix.js';
+import { isDistTag } from '../core/scanner.js';
 import type { PackageManager } from '../core/workspaces.js';
 
 /**
@@ -108,19 +110,23 @@ export function resolveInstalledVersion(opts: {
     ...(opts.memberRelDir !== undefined ? { memberRelDir: opts.memberRelDir } : {}),
   });
   if (fromLock) return fromLock;
+  // A dist-tag has no version to coerce: `ts5.6` / `next-15` would turn into 5.6.0 / 15.0.0.
+  if (isDistTag(opts.declaredRange)) return undefined;
   return semver.coerce(opts.declaredRange)?.version;
 }
 
-function lockfileBasenameFor(manager: PackageManager): string {
+/** Lockfiles each manager reads, in its own precedence order (first existing one wins). */
+function lockfileBasenamesFor(manager: PackageManager): string[] {
   switch (manager) {
     case 'pnpm':
-      return 'pnpm-lock.yaml';
+      return ['pnpm-lock.yaml'];
     case 'yarn':
-      return 'yarn.lock';
+      return ['yarn.lock'];
     case 'bun':
-      return 'bun.lock';
+      return ['bun.lock'];
     default:
-      return 'package-lock.json';
+      // npm prefers npm-shrinkwrap.json (same format) over package-lock.json when both exist.
+      return ['npm-shrinkwrap.json', 'package-lock.json'];
   }
 }
 
@@ -132,9 +138,15 @@ export async function loadLockfileVersionTree(
   cwd: string,
   manager: PackageManager,
 ): Promise<Map<string, Set<string>> & { direct?: LockfileDirectVersions }> {
-  const file = path.join(cwd, lockfileBasenameFor(manager));
   try {
-    if (!(await fs.pathExists(file))) {
+    let file: string | undefined;
+    for (const name of lockfileBasenamesFor(manager)) {
+      if (await fs.pathExists(path.join(cwd, name))) {
+        file = path.join(cwd, name);
+        break;
+      }
+    }
+    if (!file) {
       return new Map();
     }
     const raw = await fs.readFile(file, 'utf8');

@@ -271,6 +271,19 @@ export async function openPullRequest(
     }
   }
 
+  // `--git-branch main` (or `$GITHUB_REF_NAME` on a push build) committed straight onto the base
+  // branch: pushing it would land the upgrades unreviewed, and the PR can't be opened anyway.
+  if (baseBranch && branch === baseBranch) {
+    return {
+      ok: false,
+      provider: 'github',
+      branch,
+      repo: repoSlug,
+      base: baseBranch,
+      error: `refusing to push "${branch}": it is the PR's base branch. Pass a separate --git-branch for the upgrade commits.`,
+    };
+  }
+
   // Push the branch. Use `--set-upstream` so subsequent `git push` from the repo just works.
   // We do NOT force-push; a rejected push means the branch already exists remotely and has
   // commits we don't have — users should reset explicitly.

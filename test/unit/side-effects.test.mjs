@@ -19,6 +19,7 @@ async function makeRepo(files) {
   await execa('git', ['config', 'user.name', 'dep-up-surgeon test'], { cwd: dir });
   await execa('git', ['config', 'commit.gpgsign', 'false'], { cwd: dir });
   for (const [name, content] of Object.entries(files)) {
+    await fs.mkdir(path.dirname(path.join(dir, name)), { recursive: true });
     await fs.writeFile(path.join(dir, name), content);
   }
   await execa('git', ['add', '.'], { cwd: dir });
@@ -48,12 +49,39 @@ test('restoreSideEffects: puts back files the run rewrote; keeps dependency file
 
   const result = await restoreSideEffects(before);
 
-  assert.deepStrictEqual(result, { restored: ['tsconfig.json'], untracked: ['next-env.d.ts'] });
+  assert.deepStrictEqual(result.restored, ['tsconfig.json']);
+  assert.deepStrictEqual(result.untracked, ['next-env.d.ts']);
   assert.strictEqual(await read(repo, 'tsconfig.json'), '{"jsx":"preserve"}\n');
+  // The run's version is kept, in case it was the user's own edit made while the run was going.
+  assert.strictEqual(await fs.readFile(path.join(result.backupDir, 'tsconfig.json'), 'utf8'), '{"jsx":"react-jsx"}\n');
   assert.strictEqual(await read(repo, 'package.json'), '{"name":"x","v":2}\n');
   assert.strictEqual(await read(repo, 'bun.lock'), 'v2\n');
   assert.strictEqual(await read(repo, 'notes.md'), 'my wip, still editing\n', 'a file dirty before the run is never touched');
   assert.strictEqual(await read(repo, 'next-env.d.ts'), '// generated\n', 'untracked files are never deleted');
+});
+
+test('restoreSideEffects: stays inside the project dir; keeps --summary-file and yarn PnP files', async () => {
+  const repo = await makeRepo({
+    'app/package.json': '{"name":"app"}\n',
+    'app/tsconfig.json': '{"a":1}\n',
+    'app/DEPS.md': 'old\n',
+    'app/.pnp.cjs': '// pnp v1\n',
+    'other/notes.md': 'draft\n',
+  });
+  const app = path.join(repo, 'app');
+  const before = await captureWorktree(app);
+
+  await fs.writeFile(path.join(app, 'tsconfig.json'), '{"a":2}\n');
+  await fs.writeFile(path.join(app, 'DEPS.md'), 'new summary\n');
+  await fs.writeFile(path.join(app, '.pnp.cjs'), '// pnp v2\n');
+  await fs.writeFile(path.join(repo, 'other/notes.md'), 'edited in another project\n');
+
+  const result = await restoreSideEffects(before, { keep: [path.join(app, 'DEPS.md')] });
+
+  assert.deepStrictEqual(result.restored, ['app/tsconfig.json']);
+  assert.strictEqual(await read(app, 'DEPS.md'), 'new summary\n');
+  assert.strictEqual(await read(app, '.pnp.cjs'), '// pnp v2\n');
+  assert.strictEqual(await read(repo, 'other/notes.md'), 'edited in another project\n');
 });
 
 test('captureWorktree: outside a git repo there is nothing to restore', async () => {

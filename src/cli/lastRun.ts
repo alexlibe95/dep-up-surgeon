@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import path from 'node:path';
+import { execa } from 'execa';
 import fs from 'fs-extra';
 import { ROOT_LOCKFILE_NAMES } from '../core/workspaces.js';
 import type { FinalReport } from '../types.js';
@@ -19,7 +20,11 @@ export const LAST_RUN_DIR = path.join('node_modules', '.cache', 'dep-up-surgeon'
  */
 export const LAST_RUN_FILENAME = 'last-run.json';
 
-/** Where older versions wrote the report: the workspace root. Still read as a fallback. */
+/**
+ * Where older versions wrote the report: the workspace root. Still read as a fallback (callers
+ * warn, see {@link legacyLastRunWarning}) and deleted, when git doesn't track it, the next time a
+ * report is written.
+ */
 export const LEGACY_LAST_RUN_FILENAME = '.dep-up-surgeon.last-run.json';
 
 export function lastRunReportPath(cwd: string): string {
@@ -37,6 +42,11 @@ export interface PersistedLastRun extends StructuredReport {
   dryRun: boolean;
   /** Root lockfiles the run changed, each with a backup of its pre-run bytes for `undo`. */
   lockfiles?: PersistedLockfile[];
+  /**
+   * Ignore keys a `--retry-failed` run froze (from the report it resumed). Carried into the next
+   * `--retry-failed`, so a chain of retries keeps everything an earlier run settled frozen.
+   */
+  retryFrozen?: string[];
 }
 
 export interface PersistedLockfile {
@@ -60,6 +70,8 @@ export interface PersistOptions {
   dryRun: boolean;
   /** Root lockfiles read before the run ({@link captureRootLockfiles}). */
   lockfilesBefore?: LockfileCapture[];
+  /** `--retry-failed` only: the keys it froze (`computeRetryFailedIgnores(...).added`). */
+  retryFrozen?: Iterable<string>;
 }
 
 /** Pre-run lockfile backup next to the report, relative to the workspace root. */
@@ -108,6 +120,7 @@ export async function persistLastRunReport(
     return undefined;
   }
   const lockfiles = await backUpChangedLockfiles(opts);
+  const retryFrozen = [...(opts.retryFrozen ?? [])];
   const payload: PersistedLastRun = {
     ...structured,
     finishedAt: new Date().toISOString(),
@@ -115,13 +128,44 @@ export async function persistLastRunReport(
     cwd: opts.cwd,
     dryRun: opts.dryRun,
     ...(lockfiles.length > 0 ? { lockfiles } : {}),
+    ...(retryFrozen.length > 0 ? { retryFrozen } : {}),
   };
   try {
     await fs.writeFile(file, JSON.stringify(payload, null, 2) + '\n', 'utf8');
-    return file;
   } catch {
     return undefined;
   }
+  // The root report would otherwise keep being the fallback once the cache is wiped (`npm ci`),
+  // letting `undo` replay a run far older than this one.
+  await removeLegacyRunState(opts.cwd);
+  return file;
+}
+
+/**
+ * Delete the run state older versions kept in the project root (the report and any
+ * `.dep-up-surgeon.last-run.<lockfile>` backups), unless git tracks the file. Best-effort.
+ */
+async function removeLegacyRunState(cwd: string): Promise<void> {
+  const names = [
+    LEGACY_LAST_RUN_FILENAME,
+    ...ROOT_LOCKFILE_NAMES.map((lock) => `.dep-up-surgeon.last-run.${lock}`),
+  ];
+  for (const name of names) {
+    const file = path.join(cwd, name);
+    if (!(await fs.pathExists(file)) || (await maybeTrackedByGit(cwd, name))) {
+      continue;
+    }
+    await fs.remove(file).catch(() => undefined);
+  }
+}
+
+/** False only when git says the file is untracked, or `cwd` isn't a git repo at all. */
+async function maybeTrackedByGit(cwd: string, name: string): Promise<boolean> {
+  const r = await execa('git', ['ls-files', '--error-unmatch', '--', name], { cwd, reject: false });
+  if (r.exitCode === 1) return false;
+  if (r.exitCode === 128 && /not a git repository/i.test(String(r.stderr))) return false;
+  // Tracked (exit 0), or git missing / failing: keep the file.
+  return true;
 }
 
 /**
@@ -154,18 +198,57 @@ async function backUpChangedLockfiles(opts: PersistOptions): Promise<PersistedLo
   return lockfiles;
 }
 
-export async function loadLastRunReport(cwd: string): Promise<PersistedLastRun | undefined> {
-  for (const file of [lastRunReportPath(cwd), path.join(cwd, LEGACY_LAST_RUN_FILENAME)]) {
+/** A run report together with where it was read from. */
+export interface LoadedLastRun {
+  report: PersistedLastRun;
+  /** Absolute path of the file that was read. */
+  file: string;
+  /**
+   * True when the cache report was missing and an older version's project-root report
+   * ({@link LEGACY_LAST_RUN_FILENAME}) was read instead. Callers should print
+   * {@link legacyLastRunWarning}: that file can be months older than the last run.
+   */
+  legacy: boolean;
+}
+
+/**
+ * Find the run report: `node_modules/.cache/dep-up-surgeon/last-run.json`, else the legacy root
+ * report. `undefined` when neither exists, or the first one found doesn't parse.
+ */
+export async function findLastRunReport(cwd: string): Promise<LoadedLastRun | undefined> {
+  const candidates = [
+    { file: lastRunReportPath(cwd), legacy: false },
+    { file: path.join(cwd, LEGACY_LAST_RUN_FILENAME), legacy: true },
+  ];
+  for (const { file, legacy } of candidates) {
     if (!(await fs.pathExists(file))) {
       continue;
     }
     try {
-      return (await fs.readJson(file)) as PersistedLastRun;
+      return { report: (await fs.readJson(file)) as PersistedLastRun, file, legacy };
     } catch {
       return undefined;
     }
   }
   return undefined;
+}
+
+export async function loadLastRunReport(cwd: string): Promise<PersistedLastRun | undefined> {
+  return (await findLastRunReport(cwd))?.report;
+}
+
+/** Warning for a report read from the legacy root location; `undefined` for any other report. */
+export function legacyLastRunWarning(loaded: LoadedLastRun): string | undefined {
+  if (!loaded.legacy) {
+    return undefined;
+  }
+  const { finishedAt, toolVersion } = loaded.report;
+  return (
+    `${path.join(LAST_RUN_DIR, LAST_RUN_FILENAME)} is missing, so ${loaded.file} is used instead: ` +
+    `a report an older dep-up-surgeon wrote (finished ${finishedAt ?? 'at an unknown time'}, ` +
+    `dep-up-surgeon ${toolVersion ?? 'unknown'}). It may describe a much older run than your last one; ` +
+    'delete it if it does.'
+  );
 }
 
 /**
@@ -191,6 +274,8 @@ export interface RetryComputation {
   succeededLastRun: number;
   terminalFailuresLastRun: number;
   retryableLastRun: string[];
+  /** Keys the last run (itself a `--retry-failed`) had frozen, carried over into `added`. */
+  carriedOver: number;
 }
 
 interface GroupIndexEntry {
@@ -215,9 +300,13 @@ interface GroupIndexEntry {
  * Group failures (`name === '[group:<id>]'`) are expanded to the group's member packages via
  * the persisted `groups` field, so freezing a group correctly freezes every package in it
  * — scoped to the workspace that owned the group when that can be recovered.
+ *
+ * When the last run was itself a `--retry-failed`, the keys it froze (`retryFrozen`) stay
+ * frozen: they are absent from its rows, so they would otherwise be attempted again.
  */
 export function computeRetryFailedIgnores(last: PersistedLastRun): RetryComputation {
-  const added = new Set<string>();
+  const added = new Set<string>(Array.isArray(last.retryFrozen) ? last.retryFrozen.map(String) : []);
+  const carriedOver = added.size;
   let succeededLastRun = 0;
   let terminalFailuresLastRun = 0;
   const retryableLastRun: string[] = [];
@@ -256,7 +345,7 @@ export function computeRetryFailedIgnores(last: PersistedLastRun): RetryComputat
     }
   }
 
-  return { added, succeededLastRun, terminalFailuresLastRun, retryableLastRun };
+  return { added, succeededLastRun, terminalFailuresLastRun, retryableLastRun, carriedOver };
 }
 
 function indexPersistedGroups(

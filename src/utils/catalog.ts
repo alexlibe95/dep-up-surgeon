@@ -213,7 +213,13 @@ async function writePnpmWorkspaceCatalog(
       }
     }
   }
-  await fs.writeFile(file, String(doc), 'utf8');
+  // lineWidth 0: never re-fold long lines the edit didn't touch.
+  await fs.writeFile(file, withEolOf(raw, doc.toString({ lineWidth: 0 })), 'utf8');
+}
+
+/** Re-apply the original file's CRLF line endings to freshly serialized LF text. */
+function withEolOf(original: string, text: string): string {
+  return original.includes('\r\n') ? text.replace(/\r?\n/g, '\r\n') : text;
 }
 
 /** `catalogName` undefined = default catalog. */

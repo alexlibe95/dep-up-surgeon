@@ -57,21 +57,21 @@ test('installCommand: pnpm without filter → `pnpm install --no-frozen-lockfile
 });
 
 test('installCommand: yarn classic / berry-without-plugin falls back to `yarn install`', () => {
-  // No `yarnSupportsFocus` flag → we don't know if `workspaces focus` is available, so play it
-  // safe and do a full root install. The orchestrator will warn the user once.
+  // Yarn has no lockfile-safe per-workspace install: always a full root install. The
+  // orchestrator will warn the user once.
   const r = installCommand('yarn', { filter: '@org/web' });
   assert.strictEqual(r.bin, 'yarn');
   assert.deepStrictEqual(r.args, ['install']);
   assert.strictEqual(r.filtered, false);
 });
 
-test('installCommand: yarn berry + plugin → `yarn workspaces focus <name>` and filtered=true', () => {
-  // `yarnSupportsFocus: true` is set by `detectProjectInfo`'s probe when yarn>=2 AND
-  // `@yarnpkg/plugin-workspace-tools` is loaded. We expect the focused install command.
+test('installCommand: yarn berry + plugin still runs a full `yarn install` (never `workspaces focus`)', () => {
+  // `yarn workspaces focus` doesn't write yarn.lock and drops other workspaces' deps from the
+  // install, so a kept bump would ship with a stale lockfile validated against a partial tree.
   const r = installCommand('yarn', { filter: '@org/web', yarnSupportsFocus: true });
   assert.strictEqual(r.bin, 'yarn');
-  assert.deepStrictEqual(r.args, ['workspaces', 'focus', '@org/web']);
-  assert.strictEqual(r.filtered, true);
+  assert.deepStrictEqual(r.args, ['install']);
+  assert.strictEqual(r.filtered, false);
 });
 
 test('installCommand: yarn + yarnSupportsFocus but NO filter still does `yarn install`', () => {

@@ -13,7 +13,10 @@
  *
  *   1. **node-version**           — current Node satisfies `engines.node`, if set.
  *   2. **manager**                — a package manager was resolved (lockfile + binary match).
- *   3. **lockfile**               — lockfile is present, parseable, and matches the manager.
+ *                                   Red when `package.json` is missing / unreadable; the remaining
+ *                                   checks are skipped then, since there is no project to diagnose.
+ *   3. **lockfile**               — lockfile is present, parseable, and matches the manager. A
+ *                                   binary `bun.lockb` is reported as present but not inspected.
  *   4. **dependencies-installed** — declared dependencies have an install on disk (`node_modules`
  *                                   or Yarn PnP); without one, checks 6–7 fail for that reason alone.
  *   5. **workspace-coherence**    — detected workspace members resolve on disk + have `package.json`.
@@ -25,7 +28,8 @@
  *   8. **peer-deps**              — scan installed tree for existing peer-dep warnings via a
  *                                   `<mgr> ls --all` (npm) or equivalent — catches "already
  *                                   broken before you asked me to upgrade anything" cases.
- *                                   Managers without a read-only check are reported as skipped.
+ *                                   Managers without a read-only check (pnpm, yarn berry, bun) are
+ *                                   reported as skipped; a scan that fails to run is YELLOW.
  *   9. **audit**                  — `<mgr> audit` dry-run + severity breakdown. Treated as
  *                                   YELLOW for low/moderate, RED for high/critical.
  *  10. **stale-transitives**      — reuses `scanStaleTransitives` from `lockfileFix.ts` to flag
@@ -43,12 +47,12 @@ import semver from 'semver';
 import { execa } from 'execa';
 import type { PackageJson } from '../types.js';
 import type { PackageManager, ProjectInfo } from '../core/workspaces.js';
-import { describeRootLockfiles, detectProjectInfo } from '../core/workspaces.js';
+import { describeRootLockfiles, detectProjectInfo, findWorkspaceProblems } from '../core/workspaces.js';
 import { validateProject } from '../core/validator.js';
 import { runAudit, type SecurityAdvisory } from '../core/audit.js';
 import { tailLines } from '../utils/output.js';
 import { createRegistryCache, runWithConcurrency, type RegistryCache } from '../utils/concurrency.js';
-import { parseLockfileInstalledVersions } from './lockfileFix.js';
+import { isBinaryLockfile, parseLockfileInstalledVersions } from './lockfileFix.js';
 import { loadPolicy } from '../config/policy.js';
 import { fetchLatestVersion } from '../utils/npm.js';
 
@@ -112,7 +116,21 @@ export async function runDoctor(opts: RunDoctorOptions): Promise<DoctorReport> {
   // 1. Node version gate — runs first because everything downstream assumes a working Node.
   checks.push(await nodeVersionCheck(cwd));
 
-  // 2. Project info is load-bearing for every downstream check. If detection itself errors
+  // 2. Without a readable package.json there is no project to diagnose, and the shelled-out
+  //    checks would run against whatever project encloses `cwd` (`npm ls` walks up). Red, stop.
+  const packageJsonProblem = await readPackageJsonProblem(cwd);
+  if (packageJsonProblem) {
+    checks.push({
+      id: 'manager',
+      label: 'Package manager',
+      status: 'red',
+      message: `No readable \`package.json\` in ${cwd}: ${packageJsonProblem}.`,
+      hint: 'Run doctor from the project root, or point it there with `--cwd <path>`.',
+    });
+    return finalize(checks, cwd, toolVersion);
+  }
+
+  // 3. Project info is load-bearing for every downstream check. If detection itself errors
   //    we short-circuit and emit a single red check + empty remainder so the report is still
   //    structured output rather than an exception.
   let info: ProjectInfo | undefined;
@@ -132,7 +150,7 @@ export async function runDoctor(opts: RunDoctorOptions): Promise<DoctorReport> {
   checks.push(managerCheck(info));
   checks.push(await lockfileCheck(cwd, info));
   checks.push(await dependenciesInstalledCheck(cwd, info));
-  checks.push(workspaceCoherenceCheck(info));
+  checks.push(await workspaceCoherenceCheck(cwd, info));
   checks.push(await policyCheck(cwd));
   checks.push(await preflightValidatorCheck(cwd, info, opts));
   checks.push(await peerDepsCheck(cwd, info, opts));
@@ -140,6 +158,17 @@ export async function runDoctor(opts: RunDoctorOptions): Promise<DoctorReport> {
   checks.push(await staleTransitiveCheck(cwd, info, opts));
 
   return finalize(checks, cwd, toolVersion);
+}
+
+/** Why `package.json` can't be used, or `undefined` when it parses to a JSON object. */
+async function readPackageJsonProblem(cwd: string): Promise<string | undefined> {
+  try {
+    const pkg: unknown = await fs.readJson(path.join(cwd, 'package.json'));
+    return pkg && typeof pkg === 'object' && !Array.isArray(pkg) ? undefined : 'not a JSON object';
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return 'file not found';
+    return e instanceof Error ? e.message : String(e);
+  }
 }
 
 function finalize(checks: DoctorCheck[], cwd: string, toolVersion: string): DoctorReport {
@@ -311,6 +340,15 @@ async function lockfileCheck(cwd: string, projectInfo: ProjectInfo): Promise<Doc
       data: { lockfile: info.lockfile, manager: info.manager },
     };
   }
+  if (isBinaryLockfile(info.lockfile)) {
+    return {
+      id: 'lockfile',
+      label: 'Lockfile',
+      status: 'green',
+      message: `\`${info.lockfile}\` is present (binary lockfile, not inspected).`,
+      data: { lockfile: info.lockfile, binary: true },
+    };
+  }
   const abs = path.join(cwd, info.lockfile);
   try {
     const raw = await fs.readFile(abs, 'utf8');
@@ -343,7 +381,7 @@ async function lockfileCheck(cwd: string, projectInfo: ProjectInfo): Promise<Doc
   }
 }
 
-function workspaceCoherenceCheck(info: ProjectInfo): DoctorCheck {
+async function workspaceCoherenceCheck(cwd: string, info: ProjectInfo): Promise<DoctorCheck> {
   if (!info.hasWorkspaces) {
     return {
       id: 'workspace-coherence',
@@ -352,19 +390,24 @@ function workspaceCoherenceCheck(info: ProjectInfo): DoctorCheck {
       message: 'Single-package project (no workspaces).',
     };
   }
-  const missing: string[] = [];
-  for (const m of info.workspaceMembers) {
-    const pj = path.join(m.dir, 'package.json');
-    if (!fs.existsSync(pj)) missing.push(m.name);
-  }
-  if (missing.length > 0) {
+  // Member detection silently drops entries it can't use, so check the declared globs directly.
+  const problems = await findWorkspaceProblems(cwd);
+  if (problems.length > 0) {
+    // A member with a broken / nameless package.json breaks installs; a missing dir or
+    // package.json is ignored by npm / pnpm / yarn but usually means a stale glob.
+    const red = problems.some(
+      (p) => p.problem === 'unreadable-package-json' || p.problem === 'missing-name',
+    );
+    const rows = problems.map((p) => ({ dir: path.relative(cwd, p.dir) || '.', problem: p.problem }));
     return {
       id: 'workspace-coherence',
       label: 'Workspace coherence',
-      status: 'red',
-      message: `${missing.length} workspace member(s) are declared but have no \`package.json\`: ${missing.join(', ')}.`,
-      hint: 'Fix the broken workspace globs or drop orphaned members before running the upgrade loop.',
-      data: { missing },
+      status: red ? 'red' : 'yellow',
+      message: `${problems.length} declared workspace entr${problems.length === 1 ? 'y does' : 'ies do'} not resolve to a usable member: ${rows
+        .map((r) => `${r.dir} (${r.problem})`)
+        .join(', ')}.`,
+      hint: 'Fix the broken package.json files, or drop stale entries from the workspace globs.',
+      data: { problems: rows },
     };
   }
   return {
@@ -474,9 +517,9 @@ async function preflightValidatorCheck(
 
 /**
  * Quick `<mgr> ls --all --parseable` probe that doesn't install anything — just reports peer
- * dep / missing dep warnings that are ALREADY there. We scan stderr for npm's canonical
- * warning prefixes; pnpm and yarn spew the same shape in a different style, so we fall back
- * to a "did the command find `ELSPROBLEMS` / `peer dep missing` / `invalid`" text match.
+ * dep / missing dep warnings that are ALREADY there. We text-match the output for npm's
+ * canonical problem lines and yarn classic's `yarn check` errors (see `PEER_WARNING`). A
+ * command that fails without printing any of them is reported as "could not run", not green.
  */
 async function peerDepsCheck(
   cwd: string,
@@ -505,6 +548,17 @@ async function peerDepsCheck(
     const combined = [r.stdout, r.stderr].filter(Boolean).join('\n');
     const warnings = extractPeerWarnings(combined);
     if (warnings.length === 0) {
+      // No recognised warning only means "clean" when the command succeeded: `yarn check` on
+      // berry (Usage Error), a missing binary (ENOENT) or a crash says nothing about the tree.
+      if (r.failed) {
+        return {
+          id: 'peer-deps',
+          label: 'Peer dependencies',
+          status: 'yellow',
+          message: `Peer scan could not run: ${describeScanFailure(command, r.exitCode, combined, r.originalMessage)}.`,
+          hint: 'Run the command yourself to see why, or pass `--skip-peer-scan`.',
+        };
+      }
       return {
         id: 'peer-deps',
         label: 'Peer dependencies',
@@ -512,7 +566,7 @@ async function peerDepsCheck(
         message: 'No existing peer-dep / missing-dep warnings.',
       };
     }
-    const severe = warnings.filter((w) => /invalid|missing/i.test(w)).length;
+    const severe = warnings.filter((w) => FATAL_PEER_WARNING.test(w)).length;
     return {
       id: 'peer-deps',
       label: 'Peer dependencies',
@@ -544,12 +598,11 @@ export function peerScanCommandFor(
     case 'npm':
       return { bin: 'npm', args: ['ls', '--all', '--parseable'] };
     case 'pnpm':
-      // `pnpm why` is too targeted; `pnpm list` doesn't report peer issues. Re-resolving prints
-      // them: `--lockfile-only` never writes node_modules, `--frozen-lockfile` refuses to change
-      // the lockfile, `--ignore-scripts` rules out lifecycle hooks.
+      // `pnpm list` / `pnpm why` don't report peer issues, and re-resolving to print them is not
+      // read-only: `pnpm install --lockfile-only` rewrites pnpm-lock.yaml even with
+      // `--frozen-lockfile` (and an outdated lockfile just fails with ERR_PNPM_OUTDATED_LOCKFILE).
       return {
-        bin: 'pnpm',
-        args: ['install', '--frozen-lockfile', '--lockfile-only', '--ignore-scripts'],
+        skipped: 'pnpm has no read-only peer check (`pnpm install --lockfile-only` rewrites pnpm-lock.yaml)',
       };
     case 'yarn':
       // yarn classic (v1): `yarn check` only reads. Berry (v2+) has no `yarn check`, and
@@ -567,15 +620,43 @@ export function peerScanCommandFor(
   }
 }
 
+/**
+ * Output lines reporting a peer / missing / mismatched dependency: npm `ls` problems, the peer
+ * wording the managers share, and yarn classic's `yarn check` errors (`"x" not installed`,
+ * `is wrong version: expected`, `doesn't satisfy found match of`, `Lockfile does not contain pattern:`).
+ */
+const PEER_WARNING =
+  /peer dep missing|requires a peer|unmet peer dependency|incorrect peer dependency|ELSPROBLEMS|invalid:|missing: |\bnot installed\b|is wrong version: expected|doesn't satisfy found match of|Lockfile does not contain pattern:/i;
+
+/** Warnings that mean the installed tree is inconsistent, not just a peer-range complaint. */
+const FATAL_PEER_WARNING = /invalid|missing|not installed|wrong version|doesn't satisfy|does not contain pattern/i;
+
 function extractPeerWarnings(output: string): string[] {
   const lines = output.split(/\r?\n/);
   const out: string[] = [];
   for (const line of lines) {
-    if (/peer dep missing|requires a peer|unmet peer dependency|ELSPROBLEMS|invalid:|missing: /i.test(line)) {
+    if (PEER_WARNING.test(line)) {
       out.push(line.trim());
     }
   }
   return out;
+}
+
+/** `` `yarn check` exited 1 (Usage Error: …) `` — the last output line usually says why. */
+function describeScanFailure(
+  command: { bin: string; args: string[] },
+  exitCode: number | undefined,
+  output: string,
+  spawnError: string | undefined,
+): string {
+  const how = exitCode === undefined ? 'failed' : `exited ${exitCode}`;
+  const why =
+    output
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .pop() ?? spawnError;
+  return `\`${[command.bin, ...command.args].join(' ')}\` ${how}${why ? ` (${why})` : ''}`;
 }
 
 /**
@@ -739,6 +820,14 @@ async function staleTransitiveCheck(
       label: 'Stale transitives',
       status: 'green',
       message: 'No lockfile — nothing to scan.',
+    };
+  }
+  if (isBinaryLockfile(lockfile)) {
+    return {
+      id: 'stale-transitives',
+      label: 'Stale transitives',
+      status: 'green',
+      message: `\`${lockfile}\` is a binary lockfile — nothing to scan.`,
     };
   }
   try {

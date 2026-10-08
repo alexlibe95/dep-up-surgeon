@@ -37,8 +37,8 @@ export class AsyncMutex {
  * A keyed asynchronous mutex — `runExclusive(key, fn)` serializes calls that share the same
  * `key` while allowing callers with DIFFERENT keys to run concurrently.
  *
- * Why: in an isolated-lockfile monorepo (e.g. pnpm with `shared-workspace-lockfile=false`,
- * or a folder of independent projects each with its own lockfile), installs into different
+ * Why: in an isolated-lockfile monorepo (a folder of independent projects, each with its own
+ * lockfile and no shared root one), installs into different
  * workspace directories are independent — they only race when they touch the same directory.
  * The keyed mutex lets the upgrader serialize "same install directory" operations while
  * letting "different install directories" run in parallel, turning the full monorepo
@@ -129,7 +129,13 @@ export async function runWithConcurrency<T, R>(
       })(),
     );
   }
-  await Promise.all(workers);
+  // Wait for every worker before rejecting: the others may be mid-install, and the caller's
+  // cleanup must not run while they still write to the project.
+  const settled = await Promise.allSettled(workers);
+  const rejected = settled.find((s): s is PromiseRejectedResult => s.status === 'rejected');
+  if (rejected) {
+    throw rejected.reason;
+  }
   return results;
 }
 

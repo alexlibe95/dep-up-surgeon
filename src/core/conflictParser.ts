@@ -4,6 +4,7 @@
  * Patterns are generic — no package names are hard-coded.
  */
 
+import semver from 'semver';
 import type { Conflict } from '../types.js';
 
 export type { Conflict } from '../types.js';
@@ -41,6 +42,64 @@ export function dedupeConflicts(list: Conflict[]): Conflict[] {
 /** npm 9/10+ “peer (Optional) <pkg>@"<range>" from <dep>@<ver>” (warn, error, or ERESOLVE). */
 const PEER_QUOTED_RANGE_FROM: RegExp =
   /\b(?:peer|peerOptional)\s+((?:@[^/\s]+\/)?[^\s@]+)@"([^"]+)"\s+from\s+((?:@[^/\s]+\/)?[^\s@]+)@([^\s]+)/i;
+
+/** `npm error` / `npm ERR!` / `npm warn` prefix in front of every ERESOLVE report line. */
+const NPM_LOG_PREFIX = /^npm\s+(?:ERR!|error|warn)(?=\s|$)/i;
+
+/** Lines that open a new part of npm's ERESOLVE report (and so close a `Found:` block). */
+const NPM_ERESOLVE_SECTION =
+  /^(?:While resolving:|Could not resolve dependency:|Conflicting peer dependency:|Fix the upstream dependency conflict|(?:code\s+)?ERESOLVE\b)/i;
+
+/** Any depender printed with its version: `… from @emotion/react@11.11.0`. */
+const FROM_DEPENDER_VERSION = /\bfrom\s+((?:@[^/\s]+\/)?[^\s@]+)@(\S+)\s*$/;
+
+/**
+ * npm's ERESOLVE report describes the copy already in the tree under `Found: <pkg>@<version>`,
+ * followed by every dependent of it (and, nested, the chains explaining those dependents). An
+ * edge there whose range the printed version satisfies is part of the current, valid tree —
+ * `peer react@">=16.8.0" from @emotion/react@11.11.0` under `Found: react@18.3.1` — not the
+ * conflict, which npm prints under `Could not resolve dependency:` / `Conflicting peer
+ * dependency:`. Taken as a conflict, it made the ad-hoc resolver bump unrelated direct deps.
+ *
+ * Unsatisfied edges in a `Found:` block (an already-invalid edge) are kept, and nothing outside
+ * one is affected. Call `line` for every line in order, then `satisfied` for each peer edge on it.
+ */
+function npmFoundBlocks(): {
+  line: (trimmed: string) => void;
+  satisfied: (edge: RegExpMatchArray) => boolean;
+} {
+  /** Versions printed in the current `Found:` block: the found copy, then dependers as they appear. */
+  let versions: Map<string, string> | undefined;
+  return {
+    line(trimmed) {
+      const body = trimmed.replace(NPM_LOG_PREFIX, '').trim();
+      const found = /^Found:\s+(\S+)$/i.exec(body);
+      if (found) {
+        const spec = parsePackageSpec(found[1]!);
+        versions = spec.version ? new Map([[spec.name, spec.version]]) : undefined;
+      } else if (!body || NPM_ERESOLVE_SECTION.test(body)) {
+        versions = undefined;
+      } else if (versions) {
+        const depender = FROM_DEPENDER_VERSION.exec(body);
+        if (depender) {
+          versions.set(depender[1]!, depender[2]!);
+        }
+      }
+    },
+    satisfied(edge) {
+      const version = versions?.get(edge[1]!);
+      if (!version) {
+        return false;
+      }
+      try {
+        // Loose, without prereleases — the same check npm's arborist uses for edge validity.
+        return semver.satisfies(version, edge[2]!, true);
+      } catch {
+        return false;
+      }
+    },
+  };
+}
 
 const LINE_PATTERNS: Array<{
   re: RegExp;
@@ -334,9 +393,11 @@ export function parseConflictsFromNpmOutput(output: string, options?: ParseConfl
   const lines = (output || '').replace(ANSI_SGR, '').split(/\r?\n/);
   const out: Conflict[] = [];
   const pnpmParents = new Map<number, string>();
+  const npmFound = npmFoundBlocks();
 
   for (const line of lines) {
     const trimmed = line.trim();
+    npmFound.line(trimmed);
     if (!trimmed) {
       pnpmParents.clear();
       continue;
@@ -352,6 +413,10 @@ export function parseConflictsFromNpmOutput(output: string, options?: ParseConfl
       const m = trimmed.match(re);
       if (!m) {
         continue;
+      }
+      if (re === PEER_QUOTED_RANGE_FROM && npmFound.satisfied(m)) {
+        // A satisfied dependent of npm's `Found:` copy — part of the current tree, not a conflict.
+        break;
       }
       const partial = map(m);
       if (!partial) {
@@ -385,24 +450,29 @@ export function parseConflictsFromNpmOutput(output: string, options?: ParseConfl
  * level too, because some wrappers (pnpm, yarn-via-corepack) reformat npm's output and the
  * per-line scanner can miss them. Only when nothing structured matches do we emit the
  * catch-all `unknown ← unknown` marker so downstream consumers still see "something peer-ish
- * went wrong" instead of an empty list.
+ * went wrong" instead of an empty list. Satisfied dependents listed under npm's `Found:` block
+ * are skipped here too (see `npmFoundBlocks`).
  */
 export function parseEresolveFallback(output: string): Conflict[] {
   const t = output || '';
   const out: Conflict[] = [];
+  const npmFound = npmFoundBlocks();
   const globalPeer = new RegExp(PEER_QUOTED_RANGE_FROM.source, 'gi');
-  let match: RegExpExecArray | null;
-  while ((match = globalPeer.exec(t)) !== null) {
-    const dependency = match[1]!;
-    const range = match[2]!;
-    const dependerName = match[3]!;
-    const dependerVer = match[4]!;
-    pushUnique(out, {
-      depender: `${dependerName}@${dependerVer}`,
-      dependency,
-      requiredRange: range,
-      rawMessage: match[0]!,
-    });
+  for (const line of t.replace(ANSI_SGR, '').split(/\r?\n/)) {
+    const trimmed = line.trim();
+    npmFound.line(trimmed);
+    // Every edge on the line: a reformatting wrapper may have joined several onto one.
+    for (const match of trimmed.matchAll(globalPeer)) {
+      if (npmFound.satisfied(match)) {
+        continue;
+      }
+      pushUnique(out, {
+        depender: `${match[3]!}@${match[4]!}`,
+        dependency: match[1]!,
+        requiredRange: match[2]!,
+        rawMessage: match[0]!,
+      });
+    }
   }
   if (out.length > 0) {
     return out;

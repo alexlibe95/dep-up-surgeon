@@ -10,32 +10,39 @@
  *   3. **This module kicks in** when `--apply-overrides` is set: for every unresolved
  *      advisory with a `recommendedVersion`, it writes a one-line override pinning that
  *      package to the safe version, runs install + validator, and rolls back on failure.
+ *      With npm it first tries `npm update <name>`: when the refreshed lockfile no longer
+ *      holds a vulnerable copy and the validator passes, no override is written at all.
  *
  * Design notes:
  *   - **Sequential by design.** Overrides interact with the lockfile; running two installs
  *     in parallel in the same cwd would clobber each other. We also want the validator to
  *     verify the cumulative state after each pin, so "install after each override" is correct.
  *   - **Rollback on validator failure.** If the install succeeds but the validator fails, we
- *     put back the exact bytes of every file the write could touch (package.json, plus
- *     pnpm-workspace.yaml for pnpm) AND re-run install, so a pin the user already had is
- *     restored rather than deleted. If the rollback install itself fails, we surface
+ *     put back the exact bytes of every file the write could touch (package.json,
+ *     pnpm-workspace.yaml for pnpm, and every root lockfile) AND re-run install, so a pin the
+ *     user already had is restored rather than deleted and the rejected version doesn't stay
+ *     locked. If the rollback install itself fails, we surface
  *     that in the record too and keep going — one broken pin shouldn't strand every other one.
  *   - Never fatal. The returned `OverrideFlowResult` lists every attempt so the JSON consumer
  *     (and the summary writer) can render exactly what happened.
  *   - Uses the existing `runInstall` + validator utilities; this is a thin orchestrator.
  */
 import path from 'node:path';
+import { execa } from 'execa';
 import fs from 'fs-extra';
+import semver from 'semver';
 import type { SecurityAdvisory } from '../core/audit.js';
-import type { PackageManager } from '../core/workspaces.js';
+import { ROOT_LOCKFILE_NAMES, type PackageManager } from '../core/workspaces.js';
 import { runInstall, type InstallResult } from '../utils/npm.js';
 import { log } from '../utils/logger.js';
 import {
   applyOverrideToFile,
   overrideFieldFor,
+  readOverrides,
   type OverrideField,
   type OverrideEntry,
 } from '../utils/overrides.js';
+import { parseLockfileInstalledVersions } from './lockfileFix.js';
 
 export interface OverrideAttemptRecord {
   name: string;
@@ -68,6 +75,12 @@ export interface OverrideAttemptRecord {
   policyReason?: string;
   /** Field we touched (`overrides` / `pnpm.overrides` / `resolutions`). */
   field: OverrideField;
+  /**
+   * How the advisory was fixed. `lockfile-update` = `npm update <name>` moved every installed
+   * copy out of the vulnerable range, so no pin was written (`applied` then lists the installed
+   * versions). Absent = `override`, a pin in `field`.
+   */
+  method?: 'lockfile-update' | 'override';
   /** True when the write, install, AND validator all succeeded. */
   ok: boolean;
   /** True when we skipped without writing (already-safe, no recommended version, etc.). */
@@ -133,6 +146,8 @@ export interface OverrideFlowOptions {
    * write + rollback cycle without actually shelling out.
    */
   installer?: typeof runInstall;
+  /** Test hook for the npm lockfile-only refresh (default: `npm update <name>` in `cwd`). */
+  lockfileUpdater?: (cwd: string, name: string) => Promise<InstallResult>;
 }
 
 export interface OverrideFlowResult {
@@ -190,6 +205,10 @@ export async function runOverrideFlow(opts: OverrideFlowOptions): Promise<Overri
       continue;
     }
 
+    if (await tryLockfileUpdate(rec, adv, opts, pkgJson)) {
+      attempts.push(rec);
+      continue;
+    }
     await processPin(
       rec,
       { name: adv.name, range: target },
@@ -261,12 +280,12 @@ async function processPin(
   }
 
   // Snapshot before writing so a rollback restores exactly what the user had (their own pin,
-  // their formatting) instead of deleting the entry.
+  // their formatting, the versions their lockfile resolved) instead of deleting the entry.
   const touched =
     opts.manager === 'pnpm'
       ? [pkgJson, path.join(path.dirname(pkgJson), 'pnpm-workspace.yaml')]
       : [pkgJson];
-  const snapshot = await snapshotFiles(touched);
+  const snapshot = await snapshotFiles([...touched, ...rootLockfiles(opts.cwd)]);
 
   const applied = await applyOverrideToFile({
     packageJsonPath: pkgJson,
@@ -324,10 +343,122 @@ async function processPin(
   }
 }
 
+/**
+ * npm only: try fixing a transitive advisory without an override. `npm update <name>` refreshes
+ * the lockfile within the ranges its dependents already allow; when no installed copy is left in
+ * the vulnerable range and the validator passes, the attempt is recorded as fixed with
+ * `method: 'lockfile-update'`. Any other outcome puts package.json + the lockfiles back
+ * byte-for-byte (and reinstalls) and returns false so the caller writes the override pin.
+ * Skipped when the vulnerable range is unknown (nothing to check against) or a pin for the
+ * package already exists (it decides the version, not the lockfile).
+ */
+async function tryLockfileUpdate(
+  rec: OverrideAttemptRecord,
+  adv: SecurityAdvisory,
+  opts: OverrideFlowOptions,
+  pkgJson: string,
+): Promise<boolean> {
+  const vulnerable = adv.vulnerableRange && semver.validRange(adv.vulnerableRange);
+  if (opts.manager !== 'npm' || opts.dryRun || !vulnerable) return false;
+  try {
+    const pkg = JSON.parse(await fs.readFile(pkgJson, 'utf8')) as unknown;
+    const { entries } = readOverrides(pkg, 'npm');
+    if (entries.some((e) => e.chain.length === 1 && e.name === adv.name)) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+
+  const snapshot = await snapshotFiles([pkgJson, ...rootLockfiles(opts.cwd)]);
+  // A failed update may have left node_modules half-written, so it always reinstalls; otherwise
+  // only a changed file needs putting back (the override path reinstalls anyway).
+  const giveUp = async (why: string, failed = false): Promise<false> => {
+    if (failed || (await snapshotChanged(snapshot))) await rollback(snapshot, opts, adv.name);
+    if (!opts.json) {
+      log.dim(`--apply-overrides: npm update ${adv.name} ${why}; pinning an override instead`);
+    }
+    return false;
+  };
+
+  if (!opts.json) {
+    log.info(`--apply-overrides: trying \`npm update ${adv.name}\` before pinning an override`);
+  }
+  const updater = opts.lockfileUpdater ?? runNpmUpdate;
+  const update = await updater(opts.cwd, adv.name);
+  if (!update.ok) return giveUp(`exited ${update.exitCode}`, true);
+
+  const installed = await lockedVersions(opts.cwd, adv.name);
+  if (!installed || installed.length === 0) {
+    return giveUp(`left no ${adv.name} entry in the lockfile to check`);
+  }
+  const stillVulnerable = installed.filter((v) =>
+    semver.satisfies(v, vulnerable, { includePrerelease: true }),
+  );
+  if (stillVulnerable.length > 0) {
+    return giveUp(`kept vulnerable ${stillVulnerable.join(', ')}`);
+  }
+
+  const changed = await snapshotChanged(snapshot);
+  if (changed && opts.runValidator) {
+    const v = await opts.runValidator();
+    if (!v.ok) return giveUp(`failed the validator (${v.message ?? 'non-zero exit'})`);
+  }
+  rec.method = 'lockfile-update';
+  rec.applied = installed.join(', ');
+  rec.ok = true;
+  if (!changed) {
+    // The tree already resolved a fixed version (e.g. the direct upgrades pulled it in).
+    rec.skipped = true;
+    rec.reason = 'no installed copy is in the vulnerable range';
+    return true;
+  }
+  if (!opts.json) {
+    log.success(`--apply-overrides: npm update ${adv.name} moved it to ${rec.applied}; no override needed`);
+  }
+  return true;
+}
+
+async function runNpmUpdate(cwd: string, name: string): Promise<InstallResult> {
+  const args = ['update', name];
+  const r = await execa('npm', args, { cwd, reject: false, all: true });
+  return {
+    ok: r.exitCode === 0,
+    output: [r.stdout, r.stderr].filter(Boolean).join('\n'),
+    exitCode: r.exitCode ?? 1,
+    command: `npm ${args.join(' ')}`,
+  };
+}
+
+/** Every version of `name` npm's lockfile holds, ascending; `undefined` without a lockfile. */
+async function lockedVersions(cwd: string, name: string): Promise<string[] | undefined> {
+  // npm reads npm-shrinkwrap.json in preference to package-lock.json.
+  for (const file of ['npm-shrinkwrap.json', 'package-lock.json']) {
+    const raw = await fs.readFile(path.join(cwd, file), 'utf8').catch(() => undefined);
+    if (raw === undefined) continue;
+    const versions = [...(parseLockfileInstalledVersions(raw, 'npm').get(name) ?? [])];
+    return versions.filter((v) => semver.valid(v)).sort(semver.compare);
+  }
+  return undefined;
+}
+
+/** Root lockfiles of every manager: an install can create or rewrite any of them. */
+function rootLockfiles(cwd: string): string[] {
+  return ROOT_LOCKFILE_NAMES.map((file) => path.join(cwd, file));
+}
+
 interface FileSnapshot {
   file: string;
-  /** Original bytes; absent when the file didn't exist (nothing to restore). */
+  /** Original bytes; absent when the file didn't exist (a rollback deletes what was created). */
   bytes?: Buffer;
+}
+
+async function snapshotChanged(snapshot: FileSnapshot[]): Promise<boolean> {
+  for (const { file, bytes } of snapshot) {
+    const current = await fs.readFile(file).catch(() => undefined);
+    if (bytes ? !current?.equals(bytes) : current !== undefined) return true;
+  }
+  return false;
 }
 
 async function snapshotFiles(files: string[]): Promise<FileSnapshot[]> {
@@ -343,9 +474,11 @@ async function snapshotFiles(files: string[]): Promise<FileSnapshot[]> {
 }
 
 /**
- * Put back the exact bytes of every file the pin write could have touched, then re-run install
- * so the workspace ends up in the state the user had before the attempt. Restoring bytes rather
- * than deleting the entry we wrote keeps a pre-existing pin and the file's formatting intact.
+ * Put back the exact bytes of every file the attempt could have touched — including the
+ * lockfiles, which would otherwise keep the rejected version locked through the reinstall — then
+ * re-run install so the workspace ends up in the state the user had before the attempt. Restoring
+ * bytes rather than deleting the entry we wrote keeps a pre-existing pin and the file's formatting
+ * intact; a lockfile the attempt created is deleted.
  * Install failures during rollback are logged but don't crash the flow — the next override
  * attempt will run whatever state we're in.
  */
@@ -355,10 +488,11 @@ async function rollback(
   label: string,
 ): Promise<{ rolledBack: boolean; reinstallOk: boolean }> {
   for (const { file, bytes } of snapshot) {
-    if (!bytes) continue;
     try {
       const current = await fs.readFile(file).catch(() => undefined);
-      if (!current?.equals(bytes)) {
+      if (!bytes) {
+        if (current !== undefined) await fs.remove(file);
+      } else if (!current?.equals(bytes)) {
         await fs.writeFile(file, bytes);
       }
     } catch (e) {

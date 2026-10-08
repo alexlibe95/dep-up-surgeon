@@ -16,12 +16,14 @@ import { buildStructuredReport, printStructuredCliSummary } from './cli/report.j
 import {
   captureRootLockfiles,
   computeRetryFailedIgnores,
+  findLastRunReport,
   lastRunReportPath,
-  loadLastRunReport,
+  legacyLastRunWarning,
   persistLastRunReport,
 } from './cli/lastRun.js';
 import { resolveSummaryDestination, writeSummary, type SummaryFormat } from './cli/summary.js';
 import { captureWorktree, restoreSideEffects } from './cli/sideEffects.js';
+import { haltIfCancelled, stopRunOnCancel } from './cli/interactive.js';
 import { checkoutBranch, getCurrentBranch, type GitCommitMode } from './cli/git.js';
 import { createGitFlow, type GitFlowController } from './cli/gitFlow.js';
 import {
@@ -139,15 +141,19 @@ async function postRunInteractive(cwd: string, report: FinalReport): Promise<voi
     console.log(`  • ${f.name} (${f.reason}): ${f.message ?? ''}`);
   }
 
-  const res = await prompts([
-    {
-      type: 'confirm',
-      name: 'addAllIgnored',
-      message:
-        'Failed upgrades were rolled back where possible. Add all failed packages to .dep-up-surgeonrc ignore list?',
-      initial: false,
-    },
-  ]);
+  const res = await prompts(
+    [
+      {
+        type: 'confirm',
+        name: 'addAllIgnored',
+        message:
+          'Failed upgrades were rolled back where possible. Add all failed packages to .dep-up-surgeonrc ignore list?',
+        initial: false,
+      },
+    ],
+    stopRunOnCancel,
+  );
+  await haltIfCancelled();
 
   if (res?.addAllIgnored) {
     const names = failedPackageNames(report);
@@ -289,7 +295,7 @@ async function main(): Promise<void> {
     )
     .option(
       '--concurrency <n>',
-      'Maximum number of workspace targets to scan/plan in parallel (1-16; default 1). Higher values overlap registry fetches across targets while a shared mutex keeps installs and validation serialized (the lockfile is shared). In **isolated-lockfile** monorepos (pnpm `shared-workspace-lockfile=false`, or every workspace member shipping its own lockfile) the installs + validation ALSO run in parallel, keyed per workspace directory. Requires --json to keep per-target log lines from interleaving — non-JSON mode silently downgrades to 1 with a warning.',
+      'Maximum number of workspace targets to scan/plan in parallel (1-16; default 1). Higher values overlap registry fetches across targets while a shared mutex keeps installs and validation serialized (the lockfile is shared). In **isolated-lockfile** monorepos (every workspace member ships its own lockfile and there is no shared root lockfile) the installs + validation ALSO run in parallel, keyed per workspace directory. Requires --json to keep per-target log lines from interleaving — non-JSON mode silently downgrades to 1 with a warning.',
       '1',
     )
     .option(
@@ -493,13 +499,17 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
   const cwd = opts.cwd ? path.resolve(process.cwd(), opts.cwd) : process.cwd();
   const dryRun = Boolean(opts.dryRun);
   const ciMode = Boolean(opts.ci);
-  // --ci is a no-prompt convenience for bots: force interactive off so we never block on stdin.
-  const interactive = Boolean(opts.interactive) && !ciMode;
   const force = Boolean(opts.force);
   const jsonOutput = Boolean(opts.json);
   if (jsonOutput) {
     // stdout is reserved for the JSON report; warnings, errors and progress go to stderr.
     setLogToStderr(true);
+  }
+  // --ci is a no-prompt convenience for bots, and with --json stdout is the report (prompts render
+  // there): interactive is off in both, so we never block on stdin or corrupt the JSON.
+  const interactive = Boolean(opts.interactive) && !ciMode && !jsonOutput;
+  if (opts.interactive && jsonOutput && !ciMode) {
+    log.warn('--interactive is ignored with --json: prompts would corrupt the JSON report.');
   }
   // Human progress lines (installs, validation, rollbacks). Off with --json unless --progress,
   // which keeps them on stderr for tools that show a live log next to the JSON report.
@@ -576,9 +586,12 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
     }
   }
 
+  // Keys a --retry-failed run froze; persisted so the next retry keeps them frozen too.
+  let retryFrozen: Set<string> | undefined;
   if (opts.retryFailed) {
-    const last = await loadLastRunReport(cwd);
-    if (!last) {
+    const loaded = await findLastRunReport(cwd);
+    const last = loaded?.report;
+    if (!loaded || !last) {
       log.error(
         `--retry-failed: no previous run found at ${lastRunReportPath(cwd)}. ` +
           'Run dep-up-surgeon at least once first (and don’t pass --no-persist-report).',
@@ -586,7 +599,12 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
       process.exitCode = 1;
       return;
     }
+    const legacy = legacyLastRunWarning(loaded);
+    if (legacy) {
+      log.warn(`--retry-failed: ${legacy}`);
+    }
     const retry = computeRetryFailedIgnores(last);
+    retryFrozen = retry.added;
     for (const name of retry.added) {
       ignore.add(name);
     }
@@ -594,10 +612,12 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
       const ageMs = Date.now() - new Date(last.finishedAt).getTime();
       const ageMin = Math.max(1, Math.round(ageMs / 60000));
       log.info(
-        `--retry-failed: loaded last run from ${path.relative(cwd, lastRunReportPath(cwd))} (${ageMin}m ago, dep-up-surgeon ${last.toolVersion})`,
+        `--retry-failed: loaded last run from ${path.relative(cwd, loaded.file) || loaded.file} (${ageMin}m ago, dep-up-surgeon ${last.toolVersion})`,
       );
       log.dim(
-        `  freezing ${retry.succeededLastRun} previously-upgraded + ${retry.terminalFailuresLastRun} terminal failure(s); retrying ${retry.retryableLastRun.length} non-terminal failure(s): ${retry.retryableLastRun.join(', ') || '(none)'}`,
+        `  freezing ${retry.succeededLastRun} previously-upgraded + ${retry.terminalFailuresLastRun} terminal failure(s)` +
+          (retry.carriedOver > 0 ? ` + ${retry.carriedOver} kept from earlier retries` : '') +
+          `; retrying ${retry.retryableLastRun.length} non-terminal failure(s): ${retry.retryableLastRun.join(', ') || '(none)'}`,
       );
       if (retry.retryableLastRun.length === 0) {
         log.warn(
@@ -1000,6 +1020,38 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
       }
     }
 
+    // A pre-flight abort means "the project was already broken; nothing was changed": the
+    // post-run steps below must not change it either (and `undo` would have no record of it).
+    const ranUpgrades = !dryRun && !report!.preflightAborted;
+    const postRunManager: PackageManager =
+      packageManager !== 'auto' ? packageManager : report!.project?.manager ?? 'npm';
+
+    // Validator for the post-run steps (override pins, --fix-lockfile): the engine's command and
+    // manager rules; a crash counts as a failure so the step rolls back.
+    const runPostRunValidator = async (): Promise<{
+      ok: boolean;
+      command?: string;
+      lastLines?: string;
+    }> => {
+      if (validate.skip) return { ok: true };
+      try {
+        const { validateProject } = await import('./core/validator.js');
+        const pkg = await fs.readJson(path.join(cwd, 'package.json'));
+        const vr = await validateProject(cwd, pkg, {
+          ...(validate.command ? { command: validate.command } : {}),
+          manager: postRunManager,
+          ...(validate.source ? { source: validate.source } : {}),
+        });
+        return {
+          ok: vr.ok,
+          ...(vr.command ? { command: vr.command } : {}),
+          ...(vr.output ? { lastLines: vr.output } : {}),
+        };
+      } catch (e) {
+        return { ok: false, lastLines: e instanceof Error ? e.message : String(e) };
+      }
+    };
+
     // --apply-overrides / --override: fix transitive CVEs + user-supplied parent-scoped pins.
     // Runs AFTER enrichments so we have the final `upgraded` list, and BEFORE the summary so
     // the summary writer + JSON consumers see `report.overrides`. `--override` works
@@ -1008,7 +1060,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
     const hasRcOverrides = (config.overrides?.length ?? 0) > 0;
     const hasManualOverrides = hasCliOverrides || hasRcOverrides;
     const wantsAdvisoryOverrides = Boolean(opts.applyOverrides);
-    if ((wantsAdvisoryOverrides || hasManualOverrides) && !dryRun) {
+    if ((wantsAdvisoryOverrides || hasManualOverrides) && ranUpgrades) {
       // Merge rc-sourced + CLI selectors. The merger dedupes by chain (CLI wins on conflict),
       // normalizes selector strings, and surfaces malformed CLI entries as warnings — but NOT
       // as a fatal error, because we still want the valid rc entries to apply even when the
@@ -1052,8 +1104,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
           const upgradedNames = new Set(
             report!.upgraded.filter((r) => r.success && !r.skipped).map((r) => r.name),
           );
-          const overrideManager: PackageManager =
-            packageManager !== 'auto' ? packageManager : report!.project?.manager ?? 'npm';
+          const overrideManager = postRunManager;
           // Only advisories at or above --min-severity: the user filtered the rest out on purpose.
           const advisoriesForFlow = wantsAdvisoryOverrides ? (securityAdvisories ?? []) : [];
           const flowResult = await runOverrideFlow({
@@ -1065,6 +1116,13 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
             overwriteConflicts: Boolean(opts.overrideForce),
             json: quiet,
             manualOverrides,
+            // Every pin goes through install + validator + rollback, like an upgrade.
+            runValidator: async () => {
+              const v = await runPostRunValidator();
+              return v.ok
+                ? { ok: true }
+                : { ok: false, message: `\`${v.command ?? 'validator'}\` failed${v.lastLines ? `\n${v.lastLines}` : ''}` };
+            },
           });
           if (flowResult.attempts.length > 0) {
             const { overrideFieldFor } = await import('./utils/overrides.js');
@@ -1086,42 +1144,17 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
     // --fix-lockfile: dedupe + stale-transitive scan. Runs AFTER the main upgrade loop and
     // overrides pass so we dedupe the FINAL tree. We roll back on any failure, so in the
     // worst case the user ends up with the same lockfile the upgrade loop produced.
-    if (opts.fixLockfile && !dryRun) {
+    if (opts.fixLockfile && ranUpgrades) {
       try {
         const { runLockfileFix } = await import('./cli/lockfileFix.js');
-        const fixManager: PackageManager =
-          packageManager !== 'auto' ? packageManager : report!.project?.manager ?? 'npm';
+        const fixManager = postRunManager;
         const yarnMajorVersion = report!.project?.yarnMajorVersion;
         const fixRes = await runLockfileFix({
           cwd,
           manager: fixManager,
           ...(yarnMajorVersion !== undefined ? { yarnMajorVersion } : {}),
           json: quiet,
-          runValidator: async () => {
-            if (validate.skip) return { ok: true };
-            try {
-              const { validateProject } = await import('./core/validator.js');
-              const pkg = await fs.readJson(path.join(cwd, 'package.json'));
-              const vr = await validateProject(cwd, pkg, {
-                ...(validate.command ? { command: validate.command } : {}),
-                manager: fixManager,
-                ...(validate.source ? { source: validate.source } : {}),
-              });
-              return {
-                ok: vr.ok,
-                ...(vr.command ? { command: vr.command } : {}),
-                ...(vr.output ? { lastLines: vr.output } : {}),
-              };
-            } catch (e) {
-              // A thrown validator (missing package.json, unexpected crash) must fail the
-              // dedupe so we roll the lockfile back — treating it as pass would keep a
-              // potentially broken tree.
-              return {
-                ok: false,
-                lastLines: e instanceof Error ? e.message : String(e),
-              };
-            }
-          },
+          runValidator: runPostRunValidator,
           runInstallAfterRollback: async () => {
             const { runInstall } = await import('./utils/npm.js');
             await runInstall(cwd, fixManager);
@@ -1158,6 +1191,55 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
       }
     }
 
+    // Override pins and the dedupe ran after the engine's last commit: commit them too, so the
+    // branch (and a PR opened from it) carries what the report says was applied.
+    if (gitFlow?.enabled && ranUpgrades) {
+      const pinned = (report!.overrides?.attempts ?? []).filter((a) => a.ok && !a.skipped).length;
+      const deduped =
+        report!.lockfileFix?.status === 'ok' && (report!.lockfileFix.dedupeChanges?.length ?? 0) > 0;
+      if (pinned > 0 || deduped) {
+        const subject = [
+          pinned > 0 ? `apply ${pinned} override pin${pinned === 1 ? '' : 's'}` : '',
+          deduped ? 'dedupe lockfile' : '',
+        ]
+          .filter(Boolean)
+          .join(' + ');
+        await gitFlow.commitPostRun(postRunManager, cwd, subject);
+        report!.commits = gitFlow.commits;
+      }
+    }
+
+    // --security-only: an advisory on a package that no direct dependency names can't be fixed by
+    // an upgrade. Say so (and how) instead of finishing with silence.
+    if (securityAdvisories && securityAdvisories.length > 0 && report!.targets) {
+      const { collectDirectDepNames } = await import('./cli/overrideFlow.js');
+      const direct = new Set<string>();
+      for (const t of report!.targets) {
+        for (const n of await collectDirectDepNames(t.packageJson)) direct.add(n);
+      }
+      const transitive = securityAdvisories.filter((a) => !direct.has(a.name));
+      if (transitive.length > 0) {
+        report!.transitiveAdvisories = transitive.map((a) => ({
+          name: a.name,
+          severity: a.severity,
+          ids: a.ids,
+          ...(a.recommendedVersion ? { recommendedVersion: a.recommendedVersion } : {}),
+        }));
+        if (!quiet && !opts.applyOverrides) {
+          for (const a of transitive) {
+            const fix = a.recommendedVersion ? ` (fixed in ${a.recommendedVersion})` : '';
+            const how =
+              postRunManager === 'npm'
+                ? `\`npm update ${a.name}\` refreshes it in the lockfile when the packages that depend on it allow the fix`
+                : 'refresh it in the lockfile with your package manager';
+            log.warn(
+              `${a.name} [${a.severity}]${fix} is only a transitive dependency, so no direct upgrade reaches it: ${how}, or rerun with --apply-overrides to pin it.`,
+            );
+          }
+        }
+      }
+    }
+
     // Write the --summary file BEFORE emitting the primary report so we can reuse it as the
     // PR body (when --open-pr is set) and so the JSON consumer sees `pullRequest` reflected in
     // the final structured report.
@@ -1187,6 +1269,8 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
             `Wrote ${summaryFormat.toUpperCase()} summary to ${rel}${dest.append ? ' (appended)' : ''}`,
           );
         }
+      } else {
+        log.warn(`--summary: could not write ${dest.path}`);
       }
     }
 
@@ -1248,11 +1332,18 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
     // Tracked files the validator or install scripts rewrote (e.g. `next build` → tsconfig.json)
     // go back, so the run only leaves dependency changes behind.
     if (worktreeBefore) {
-      const sideEffects = await restoreSideEffects(worktreeBefore);
+      const sideEffects = await restoreSideEffects(worktreeBefore, {
+        // A --summary-file the user keeps in git is output they asked for, not a side effect.
+        keep: summaryFilePath ? [summaryFilePath] : [],
+      });
       if (sideEffects.restored.length > 0) {
         report!.restoredFiles = sideEffects.restored;
         if (!quiet) {
-          log.dim(`Restored files the run changed besides dependencies: ${sideEffects.restored.join(', ')}`);
+          const copies = sideEffects.backupDir ? path.relative(cwd, sideEffects.backupDir) : undefined;
+          log.dim(
+            `Restored files the run changed besides dependencies: ${sideEffects.restored.join(', ')}` +
+              (copies ? ` (the changed versions are kept in ${copies})` : ''),
+          );
         }
       }
       if (sideEffects.untracked.length > 0 && !quiet) {
@@ -1291,6 +1382,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
         toolVersion: version,
         dryRun,
         lockfilesBefore,
+        ...(retryFrozen ? { retryFrozen } : {}),
       });
       if (written && !quiet) {
         log.dim(`Wrote ${path.relative(cwd, written)} for undo / --retry-failed / CI`);

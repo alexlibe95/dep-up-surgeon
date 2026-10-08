@@ -192,30 +192,31 @@ export interface InstallOptions {
    *
    *   - npm  → `npm install --workspace <filter>` (npm 7+)
    *   - pnpm → `pnpm install --filter <filter>`
-   *   - yarn berry (v2+) **with `@yarnpkg/plugin-workspace-tools`** → `yarn workspaces focus <filter>`
-   *   - yarn classic / berry without plugin → **fall back to a full install** (the lockfile is
-   *     shared and we can't safely partial-install it without the plugin). The caller can
-   *     detect this via `result.filtered === false`.
+   *   - bun  → `bun install --filter <filter>`
+   *   - yarn (classic and berry) → **fall back to a full install**. Classic has no per-workspace
+   *     install; berry's `yarn workspaces focus` doesn't write yarn.lock and leaves the other
+   *     workspaces' dependencies out of the tree, so a kept bump would ship with a stale
+   *     lockfile and be validated against a partial install. The caller can detect this via
+   *     `result.filtered === false`.
    */
   filter?: string;
   /**
-   * True when the active yarn binary is yarn berry v2+ AND `@yarnpkg/plugin-workspace-tools` is
-   * loaded. Detected once at startup (`detectProjectInfo` → `probeYarnCapabilities`) and threaded
-   * through here so the install command for a yarn project becomes `yarn workspaces focus <name>`
-   * instead of falling back to a full root install. Ignored for non-yarn managers.
+   * Whether the active yarn binary has `yarn workspaces focus` (`ProjectInfo.yarnSupportsFocus`).
+   * @deprecated Ignored: focus is never used for upgrade installs (see `filter`). Kept so
+   * existing callers still compile.
    */
   yarnSupportsFocus?: boolean;
 }
 
 /**
  * Build the install command for the given manager + options. Returns `filtered: true` only when
- * the manager actually applied the filter (yarn classic / berry-without-plugin returns `false`).
+ * the manager actually applied the filter (yarn always returns `false`).
  */
 export function installCommand(
   manager: InstallManager,
   options: InstallOptions = {},
 ): { bin: string; args: string[]; filtered: boolean } {
-  const { filter, yarnSupportsFocus } = options;
+  const { filter } = options;
   switch (manager) {
     case 'pnpm':
       // pnpm switches to --frozen-lockfile when `CI` is set, which would fail every bump: the
@@ -224,17 +225,10 @@ export function installCommand(
         ? { bin: 'pnpm', args: ['install', '--filter', filter, '--no-frozen-lockfile'], filtered: true }
         : { bin: 'pnpm', args: ['install', '--no-frozen-lockfile'], filtered: false };
     case 'yarn':
-      // Yarn classic (v1) has no clean per-workspace install path; we fall back to the full
-      // install. Yarn berry (v2+) has `yarn workspaces focus <name>` BUT only when the
-      // `@yarnpkg/plugin-workspace-tools` plugin is loaded — `detectProjectInfo` probes for
-      // both and sets `yarnSupportsFocus` accordingly.
-      if (filter && yarnSupportsFocus) {
-        return {
-          bin: 'yarn',
-          args: ['workspaces', 'focus', filter],
-          filtered: true,
-        };
-      }
+      // Always a full install, filter or not. Yarn classic (v1) has no per-workspace install,
+      // and berry's `yarn workspaces focus <name>` runs with persistProject:false (yarn.lock
+      // isn't written) and strips every other workspace's dependencies from the install — the
+      // bump would be validated against a partial tree and kept with a stale lockfile.
       return { bin: 'yarn', args: ['install'], filtered: false };
     case 'bun':
       return filter

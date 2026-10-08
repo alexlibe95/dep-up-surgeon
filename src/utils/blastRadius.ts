@@ -13,6 +13,12 @@
  *   - We intentionally skip `node_modules`, `dist`, `build`, `.git`, `coverage`, `.next`,
  *     `.turbo`, `.vercel` — anything that is a build artifact or another tool's cache. Users
  *     who need to scan inside those can pass an empty `skipDirs` (programmatic use only).
+ *     Build-output names (`dist`, `build`, `out`, `coverage`) are only skipped where a build
+ *     writes them — the scan root and package roots (any folder with its own `package.json`,
+ *     e.g. workspace members); deeper down, `src/build/` or `lib/out/` are real source.
+ *   - `@types/<x>` has no imports of its own: it is matched as the package it types (`x`, or
+ *     `@scope/x` for `@types/scope__x`), in addition to the literal name. `@types/node` is the
+ *     exception — it types Node's builtins, not an npm package called `node`.
  *   - Scans are capped: at most `MAX_FILES` files per package, at most `MAX_BYTES` per file,
  *     and the whole pass runs with `concurrency` I/O workers. Tuned for interactive CLI usage,
  *     not for indexing huge repos.
@@ -45,6 +51,12 @@ const DEFAULT_SKIP_DIRS = new Set<string>([
   'out',
   '.output',
 ]);
+
+/**
+ * Build-output folders from `DEFAULT_SKIP_DIRS`: skipped only at the scan root and in package
+ * roots, never deeper (`src/build/`, `lib/out/` hold real source).
+ */
+const OUTPUT_DIRS = new Set<string>(['dist', 'build', 'coverage', 'out']);
 
 /** Extensions we actually scan. Everything else is skipped outright. */
 const DEFAULT_EXTENSIONS = new Set<string>([
@@ -86,7 +98,10 @@ export interface ComputeBlastRadiusOptions {
   packageNames: readonly string[];
   /** File extensions to scan (default: the common JS/TS family). */
   extensions?: Set<string>;
-  /** Directory basenames to skip (default: see `DEFAULT_SKIP_DIRS`). */
+  /**
+   * Directory basenames to skip (default: see `DEFAULT_SKIP_DIRS`). `dist` / `build` / `out` /
+   * `coverage` only apply at the scan root and in package roots (folders with a `package.json`).
+   */
   skipDirs?: Set<string>;
   /** Max files listed per package (the `total` count keeps going past this cap). */
   maxFiles?: number;
@@ -125,19 +140,19 @@ export async function computeBlastRadius(
   //   - from "<pkg>/sub/leaf"
   const perPkgRegex = new Map<string, RegExp>();
   for (const name of packageNames) {
-    const esc = escapeRegex(name);
-    // Capture group around `<pkg>` + optional subpath. `(?![\w-])` ensures that scanning for
-    // `react` doesn't match `react-dom`, and scanning for `@types/node` doesn't match
-    // `@types/node-ipc`. Does NOT anchor to start-of-line: we want matches inside any position.
+    const esc = importSpecifiersFor(name).map(escapeRegex).join('|');
+    // `<pkg>` + optional subpath, then the closing quote: scanning for `react` doesn't match
+    // `react-dom`, and scanning for `@types/node` doesn't match `@types/node-ipc`. Does NOT
+    // anchor to start-of-line: we want matches inside any position.
     const re = new RegExp(
-      `(?:from|require|import)\\s*\\(?\\s*["']${esc}(?:/[^"']*)?["']`,
+      `(?:from|require|import)\\s*\\(?\\s*["'](?:${esc})(?:/[^"']*)?["']`,
       'g',
     );
     perPkgRegex.set(name, re);
   }
 
   const files: string[] = [];
-  await walk(opts.cwd, skipDirs, extensions, files);
+  await walk(opts.cwd, skipDirs, extensions, files, true);
 
   let filesScanned = 0;
   let bytesRead = 0;
@@ -209,11 +224,24 @@ export async function computeBlastRadius(
   return { byPackage, filesScanned, bytesRead };
 }
 
+/**
+ * Module specifiers that count as importing `name`. Type packages are never imported themselves,
+ * so `@types/react` matches `react` and `@types/babel__core` matches `@babel/core`. `@types/node`
+ * types Node's builtins, not the `node` npm package, so it keeps its literal name only.
+ */
+function importSpecifiersFor(name: string): string[] {
+  const typed = name.match(/^@types\/(.+)$/)?.[1];
+  if (!typed || typed === 'node') return [name];
+  const scoped = typed.match(/^([^_]+)__(.+)$/);
+  return [name, scoped ? `@${scoped[1]}/${scoped[2]}` : typed];
+}
+
 async function walk(
   dir: string,
   skipDirs: Set<string>,
   extensions: Set<string>,
   out: string[],
+  isScanRoot = false,
 ): Promise<void> {
   let entries: Array<{ name: string; isDirectory: () => boolean; isFile: () => boolean; isSymbolicLink: () => boolean }>;
   try {
@@ -221,6 +249,8 @@ async function walk(
   } catch {
     return;
   }
+  // Build output sits next to a package.json; elsewhere a `build/` folder is source.
+  const isPackageRoot = isScanRoot || entries.some((e) => e.name === 'package.json' && e.isFile());
   for (const ent of entries) {
     const name = ent.name;
     if (name.startsWith('.') && skipDirs.has(name)) {
@@ -228,7 +258,7 @@ async function walk(
     }
     const abs = path.join(dir, name);
     if (ent.isDirectory()) {
-      if (skipDirs.has(name)) continue;
+      if (skipDirs.has(name) && (isPackageRoot || !OUTPUT_DIRS.has(name))) continue;
       await walk(abs, skipDirs, extensions, out);
     } else if (ent.isFile()) {
       const ext = path.extname(name).toLowerCase();

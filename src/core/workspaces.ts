@@ -60,46 +60,47 @@ export interface ProjectInfo {
   workspacePackageNames: Set<string>;
   /**
    * Resolved major version of the active package manager binary. Currently only populated for
-   * yarn, and probed for every yarn project: classic v1 vs berry v2+ decides filtered installs
-   * (`workspaces focus`), dedupe support, lockfile handling and the audit command.
+   * yarn, and probed for every yarn project: classic v1 vs berry v2+ decides dedupe support,
+   * lockfile handling and the audit command.
    * `undefined` means we couldn't probe the binary (PATH miss, network-isolated CI,
-   * etc.) — callers must treat that as "no capability" and fall back to a full install.
+   * etc.) — callers must treat that as "no capability".
    */
   yarnMajorVersion?: number;
   /**
    * True when the active yarn binary supports `yarn workspaces focus <name>` (i.e. yarn berry
    * v2+ AND `@yarnpkg/plugin-workspace-tools` is loaded). Only meaningful when `manager === 'yarn'`.
    * Always `false` for yarn classic; not probed (undefined) for berry projects without
-   * workspaces. When this is true, `--install-mode filtered` runs the
-   * focused install instead of falling back to a root install.
+   * workspaces. Reported only: upgrade installs never use `focus` (it doesn't write yarn.lock
+   * and installs a partial tree), so `--install-mode filtered` always falls back to a full
+   * root `yarn install`.
    */
   yarnSupportsFocus?: boolean;
   /**
-   * True when the project is set up with **per-workspace lockfiles** rather than a single
-   * shared one at the root (aka "nohoist" / isolated-lockfile monorepo). Detected for:
+   * True when every workspace member is an **independent install**: an install run inside one
+   * member touches only that member's lockfile and `node_modules`. Detected when every member
+   * directory contains its own lockfile of the right kind (`package-lock.json` /
+   * `pnpm-lock.yaml` / `yarn.lock` / `bun.lock`) AND the manager wouldn't resolve a shared
+   * workspace root from inside a member (no root `workspaces` for npm/yarn/bun, no
+   * `pnpm-workspace.yaml` for pnpm). This is the "folder of independent projects" case; rare
+   * but it shows up in corporate monorepos.
    *
-   *   - **pnpm**: `shared-workspace-lockfile=false` in the root `.npmrc`, or
-   *     `sharedWorkspaceLockfile: false` in `pnpm-workspace.yaml` (user-level config is
-   *     ignored — we can only see what's committed).
-   *   - **any manager**: every workspace member directory contains its own lockfile of the
-   *     right kind (`package-lock.json` / `pnpm-lock.yaml` / `yarn.lock`) AND the manager
-   *     wouldn't resolve a shared workspace root from inside a member (no root `workspaces`
-   *     for npm/yarn/bun, no `pnpm-workspace.yaml` for pnpm). This is the "folder of
-   *     independent projects" case; rare but it shows up in corporate monorepos.
+   * Separate lockfiles alone are not enough: pnpm's `shared-workspace-lockfile=false` /
+   * `sharedWorkspaceLockfile: false` gives each member its own `pnpm-lock.yaml`, but
+   * `pnpm install` anywhere under `pnpm-workspace.yaml` is recursive and installs every
+   * project, so those workspaces stay `false`.
    *
    * When true, the upgrader's keyed install mutex lets different workspace targets install
-   * **concurrently** — since each has its own lockfile, the install steps don't race.
-   * When false (or in single-package projects), every install keys off the root `cwd` and
-   * behaves exactly as before (fully serialized).
+   * **concurrently** — the install steps don't race. When false (or in single-package
+   * projects), every install keys off the root `cwd` and behaves exactly as before (fully
+   * serialized).
    */
   isolatedLockfiles?: boolean;
   /**
-   * Reason / source for `isolatedLockfiles === true`. `'pnpm-npmrc'` covers both pnpm settings
-   * (`.npmrc` and `pnpm-workspace.yaml`). Surfaced in the structured report so
+   * Reason / source for `isolatedLockfiles === true`, surfaced in the structured report so
    * users can see why the tool chose parallel installs. Never populated when
    * `isolatedLockfiles` is false / undefined.
    */
-  isolatedLockfilesSource?: 'pnpm-npmrc' | 'per-workspace-lockfiles';
+  isolatedLockfilesSource?: 'per-workspace-lockfiles';
 }
 
 const PNPM_WORKSPACE_FILE = 'pnpm-workspace.yaml';
@@ -165,21 +166,34 @@ export function describeRootLockfiles(
 ): { updated: RootLockfile[]; stale: RootLockfile[] } {
   const updated: RootLockfile[] = [];
   const stale: RootLockfile[] = [];
+  const bunWritesYarnLock = manager === 'bun' && bunPrintsYarnLockfile(cwd);
   for (const [file, owner] of ROOT_LOCKFILES) {
     if (fs.existsSync(path.join(cwd, file))) {
-      (owner === manager ? updated : stale).push(file);
+      const written = owner === manager || (bunWritesYarnLock && file === 'yarn.lock');
+      (written ? updated : stale).push(file);
     }
   }
   return { updated, stale };
 }
 
-function detectFromLockfile(cwd: string): { manager?: PackageManager; lockfileName?: RootLockfile } {
-  for (const [file, manager] of ROOT_LOCKFILES) {
-    if (fs.existsSync(path.join(cwd, file))) {
-      return { manager, lockfileName: file };
-    }
+/** bunfig.toml `[install.lockfile] print = "yarn"`: every `bun install` also writes a yarn.lock. */
+function bunPrintsYarnLockfile(cwd: string): boolean {
+  try {
+    const raw = fs.readFileSync(path.join(cwd, 'bunfig.toml'), 'utf8');
+    return /^\s*print\s*=\s*["']yarn["']/m.test(raw);
+  } catch {
+    return false;
   }
-  return {};
+}
+
+function detectFromLockfile(cwd: string): { manager?: PackageManager; lockfileName?: RootLockfile } {
+  const present = ROOT_LOCKFILES.filter(([file]) => fs.existsSync(path.join(cwd, file)));
+  // A yarn.lock next to bun.lock / bun.lockb is usually bun's own (bunfig `print = "yarn"`), so
+  // the bun lockfile decides. An explicit `packageManager` field still wins over both.
+  const bunLock =
+    present[0]?.[0] === 'yarn.lock' ? present.find(([, manager]) => manager === 'bun') : undefined;
+  const hit = bunLock ?? present[0];
+  return hit ? { manager: hit[1], lockfileName: hit[0] } : {};
 }
 
 interface WorkspaceConfig {
@@ -188,8 +202,6 @@ interface WorkspaceConfig {
   pnpmFile: boolean;
   /** Root `package.json` declares `workspaces` — what npm/yarn/bun resolve the workspace root from. */
   rootWorkspacesField: boolean;
-  /** `sharedWorkspaceLockfile` from `pnpm-workspace.yaml` (pnpm 10 settings), as written. */
-  pnpmSharedWorkspaceLockfile?: unknown;
 }
 
 function stringList(value: unknown): string[] {
@@ -208,7 +220,6 @@ function readWorkspaceConfig(pkg: PackageJson, cwd: string): WorkspaceConfig {
   const globs = [...fromPackageJson];
 
   let pnpmFile = false;
-  let pnpmSharedWorkspaceLockfile: unknown;
   const pnpmYaml = path.join(cwd, PNPM_WORKSPACE_FILE);
   if (fs.existsSync(pnpmYaml)) {
     pnpmFile = true;
@@ -216,9 +227,7 @@ function readWorkspaceConfig(pkg: PackageJson, cwd: string): WorkspaceConfig {
       // logLevel 'error': yaml would otherwise print document warnings via process.emitWarning.
       const doc: unknown = YAML.parse(fs.readFileSync(pnpmYaml, 'utf8'), { logLevel: 'error' });
       if (doc && typeof doc === 'object') {
-        const record = doc as Record<string, unknown>;
-        globs.push(...stringList(record.packages));
-        pnpmSharedWorkspaceLockfile = record.sharedWorkspaceLockfile;
+        globs.push(...stringList((doc as Record<string, unknown>).packages));
       }
     } catch {
       // best-effort; ignore unreadable yaml
@@ -229,7 +238,6 @@ function readWorkspaceConfig(pkg: PackageJson, cwd: string): WorkspaceConfig {
     globs: Array.from(new Set(globs)),
     pnpmFile,
     rootWorkspacesField: fromPackageJson.length > 0,
-    pnpmSharedWorkspaceLockfile,
   };
 }
 
@@ -314,16 +322,7 @@ function isDirectory(p: string): boolean {
   }
 }
 
-/**
- * Expand workspace globs without pulling a glob dependency (and without `fs.globSync`, which
- * prints an ExperimentalWarning on some supported Node versions).
- *
- * Supported: `*` / `?` within a segment (incl. prefixes/suffixes like `eslint-plugin-*`), `**`
- * across segments, `{a,b}` alternatives, and `!` negations (applied to every match, like pnpm).
- * Only directories with a `package.json` count, `node_modules` is never entered, and the
- * workspace root itself (e.g. `.`) is dropped — it's always its own target.
- */
-function expandWorkspaceGlobs(cwd: string, globs: string[]): string[] {
+function compileWorkspaceGlobs(globs: string[]): { include: GlobSegment[][]; exclude: GlobSegment[][] } {
   const include: GlobSegment[][] = [];
   const exclude: GlobSegment[][] = [];
   for (const raw of globs) {
@@ -336,6 +335,36 @@ function expandWorkspaceGlobs(cwd: string, globs: string[]): string[] {
       (negated ? exclude : include).push(compileGlob(expanded));
     }
   }
+  return { include, exclude };
+}
+
+/** True for the workspace root itself and for paths a `!` negation removes. */
+function droppedMember(cwd: string, dir: string, exclude: GlobSegment[][]): boolean {
+  if (path.resolve(dir) === path.resolve(cwd)) {
+    return true;
+  }
+  const parts = path.relative(cwd, dir).split(path.sep);
+  return exclude.some((segments) => matchesGlob(segments, parts));
+}
+
+/**
+ * Expand workspace globs without pulling a glob dependency (and without `fs.globSync`, which
+ * prints an ExperimentalWarning on some supported Node versions).
+ *
+ * Supported: `*` / `?` within a segment (incl. prefixes/suffixes like `eslint-plugin-*`), `**`
+ * across segments, `{a,b}` alternatives, and `!` negations (applied to every match, like pnpm).
+ * Only directories with a `package.json` count, `node_modules` is never entered, and the
+ * workspace root itself (e.g. `.`) is dropped — it's always its own target.
+ *
+ * `includeBare` also keeps matched directories WITHOUT a `package.json` (for
+ * `findWorkspaceProblems`), except below a `**`, which is meant to search a tree.
+ */
+function expandWorkspaceGlobs(
+  cwd: string,
+  globs: string[],
+  opts: { includeBare?: boolean } = {},
+): string[] {
+  const { include, exclude } = compileWorkspaceGlobs(globs);
 
   const childDirCache = new Map<string, string[]>();
   const childDirs = (dir: string): string[] => {
@@ -356,20 +385,25 @@ function expandWorkspaceGlobs(cwd: string, globs: string[]): string[] {
   };
 
   const found = new Set<string>();
-  const visit = (dir: string, segments: GlobSegment[], globstarDepth: number): void => {
+  const visit = (
+    dir: string,
+    segments: GlobSegment[],
+    globstarDepth: number,
+    belowGlobstar: boolean,
+  ): void => {
     if (segments.length === 0) {
-      if (fs.existsSync(path.join(dir, 'package.json'))) {
+      if ((opts.includeBare && !belowGlobstar) || fs.existsSync(path.join(dir, 'package.json'))) {
         found.add(dir);
       }
       return;
     }
     const [head, ...rest] = segments;
     if (head!.kind === 'globstar') {
-      visit(dir, rest, 0);
+      visit(dir, rest, 0, true);
       if (globstarDepth < MAX_GLOBSTAR_DEPTH) {
         for (const name of childDirs(dir)) {
           if (!name.startsWith('.')) {
-            visit(path.join(dir, name), segments, globstarDepth + 1);
+            visit(path.join(dir, name), segments, globstarDepth + 1, true);
           }
         }
       }
@@ -378,33 +412,89 @@ function expandWorkspaceGlobs(cwd: string, globs: string[]): string[] {
     if (head!.kind === 'literal') {
       const next = path.join(dir, head!.value);
       if (head!.value !== 'node_modules' && isDirectory(next)) {
-        visit(next, rest, 0);
+        visit(next, rest, 0, belowGlobstar);
       }
       return;
     }
     for (const name of childDirs(dir)) {
       if (segmentMatches(head!, name)) {
-        visit(path.join(dir, name), rest, 0);
+        visit(path.join(dir, name), rest, 0, belowGlobstar);
       }
     }
   };
 
   for (const segments of include) {
-    visit(cwd, segments, 0);
+    visit(cwd, segments, 0, false);
   }
 
-  const root = path.resolve(cwd);
-  return [...found].filter((dir) => {
-    if (path.resolve(dir) === root) {
-      return false;
-    }
-    const parts = path.relative(cwd, dir).split(path.sep);
-    return !exclude.some((segments) => matchesGlob(segments, parts));
-  });
+  return [...found].filter((dir) => !droppedMember(cwd, dir, exclude));
+}
+
+export type WorkspaceProblemKind =
+  | 'missing-package-json'
+  | 'unreadable-package-json'
+  | 'missing-name'
+  | 'missing-path';
+
+export interface WorkspaceProblem {
+  /** Absolute path of the declared member directory. */
+  dir: string;
+  problem: WorkspaceProblemKind;
 }
 
 /**
- * Probe the active `yarn` binary for capabilities relevant to filtered installs.
+ * Declared workspace entries that don't resolve to a usable member — everything
+ * `detectProjectInfo` silently leaves out of `workspaceMembers`:
+ *
+ *   - `missing-path`: a literal (non-glob) entry such as `packages/app` that isn't a directory.
+ *   - `missing-package-json`: a directory matched by an entry has no `package.json`
+ *     (directories reached through `**` are skipped: that pattern is meant to search a tree).
+ *   - `unreadable-package-json`: its `package.json` doesn't parse as a JSON object.
+ *   - `missing-name`: its `package.json` has no `name`.
+ *
+ * Same globs, negations and `node_modules` / root handling as member detection. Sorted by `dir`;
+ * empty for single-package projects.
+ */
+export async function findWorkspaceProblems(cwd: string): Promise<WorkspaceProblem[]> {
+  let pkg: PackageJson = {};
+  try {
+    pkg = (await fs.readJson(path.join(cwd, 'package.json'))) as PackageJson;
+  } catch {
+    // Missing / unreadable root package.json: pnpm-workspace.yaml can still declare members.
+  }
+  const { globs } = readWorkspaceConfig(pkg, cwd);
+  const { include, exclude } = compileWorkspaceGlobs(globs);
+  const problems: WorkspaceProblem[] = [];
+
+  const missing = new Set<string>();
+  for (const segments of include) {
+    const literal = segments.every(
+      (s): s is Extract<GlobSegment, { kind: 'literal' }> => s.kind === 'literal',
+    );
+    if (!literal || segments.length === 0) {
+      continue;
+    }
+    const dir = path.join(cwd, ...segments.map((s) => s.value));
+    if (!isDirectory(dir) && !droppedMember(cwd, dir, exclude)) {
+      missing.add(dir);
+    }
+  }
+  for (const dir of missing) {
+    problems.push({ dir, problem: 'missing-path' });
+  }
+
+  for (const dir of expandWorkspaceGlobs(cwd, globs, { includeBare: true })) {
+    const member = readMember(dir);
+    if ('problem' in member) {
+      problems.push({ dir, problem: member.problem });
+    }
+  }
+  return problems.sort((a, b) => a.dir.localeCompare(b.dir));
+}
+
+/**
+ * Probe the active `yarn` binary's version and `workspaces focus` support (the latter is only
+ * reported — see `ProjectInfo.yarnSupportsFocus`).
  *
  *   - `yarn --version` gives us the major (`1.x` → classic, `2+` → berry).
  *   - For berry, we additionally check whether `workspaces focus` is exposed by the loaded
@@ -465,13 +555,29 @@ async function probeYarnCapabilities(
   return { major, supportsFocus };
 }
 
-function readMemberName(dir: string): string | undefined {
-  try {
-    const pkg = fs.readJsonSync(path.join(dir, 'package.json')) as PackageJson;
-    return typeof pkg.name === 'string' && pkg.name ? pkg.name : undefined;
-  } catch {
-    return undefined;
+function readMember(
+  dir: string,
+): { name: string } | { problem: Exclude<WorkspaceProblemKind, 'missing-path'> } {
+  const file = path.join(dir, 'package.json');
+  if (!fs.existsSync(file)) {
+    return { problem: 'missing-package-json' };
   }
+  let pkg: unknown;
+  try {
+    pkg = fs.readJsonSync(file);
+  } catch {
+    return { problem: 'unreadable-package-json' };
+  }
+  if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg)) {
+    return { problem: 'unreadable-package-json' };
+  }
+  const { name } = pkg as PackageJson;
+  return typeof name === 'string' && name ? { name } : { problem: 'missing-name' };
+}
+
+function readMemberName(dir: string): string | undefined {
+  const member = readMember(dir);
+  return 'name' in member ? member.name : undefined;
 }
 
 /**
@@ -531,9 +637,9 @@ export async function detectProjectInfo(
     }
   }
 
-  // Probe yarn for every yarn project: besides filtered installs, the major decides dedupe
-  // support, lockfile handling and the audit command. The `workspaces focus` probe only
-  // matters with workspaces, so that extra spawn is skipped otherwise.
+  // Probe yarn for every yarn project: the major decides dedupe support, lockfile handling and
+  // the audit command. The `workspaces focus` probe (reported only) means nothing without
+  // workspaces, so that extra spawn is skipped otherwise.
   let yarnMajorVersion: number | undefined;
   let yarnSupportsFocus: boolean | undefined;
   if (manager === 'yarn') {
@@ -542,7 +648,7 @@ export async function detectProjectInfo(
     yarnSupportsFocus = probe.supportsFocus;
   }
 
-  const isolated = detectIsolatedLockfiles(cwd, manager, workspaceMembers, config);
+  const isolated = detectIsolatedLockfiles(manager, workspaceMembers, config);
 
   return {
     cwd,
@@ -562,61 +668,33 @@ export async function detectProjectInfo(
 }
 
 /**
- * Decide whether this project has per-workspace lockfiles rather than a single shared one.
+ * Decide whether each workspace member installs independently of the others.
  *
- * Two detection paths:
+ * Only on-disk evidence counts: every workspace member already has its own lockfile of the
+ * matching kind AND the manager doesn't resolve a shared workspace root from inside a member.
+ * This catches the "folder of independent projects accidentally treated as workspaces" case.
  *
- *   1. **pnpm opt-out**: `shared-workspace-lockfile=false` in the root `.npmrc`, or
- *      `sharedWorkspaceLockfile: false` in `pnpm-workspace.yaml`, makes pnpm generate a
- *      `pnpm-lock.yaml` in each workspace member. We don't need to verify the lockfiles exist
- *      on disk — the setting IS the contract. (This also covers the pre-install case where
- *      members don't have their lockfiles yet.)
- *   2. **On-disk evidence**: if every workspace member already has its own lockfile of the
- *      matching kind, we treat the project as isolated-lockfile — unless the manager resolves
- *      a shared workspace root from inside a member, in which case those lockfiles are stale.
- *      This catches the "folder of independent projects accidentally treated as workspaces" case.
+ * pnpm's `shared-workspace-lockfile=false` (`.npmrc`) / `sharedWorkspaceLockfile: false`
+ * (`pnpm-workspace.yaml`) deliberately does NOT count: it splits the lockfile per project,
+ * but `pnpm install` run anywhere under `pnpm-workspace.yaml` still installs every project,
+ * so parallel per-member installs would race on shared `node_modules` and on each other's
+ * lockfiles.
  *
- * Returns `{ isolated: false }` when neither applies OR when `hasWorkspaces` is false.
+ * Returns `{ isolated: false }` when that doesn't hold OR when `hasWorkspaces` is false.
  */
 function detectIsolatedLockfiles(
-  cwd: string,
   manager: PackageManager,
   members: WorkspaceMember[],
   config: WorkspaceConfig,
-): { isolated: false } | { isolated: true; source: 'pnpm-npmrc' | 'per-workspace-lockfiles' } {
+): { isolated: false } | { isolated: true; source: 'per-workspace-lockfiles' } {
   if (members.length === 0) {
     return { isolated: false };
   }
 
-  if (manager === 'pnpm') {
-    const yamlSetting = config.pnpmSharedWorkspaceLockfile;
-    if (yamlSetting === false || yamlSetting === 'false') {
-      return { isolated: true, source: 'pnpm-npmrc' };
-    }
-
-    // Look for the canonical `.npmrc` opt-out. We parse conservatively — a commented-out line
-    // (`# shared-workspace-lockfile=false`) shouldn't trigger detection.
-    const npmrc = path.join(cwd, '.npmrc');
-    try {
-      if (fs.existsSync(npmrc)) {
-        const raw = fs.readFileSync(npmrc, 'utf8');
-        for (const line of raw.split(/\r?\n/)) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith(';')) continue;
-          const m = trimmed.match(/^shared-workspace-lockfile\s*=\s*(false|no|0)$/i);
-          if (m) {
-            return { isolated: true, source: 'pnpm-npmrc' };
-          }
-        }
-      }
-    } catch {
-      // Unreadable .npmrc is effectively absent — fall through.
-    }
-  }
-
   // Running an install inside a member still resolves the workspace root here (npm/yarn/bun via
-  // root `workspaces`, pnpm via pnpm-workspace.yaml), so "per-member" installs would all race on
-  // the root lockfile + node_modules. Member lockfiles are just stale.
+  // root `workspaces`, pnpm via pnpm-workspace.yaml — whatever its lockfile settings), so
+  // "per-member" installs would all race on the root install. Member lockfiles are stale, or
+  // (pnpm without a shared lockfile) written by that same recursive install.
   const resolvesSharedRoot = manager === 'pnpm' ? config.pnpmFile : config.rootWorkspacesField;
   if (resolvesSharedRoot) {
     return { isolated: false };
