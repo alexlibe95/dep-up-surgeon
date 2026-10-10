@@ -432,6 +432,34 @@ export interface FinalReport {
    * `src/cli/lockfileFix.ts` for the orchestration semantics.
    */
   lockfileFix?: LockfileFixReport;
+  /**
+   * Other managers' root lockfiles (e.g. `package-lock.json` next to `bun.lock`) re-resolved
+   * after the run so they match package.json too. See `src/cli/lockfileSync.ts`. Absent when the
+   * project has a single lockfile or the run passed `--no-sync-lockfiles`.
+   */
+  lockfileSync?: LockfileSyncEntry[];
+}
+
+/**
+ * One other-manager root lockfile brought in step with package.json after the run, by its own
+ * manager in lockfile-only mode (node_modules untouched, no install scripts).
+ */
+export interface LockfileSyncEntry {
+  lockfile: 'package-lock.json' | 'npm-shrinkwrap.json' | 'pnpm-lock.yaml' | 'yarn.lock' | 'bun.lock' | 'bun.lockb';
+  manager: 'npm' | 'pnpm' | 'yarn' | 'bun';
+  /**
+   * `updated` / `unchanged`: the command succeeded (the file did / didn't change). `failed`: it
+   * exited non-zero and the lockfile was put back as it was. `skipped`: see `skipReason`.
+   */
+  status: 'updated' | 'unchanged' | 'failed' | 'skipped' | 'dry-run';
+  /** Present unless `skipReason` is `unsupported`. */
+  command?: string;
+  /** Exit code when `status === 'failed'`. */
+  exitCode?: number;
+  /** Last lines of the command output when `status === 'failed'`. */
+  lastLines?: string;
+  /** `unsupported`: Yarn classic / Yarn 2 have no lockfile-only install. `missing-binary`: not on PATH. */
+  skipReason?: 'unsupported' | 'missing-binary';
 }
 
 /**

@@ -1,6 +1,7 @@
 import path from 'node:path';
 import fs from 'fs-extra';
 import type { ConflictEntry, LockfileFixReport, UpgradeRecord } from '../types.js';
+import { describeLockfileSync } from './lockfileSync.js';
 import type { StructuredReport } from './report.js';
 
 /**
@@ -387,6 +388,15 @@ export function renderSummaryMarkdown(structured: StructuredReport, toolVersion:
     }
   }
 
+  if (structured.lockfileSync && structured.lockfileSync.length > 0) {
+    lines.push(`### Other lockfiles`);
+    lines.push('');
+    for (const entry of structured.lockfileSync) {
+      lines.push(`- ${describeLockfileSync(entry)}`);
+    }
+    lines.push('');
+  }
+
   if (structured.overrides && structured.overrides.attempts.length > 0) {
     const ok = structured.overrides.attempts.filter((a) => a.ok && !a.skipped);
     const noOp = structured.overrides.attempts.filter((a) => a.ok && a.skipped);
@@ -687,6 +697,15 @@ export function renderSummaryHtml(structured: StructuredReport, toolVersion: str
         `<details><summary>${esc(lf.failureKind ?? 'dedupe')} output (last lines)</summary><pre>${esc(lf.lastLines)}</pre></details>`,
       );
     }
+  }
+
+  if (structured.lockfileSync && structured.lockfileSync.length > 0) {
+    out.push(`<h3>Other lockfiles</h3>`);
+    out.push(`<ul>`);
+    for (const entry of structured.lockfileSync) {
+      out.push(`<li>${esc(describeLockfileSync(entry)).replace(/`([^`]+)`/g, '<code>$1</code>')}</li>`);
+    }
+    out.push(`</ul>`);
   }
 
   out.push(`</section>`);

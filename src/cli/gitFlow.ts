@@ -88,10 +88,16 @@ export interface GitFlowController {
   /** Call once after the whole flow (all mode commits here; safety net for the others). */
   flushAtEnd(manager: PackageManager, installCwd: string): Promise<void>;
   /**
-   * Commit what the post-run steps (override pins, `--fix-lockfile`) changed after the engine's
-   * last commit: the root package.json, pnpm-workspace.yaml and lockfiles.
+   * Commit what the post-run steps (override pins, `--fix-lockfile`, other managers' lockfiles)
+   * changed after the engine's last commit: the root package.json, pnpm-workspace.yaml,
+   * `manager`'s lockfiles and `extraFiles`.
    */
-  commitPostRun(manager: PackageManager, installCwd: string, subject: string): Promise<void>;
+  commitPostRun(
+    manager: PackageManager,
+    installCwd: string,
+    subject: string,
+    extraFiles?: string[],
+  ): Promise<void>;
   /** Accumulated commit records (for the structured report). */
   commits: GitCommitRecord[];
 }
@@ -452,11 +458,13 @@ export async function createGitFlow(
     manager: PackageManager,
     installCwd: string,
     subject: string,
+    extraFiles: string[] = [],
   ): Promise<void> => {
     const files = [
       path.join(installCwd, 'package.json'),
       path.join(installCwd, 'pnpm-workspace.yaml'),
       ...lockfilePaths([installCwd], manager),
+      ...extraFiles,
     ];
     await recordCommit(installCwd, files, `${prefix}${subject}`, undefined, undefined);
   };

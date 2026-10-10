@@ -507,7 +507,7 @@ export async function findWorkspaceProblems(cwd: string): Promise<WorkspaceProbl
  * yarn binary that hangs (rare but seen on misconfigured corp CI) must NEVER block the upgrade
  * loop. On any failure we return `{ }` and the caller treats it as "no capability".
  */
-async function probeYarnCapabilities(
+export async function probeYarnCapabilities(
   cwd: string,
   opts: { probeFocus: boolean },
 ): Promise<{ major?: number; supportsFocus?: boolean }> {

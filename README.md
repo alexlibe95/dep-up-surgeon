@@ -126,6 +126,7 @@ dep-up-surgeon outdated [options]
 | `--override <spec...>` | Apply one or more **manual** override pins independent of the audit. Repeatable and also accepts comma-separated values. Syntax: `<chain>@<range>`, where `<chain>` is a bare name (`lodash`), a pnpm-style chain (`some-dep>foo`, any depth), or a yarn-style chain (`parent/child`). Scoped names (`@scope/pkg`) are preserved as single chain segments. Written to the manager-native nested form (npm object, pnpm `>`-keys, yarn `/`-keys) and run through the same install + validator + rollback loop as `--apply-overrides`. Works standalone — `--security-only` is not required. See **Transitive overrides** below. |
 | `--override-force` | Used with `--apply-overrides`. Overwrite an **existing** override entry whose value conflicts with the audit-recommended version. By default we refuse to clobber user-managed pins and record `conflict` in the report. |
 | `--fix-lockfile` | After the main upgrade loop, run the package manager's native dedupe command (`npm dedupe` / `pnpm dedupe` / `yarn dedupe`) to collapse redundant transitive copies **without touching `package.json`**, and flag transitives more than a minor or a full major behind registry `latest`. Lockfile is backed up before dedupe and restored if dedupe OR the post-dedupe validator fails. Yarn classic (v1) has no dedupe subcommand — recorded as `skipped: "unsupported"`. See **Lockfile fix** below. |
+| `--no-sync-lockfiles` | Leave other package managers' root lockfiles alone. By default a lockfile the run's manager doesn't write — `package-lock.json` next to `bun.lock`, say — is re-resolved after the run by its own manager in lockfile-only mode, so CI or a host that installs from it gets the upgraded versions too. See **Other lockfiles** below. |
 | `--open-pr` | After `--git-commit --git-branch` pushes the branch, open a GitHub PR with the `--summary` markdown as the body (falls back to a deterministic minimal body). Uses the `gh` CLI (must be installed + authenticated); never fatal — a missing binary, auth failure, or push rejection is recorded as `pullRequest.error` in the JSON report without aborting the run. See **Auto-opening a PR** below. |
 | `--open-pr-title <title>` | Override the PR title. Default: derived from the upgrade counts, e.g. `deps: [breaking+security] bump 3 packages`. |
 | `--open-pr-draft` | Open the PR as a draft. Recommended with `--force` or on Fridays so merge-queue bots don't auto-land it. |
@@ -562,6 +563,23 @@ Where it shows up:
 # Post-security-sweep cleanup: dedupe the tree and surface stale transitives in the PR body.
 npx dep-up-surgeon --security-only --apply-overrides --fix-lockfile --summary md
 ```
+
+### Other lockfiles
+
+Upgrades install with one package manager, and only its lockfile changes. When the project also has another manager's root lockfile — a `package-lock.json` next to `bun.lock` is the usual case — that one would keep the old versions while CI or a host still installs from it (Netlify runs `npm install` whenever it finds `package-lock.json`). So after the run, each such lockfile is re-resolved by its own manager in **lockfile-only** mode: `node_modules` isn't touched and no install scripts run.
+
+| Lockfile | Command |
+| --- | --- |
+| `package-lock.json` / `npm-shrinkwrap.json` | `npm install --package-lock-only --ignore-scripts --no-audit --no-fund` |
+| `pnpm-lock.yaml` | `pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile` |
+| `bun.lock` / `bun.lockb` | `bun install --lockfile-only --ignore-scripts` |
+| `yarn.lock` (Yarn 3+) | `yarn install --mode=update-lockfile` |
+
+- Runs once at the end, **after** `--apply-overrides` and `--fix-lockfile`, so the lockfile matches the final `package.json`.
+- A command that fails puts the lockfile back exactly as it was (`failed`, with the last lines of output). A manager that isn't installed is `skipped: "missing-binary"`; Yarn classic and Yarn 2 can't update a lockfile without installing and are `skipped: "unsupported"`.
+- `undo` restores it with the other lockfiles, and with `--git-commit` it lands in the post-run commit (`deps: sync package-lock.json`).
+- `--dry-run` lists what it would run; `--no-sync-lockfiles` turns it off.
+- **`--json`**: `lockfileSync: [{ lockfile, manager, status, command, ... }]`. **`--summary`**: an **Other lockfiles** section.
 
 ### Doctor subcommand (`dep-up-surgeon doctor`)
 

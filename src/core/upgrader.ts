@@ -3196,6 +3196,11 @@ export interface UpgradeFlowOptions
    * (npm scripts, generated files, etc.) and can't tolerate concurrent peers.
    */
   forceSerialInstalls?: boolean;
+  /**
+   * Whether the CLI re-resolves other managers' root lockfiles after the run (default true;
+   * `--no-sync-lockfiles` turns it off). Only changes what the start-of-run notice says.
+   */
+  syncLockfiles?: boolean;
 }
 
 export interface TargetCompleteEvent {
@@ -3287,9 +3292,15 @@ export async function runUpgradeFlow(opts: UpgradeFlowOptions): Promise<FinalRep
     if (lockfiles.stale.length > 0) {
       const stale = lockfiles.stale.map((f) => `\`${f}\``).join(', ');
       const updated = lockfiles.updated.map((f) => `\`${f}\``).join(', ') || `the ${projectInfo.manager} lockfile`;
-      log.warn(
-        `Also found ${stale}: upgrades install with ${projectInfo.manager} and only update ${updated}, so ${stale} will go stale. A CI or host that installs from it won't get the validated versions — keep one lockfile and set "packageManager" in package.json.`,
-      );
+      if (opts.syncLockfiles === false) {
+        log.warn(
+          `Also found ${stale}: upgrades install with ${projectInfo.manager} and only update ${updated}, so ${stale} will go stale (--no-sync-lockfiles). A CI or host that installs from it won't get the validated versions — keep one lockfile and set "packageManager" in package.json.`,
+        );
+      } else {
+        log.dim(
+          `Also found ${stale}: upgrades install with ${projectInfo.manager} and update ${updated}; ${stale} is re-resolved by its own manager (lockfile-only) after the run.`,
+        );
+      }
     }
     if (mode !== 'root-only') {
       log.info(

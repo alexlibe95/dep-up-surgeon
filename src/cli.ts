@@ -409,6 +409,10 @@ async function main(): Promise<void> {
       false,
     )
     .option(
+      '--no-sync-lockfiles',
+      'Leave other package managers\' root lockfiles alone. By default, a lockfile the run\'s manager doesn\'t write (`package-lock.json` next to `bun.lock`, ...) is re-resolved after the run by its own manager in lockfile-only mode (`npm install --package-lock-only`, `pnpm install --lockfile-only`, `bun install --lockfile-only`, Yarn 3+ `yarn install --mode=update-lockfile`), so CI or a host that installs from it gets the upgraded versions too.',
+    )
+    .option(
       '--open-pr',
       'Push the branch created by --git-branch and open a GitHub PR using the `gh` CLI (must be installed + authenticated). The PR body is the --summary markdown (falls back to a minimal default). Never fatal: a missing `gh`, an auth failure, or a push reject is recorded in the structured report as `pullRequest.error` without aborting the upgrade run.',
       false,
@@ -488,6 +492,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
     overrideForce?: boolean;
     override?: string[];
     fixLockfile?: boolean;
+    syncLockfiles?: boolean;
     openPr?: boolean;
     openPrTitle?: string;
     openPrDraft?: boolean;
@@ -884,6 +889,7 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
       // `--no-resolve-peers` sets opts.resolvePeers to false (commander convention);
       // anything else (undefined, true) means "default on" inside the engine.
       resolvePeers: opts.resolvePeers !== false,
+      syncLockfiles: opts.syncLockfiles !== false,
       onUpgradeApplied: gitFlow?.onUpgradeApplied,
       onTargetComplete: gitFlow
         ? async (ev) => {
@@ -1191,20 +1197,60 @@ Run \`dep-up-surgeon <command> --help\` for command-specific options.
       }
     }
 
-    // Override pins and the dedupe ran after the engine's last commit: commit them too, so the
-    // branch (and a PR opened from it) carries what the report says was applied.
+    // Another manager's root lockfile (package-lock.json next to bun.lock, ...) isn't written by
+    // the installs above. Re-resolve it in lockfile-only mode AFTER overrides and dedupe, so it
+    // matches the final package.json; the undo backup below picks it up like any changed lockfile.
+    if (opts.syncLockfiles !== false && !report!.preflightAborted) {
+      try {
+        const { syncStaleLockfiles, describeLockfileSync } = await import('./cli/lockfileSync.js');
+        const yarnMajorVersion = report!.project?.yarnMajorVersion;
+        const entries = await syncStaleLockfiles({
+          cwd,
+          manager: postRunManager,
+          dryRun,
+          ...(yarnMajorVersion !== undefined ? { yarnMajorVersion } : {}),
+        });
+        if (entries.length > 0) {
+          report!.lockfileSync = entries;
+          if (!quiet) {
+            for (const entry of entries) {
+              const line = `Other lockfile: ${describeLockfileSync(entry)}`;
+              if (entry.status === 'failed' || entry.status === 'skipped') {
+                log.warn(entry.lastLines ? `${line}\n${entry.lastLines}` : line);
+              } else {
+                log.info(line);
+              }
+            }
+          }
+        }
+      } catch (e) {
+        if (!quiet) {
+          log.warn(`Other lockfiles: skipped due to error: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+    }
+
+    // Override pins, the dedupe and the other lockfiles changed after the engine's last commit:
+    // commit them too, so the branch (and a PR opened from it) carries what the report says.
     if (gitFlow?.enabled && ranUpgrades) {
       const pinned = (report!.overrides?.attempts ?? []).filter((a) => a.ok && !a.skipped).length;
       const deduped =
         report!.lockfileFix?.status === 'ok' && (report!.lockfileFix.dedupeChanges?.length ?? 0) > 0;
-      if (pinned > 0 || deduped) {
+      const synced = (report!.lockfileSync ?? []).filter((e) => e.status === 'updated').map((e) => e.lockfile);
+      if (pinned > 0 || deduped || synced.length > 0) {
         const subject = [
           pinned > 0 ? `apply ${pinned} override pin${pinned === 1 ? '' : 's'}` : '',
           deduped ? 'dedupe lockfile' : '',
+          synced.length > 0 ? `sync ${synced.join(', ')}` : '',
         ]
           .filter(Boolean)
           .join(' + ');
-        await gitFlow.commitPostRun(postRunManager, cwd, subject);
+        await gitFlow.commitPostRun(
+          postRunManager,
+          cwd,
+          subject,
+          synced.map((file) => path.join(cwd, file)),
+        );
         report!.commits = gitFlow.commits;
       }
     }

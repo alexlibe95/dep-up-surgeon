@@ -234,7 +234,7 @@ function managerCheck(info: ProjectInfo): DoctorCheck {
   const ambiguous = countLockfileKinds(info);
   if (ambiguous > 1) {
     issues.push(
-      `${ambiguous} lockfiles present at the project root — pick one and delete the others before upgrading`,
+      `${ambiguous} lockfiles present at the project root — upgrades install with ${info.manager} and re-resolve the others in lockfile-only mode; delete any that no CI or host installs from`,
     );
   }
   if (issues.length === 0) {

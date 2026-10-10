@@ -55,6 +55,8 @@ export interface StructuredReport {
   pullRequest?: FinalReport['pullRequest'];
   /** Result of the `--fix-lockfile` step (only present when the flag was passed). */
   lockfileFix?: FinalReport['lockfileFix'];
+  /** Other managers' root lockfiles re-resolved after the run (only present when there were any). */
+  lockfileSync?: FinalReport['lockfileSync'];
 }
 
 export function buildStructuredReport(
@@ -94,6 +96,7 @@ export function buildStructuredReport(
     ...(report.overrides ? { overrides: report.overrides } : {}),
     ...(report.pullRequest ? { pullRequest: report.pullRequest } : {}),
     ...(report.lockfileFix ? { lockfileFix: report.lockfileFix } : {}),
+    ...(report.lockfileSync && report.lockfileSync.length > 0 ? { lockfileSync: report.lockfileSync } : {}),
   };
 }
 
